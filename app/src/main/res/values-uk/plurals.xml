@@ -1,3 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <plurals name="book_count">
+        <item quantity="one">%1$d Книжка</item>
+        <item quantity="few">%1$d Книжки</item>
+        <item quantity="many">%1$d Книг</item>
+        <item quantity="other">%1$d Книг</item>
+    </plurals>
+    <plurals name="book_word">
+        <item quantity="one">Книжка</item>
+        <item quantity="few">Книжки</item>
+        <item quantity="many">Книг</item>
+        <item quantity="other">Книг</item>
+    </plurals>
 </resources>

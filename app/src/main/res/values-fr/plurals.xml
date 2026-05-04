@@ -6,7 +6,7 @@
         <item quantity="other">%1$d livres</item>
     </plurals>
     <plurals name="book_word">
-        <item quantity="one">livres</item>
+        <item quantity="one">livre</item>
         <item quantity="many">livres</item>
         <item quantity="other">livres</item>
     </plurals>

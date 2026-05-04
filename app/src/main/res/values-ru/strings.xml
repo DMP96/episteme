@@ -861,8 +861,8 @@
     <string name="setting_pull_distance_change_chapter">Свайп для смены главы</string>
     <string name="label_short">Короткое</string>
     <string name="label_long">Длинное</string>
-    <string name="tts_speed_short">Скор.</string>
-    <string name="tts_pitch_short">Тон</string>
+    <string name="tts_speed_short">Скорость: %1$sx</string>
+    <string name="tts_pitch_short">Высота тона: %1$sx</string>
     <string name="content_desc_play_pause">Воспроизведение / Пауза</string>
     <string name="content_desc_reset_speed">Сбросить скорость</string>
     <string name="content_desc_reset_pitch">Сбросить тон</string>
@@ -877,4 +877,23 @@
     <string name="action_exit_smart_zoom">Выйти из умного масштабирования</string>
     <string name="action_smart_comic_zoom">Умный масштаб комикса</string>
     <string name="desc_toggle_smart_comic_zoom">Включить/выключить умный масштаб комикса</string>
+    <string name="drawer_support_project">Помочь проекту</string>
+    <string name="support_project_title">Помочь проекту</string>
+    <string name="support_project_heading">Помогите Episteme продолжать свою работу</string>
+    <string name="support_project_desc">Ваша поддержка помогает мне продолжать поддерживать и улучшать Episteme для всех!!!</string>
+    <string name="support_github_sponsor">Спонсировать на GitHub</string>
+    <string name="support_github_sponsor_desc">Поддержите разработку напрямую через GitHub Sponsors. В знак благодарности вы получите упоминание в файле README репозитория проекта.</string>
+    <string name="support_patreon">Присоединяйтесь на Patreon</string>
+    <string name="support_patreon_desc">В благодарность за поддержку приложения подписчики на Patreon получают дополнительный контент и привилегии: эксклюзивный предварительный просмотр моих текущих разработок, ранний доступ к скриншотам и обновлениям, возможность голосовать, влияя на внешний вид и функциональность новых функций, а также упоминание в файле README репозитория проекта.</string>
+    <string name="theme_textured_presets">Текстурированные пресеты</string>
+    <string name="theme_my_textured_themes">Мои текстурированные темы</string>
+    <string name="theme_no_textured_custom">Пока нет пользовательских текстурированных тем.</string>
+    <string name="theme_new_textured">Новая текстурированная тема</string>
+    <string name="theme_texture">Текстура</string>
+    <string name="theme_texture_none">Отсутствует</string>
+    <string name="theme_texture_upload">Загрузить</string>
+    <string name="theme_texture_transparency">Прозрачность текстуры</string>
+    <string name="visual_options_progress_bar_position">Позиция</string>
+    <string name="label_vertical_margin">Вертикальный отступ</string>
+    <string name="content_desc_jump_forward">Дальше</string>
 </resources>

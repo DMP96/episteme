@@ -674,4 +674,13 @@
     <string name="ai_analyzing_chapter">Kapitels %1$d wird analysiert…</string>
     <string name="ai_reading_position">Aktuelle Position lesen…</string>
     <string name="ai_generating_recap">Recap wird generiert…</string>
+    <string name="ai_chapter_summary">Zusammenfassung</string>
+    <string name="ai_story_recap_beta">Zusammenfassung der Geschichte (Beta)</string>
+    <string name="app_theme_appearance">Aussehen</string>
+    <string name="app_theme_contrast">Kontrast</string>
+    <string name="app_contrast_standard">Standard</string>
+    <string name="app_contrast_medium">Mittel</string>
+    <string name="app_contrast_high">Hoch</string>
+    <string name="app_theme_mode_light">Hell</string>
+    <string name="app_theme_mode_dark">Dunkel</string>
 </resources>

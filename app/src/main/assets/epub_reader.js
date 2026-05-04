@@ -189,7 +189,7 @@
         window.VIEWPORT_PADDING_BOTTOM = bottom || 0;
     };
 
-    window.applyReaderTheme = function (isDark, bgHex, textHex, textureBase64) {
+    window.applyReaderTheme = function (isDark, bgHex, textHex, textureBase64, textureAlpha) {
         var styleId = "readerThemeStyle";
         var themeStyleElement = document.getElementById(styleId);
 
@@ -207,8 +207,14 @@
         var effectiveBg = bgHex || (isDark ? '#121212' : '#FFFFFF');
         var effectiveText = textHex || (isDark ? '#E0E0E0' : '#000000');
 
+        var effectiveTextureAlpha = Math.max(0, Math.min(1, textureAlpha == null ? 0.55 : textureAlpha));
+        var bgMatch = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(effectiveBg);
+        var bgRgb = bgMatch
+            ? `${parseInt(bgMatch[1], 16)}, ${parseInt(bgMatch[2], 16)}, ${parseInt(bgMatch[3], 16)}`
+            : (isDark ? '18, 18, 18' : '255, 255, 255');
+
         var textureCss = textureBase64
-            ? `background-image: url('${textureBase64}'); background-repeat: repeat; background-blend-mode: multiply;`
+            ? `background-image: linear-gradient(rgba(${bgRgb},${1 - effectiveTextureAlpha}), rgba(${bgRgb},${1 - effectiveTextureAlpha})), url('${textureBase64}'); background-repeat: repeat, repeat; background-blend-mode: normal, normal;`
             : 'background-image: none;';
 
         var css = `
@@ -517,7 +523,65 @@
         }
     }, true);
 
-    window.updateReaderStyles = function (fontSizeEm, lineHeight, fontFamily, textAlign, paragraphGap, imageSize, horizontalMargin) {
+    function getReaderImageElements() {
+        return Array.prototype.slice.call(document.querySelectorAll("img, svg, video, canvas, image"));
+    }
+
+    function rememberReaderImageAnchors() {
+        getReaderImageElements().forEach(function (image) {
+            if (image.getAttribute("data-reader-image-anchor")) return;
+
+            var parent = image.parentElement || document.body;
+            var imageRect = image.getBoundingClientRect();
+            var parentRect = parent.getBoundingClientRect();
+            var parentWidth = parentRect.width || document.documentElement.clientWidth || window.innerWidth || 0;
+
+            if (!parentWidth || imageRect.width <= 0) {
+                image.setAttribute("data-reader-image-anchor", "center");
+                return;
+            }
+
+            var imageCenter = imageRect.left + imageRect.width / 2;
+            var parentCenter = parentRect.left + parentWidth / 2;
+            var tolerance = Math.max(4, parentWidth * 0.08);
+            var anchor = "center";
+
+            if (Math.abs(imageCenter - parentCenter) <= tolerance || imageRect.width >= parentWidth - 2) {
+                anchor = "center";
+            } else if (imageCenter > parentCenter) {
+                anchor = "right";
+            } else {
+                anchor = "left";
+            }
+
+            image.setAttribute("data-reader-image-anchor", anchor);
+        });
+    }
+
+    function applyReaderImageAnchors() {
+        getReaderImageElements().forEach(function (image) {
+            var anchor = image.getAttribute("data-reader-image-anchor") || "center";
+
+            image.style.setProperty("display", "block", "important");
+            image.style.setProperty("height", "auto", "important");
+            image.style.setProperty("object-fit", "contain", "important");
+
+            if (anchor === "right") {
+                image.style.setProperty("float", "none", "important");
+                image.style.setProperty("margin-left", "auto", "important");
+                image.style.setProperty("margin-right", "0", "important");
+            } else if (anchor === "left") {
+                image.style.setProperty("margin-left", "0", "important");
+                image.style.setProperty("margin-right", "auto", "important");
+            } else {
+                image.style.setProperty("float", "none", "important");
+                image.style.setProperty("margin-left", "auto", "important");
+                image.style.setProperty("margin-right", "auto", "important");
+            }
+        });
+    }
+
+    window.updateReaderStyles = function (fontSizeEm, lineHeight, fontFamily, textAlign, paragraphGap, imageSize, horizontalMargin, verticalMargin) {
         var logTag = "ReaderFontDiagnosis";
         console.log(
             logTag +
@@ -534,7 +598,9 @@
                   ", ImageSize: " +
                   imageSize +
                   ", HorizontalMargin: " +
-                  horizontalMargin
+                  horizontalMargin +
+                  ", VerticalMargin: " +
+                  verticalMargin
           );
 
         var dynamicStyleId = "dynamicReaderStyles";
@@ -551,12 +617,16 @@
         var newGap = parseFloat(paragraphGap);
         var newImageSize = parseFloat(imageSize);
         var newHorizontalMargin = parseFloat(horizontalMargin);
+        var newVerticalMargin = parseFloat(verticalMargin);
 
         if (isNaN(newFontSize) || newFontSize < 0.5 || newFontSize > 5.0) newFontSize = 1.0;
         if (isNaN(newLineHeight) || newLineHeight < 1.0 || newLineHeight > 3.0) newLineHeight = 1.0;
         if (isNaN(newGap) || newGap < 0.0 || newGap > 3.0) newGap = 1.0;
         if (isNaN(newImageSize) || newImageSize < 0.5 || newImageSize > 2.0) newImageSize = 1.0;
         if (isNaN(newHorizontalMargin) || newHorizontalMargin < 0.0 || newHorizontalMargin > 3.0) newHorizontalMargin = 1.0;
+        if (isNaN(newVerticalMargin) || newVerticalMargin < 0.0 || newVerticalMargin > 3.0) newVerticalMargin = 1.0;
+
+        rememberReaderImageAnchors();
 
         var fontCss = "";
         if (fontFamily && fontFamily !== "Original" && fontFamily !== "") {
@@ -609,11 +679,14 @@
         }
 
         var horizontalPaddingPx = Math.max(0, 16 * newHorizontalMargin);
+        var verticalPaddingPx = Math.max(0, 16 * newVerticalMargin);
         var horizontalMarginCss = `
             body {
                 box-sizing: border-box !important;
                 padding-left: ${horizontalPaddingPx}px !important;
                 padding-right: ${horizontalPaddingPx}px !important;
+                padding-top: ${verticalPaddingPx}px !important;
+                padding-bottom: ${verticalPaddingPx}px !important;
             }
         `;
 
@@ -629,10 +702,22 @@
                 width: min(100%, calc(100% * var(--reader-image-size))) !important;
                 max-width: 100% !important;
                 height: auto !important;
+                display: block !important;
+                float: none !important;
+                margin-left: auto !important;
+                margin-right: auto !important;
+                object-fit: contain !important;
+            }
+            body p:has(> img:only-child),
+            body div:has(> img:only-child),
+            body figure {
+                text-align: center !important;
             }
         `;
 
         dynamicStyleElement.innerHTML = [sizeCss, lineHeightCss, fontCss, alignCss, gapCss, imageCss, horizontalMarginCss].join("\n");
+        applyReaderImageAnchors();
+        setTimeout(applyReaderImageAnchors, 80);
 
         setTimeout(
             function () {
@@ -2170,6 +2255,7 @@
             if (window.checkImagesForDiagnosis) {
                 setTimeout(window.checkImagesForDiagnosis, 100);
             }
+            setTimeout(applyReaderImageAnchors, 80);
         },
     };
 

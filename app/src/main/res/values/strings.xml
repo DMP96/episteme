@@ -102,6 +102,7 @@
     <!-- "Google Drive" is a brand name — do not translate. -->
     <string name="drawer_backup_desc">Upload books from your synced folders to Google Drive.</string>
     <string name="drawer_custom_fonts">Custom Fonts</string>
+    <string name="drawer_support_project">Support the Project</string>
     <string name="drawer_help_feedback">Help &amp; Feedback</string>
     <string name="drawer_sign_out">Sign Out</string>
 
@@ -316,6 +317,15 @@
     <string name="github_issues_desc">Report bugs, request features, and track development progress.</string>
     <string name="email_support">Email Support</string>
     <string name="email_support_desc">Contact us directly via email for any other inquiries.</string>
+
+    <!-- Support Project -->
+    <string name="support_project_title">Support the Project</string>
+    <string name="support_project_heading">Help keep Episteme moving</string>
+    <string name="support_project_desc">Your support helps me keep maintaining and Improving Episteme for everyone!!!</string>
+    <string name="support_github_sponsor">Sponsor on GitHub</string>
+    <string name="support_github_sponsor_desc">Support development directly through GitHub Sponsors. As a thank you, you get a README shoutout in the project repo.</string>
+    <string name="support_patreon">Join on Patreon</string>
+    <string name="support_patreon_desc">As a thank you for backing the app, Patreon supporters get extra content and benefits: sneak peeks at what I am working on, early screenshots and updates, votes that help shape how new features should look and work, and a README shoutout in the project repo.</string>
 
     <!-- Dialogs -->
     <!-- "Episteme Pro" is the product tier name — do not translate "Episteme". -->
@@ -573,10 +583,14 @@
     <!-- Common.kt: ReaderThemePanel & ThemeBuilderView -->
     <string name="reading_themes">Reading Themes</string>
     <string name="theme_presets">Presets</string>
+    <string name="theme_textured_presets">Textured Presets</string>
     <string name="theme_my_themes">My Themes</string>
+    <string name="theme_my_textured_themes">My Textured Themes</string>
     <!-- "+" is a literal plus icon reference in the description. -->
     <string name="theme_no_custom">No custom themes yet. Tap \'+\' to create one.</string>
+    <string name="theme_no_textured_custom">No custom textured themes yet.</string>
     <string name="theme_new">New Theme</string>
+    <string name="theme_new_textured">New Textured Theme</string>
     <string name="theme_edit">Edit Theme</string>
     <string name="theme_name">Theme Name</string>
     <!-- Short motivational quote used as preview text in the theme builder. -->
@@ -587,6 +601,10 @@
     <string name="theme_low_contrast_warning">⚠️ Low contrast! This might cause eye strain.</string>
     <string name="theme_page_color">Page Color</string>
     <string name="theme_text_color">Text Color</string>
+    <string name="theme_texture">Texture</string>
+    <string name="theme_texture_none">None</string>
+    <string name="theme_texture_upload">Upload</string>
+    <string name="theme_texture_transparency">Texture Transparency</string>
     <string name="theme_color_live_preview">Live Preview</string>
     <!-- Short phrase shown in the live color preview area of the theme builder. -->
     <string name="theme_color_preview_text">Reading is dreaming.</string>
@@ -808,7 +826,8 @@
     <string name="visual_options_system_ui">System UI (Status &amp; Navigation Bars)</string>
     <string name="visual_options_system_ui_desc">Control the visibility of the device\'s system bars.</string>
     <string name="visual_options_progress_bar">Progress Bar</string>
-    <string name="visual_options_progress_bar_desc">The reading progress and chapter indicator at the bottom of the screen.</string>
+    <string name="visual_options_progress_bar_desc">The reading progress and chapter indicator on the reading screen.</string>
+    <string name="visual_options_progress_bar_position">Position</string>
     <!-- "Seamless Chapter Transition" is a reading feature name. -->
     <string name="visual_options_seamless_chapter">Seamless Chapter Transition</string>
     <string name="visual_options_seamless_chapter_desc">Instantly load the next/previous chapter when scrolling past the end, without the pull-to-refresh animation.</string>
@@ -871,6 +890,7 @@
     <string name="label_paragraph_gap">Paragraph Gap</string>
     <string name="label_image_size">Image Size</string>
     <string name="label_horizontal_margin">Horizontal Margin</string>
+    <string name="label_vertical_margin">Vertical Margin</string>
     <string name="label_none">None</string>
     <!-- Short label for the "Original" font option in the reader settings. "Orig" is an abbreviation. -->
     <string name="label_original">Orig</string>
@@ -1214,6 +1234,7 @@
     <string name="msg_downloading_bubble_zoom_model_progress">Downloading Bubble Zoom model… %1$d%%</string>
     <string name="content_desc_exit_slider_navigation">Exit slider navigation</string>
     <string name="content_desc_jump_back">Jump Back</string>
+    <string name="content_desc_jump_forward">Jump Forward</string>
     <string name="content_desc_scroll_to_reading_page">Scroll to reading page</string>
     <string name="content_desc_annotated_page">Annotated Page</string>
     <string name="content_desc_close_image">Close Image</string>
@@ -1261,9 +1282,9 @@
     <string name="label_short">Short</string>
     <string name="label_long">Long</string>
     <!-- Compact TTS speed label. %1$s = formatted multiplier, e.g. 1.2. -->
-    <string name="tts_speed_short">Spd: %1$sx</string>
+    <string name="tts_speed_short">Speed: %1$sx</string>
     <!-- Compact TTS pitch label. %1$s = formatted multiplier, e.g. 1.0. -->
-    <string name="tts_pitch_short">Ptch: %1$sx</string>
+    <string name="tts_pitch_short">Pitch: %1$sx</string>
     <string name="content_desc_play_pause">Play/Pause</string>
     <string name="content_desc_reset_speed">Reset Speed</string>
     <string name="content_desc_reset_pitch">Reset Pitch</string>

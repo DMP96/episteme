@@ -24,14 +24,13 @@ kotlin {
 android {
     namespace = "com.aryan.reader"
     compileSdk = 36
-    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "com.aryan.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 46
-        versionName = "1.0.46"
+        versionCode = 51
+        versionName = "1.0.47"
 
         resourceConfigurations += setOf("en", "ar", "de", "tr", "fr", "ru")
 
@@ -154,6 +153,8 @@ android {
 //noinspection UseTomlInstead
 dependencies {
 
+    implementation(project(":shared"))
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -190,7 +191,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
 
     //noinspection GradleDependency (Updating these might cause the custom toolbox in pagination to break)
-    implementation("androidx.navigation:navigation-compose:2.9.2")
+    implementation("androidx.navigation:navigation-compose:2.9.6")
     //noinspection GradleDependency
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.2")
     //noinspection GradleDependency
@@ -240,6 +241,11 @@ dependencies {
     implementation("org.zwobble.mammoth:mammoth:1.4.2")
 
     implementation("com.materialkolor:material-kolor:5.0.0-alpha07")
+
+    debugImplementation("org.tensorflow:tensorflow-lite:2.17.0")
+    debugImplementation("org.tensorflow:tensorflow-lite-support:0.5.0")
+    debugImplementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
+    debugImplementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
 
     implementation("androidx.core:core-splashscreen:1.2.0")
 

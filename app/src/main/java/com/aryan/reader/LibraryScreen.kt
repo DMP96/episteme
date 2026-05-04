@@ -56,6 +56,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -131,6 +132,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.util.UnstableApi
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.aryan.reader.data.RecentFileItem
@@ -141,6 +143,8 @@ import com.aryan.reader.opds.OpdsEntry
 import com.aryan.reader.opds.OpdsViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import org.jsoup.Jsoup
 import timber.log.Timber
@@ -154,20 +158,26 @@ private fun getBookCountString(count: Int): String {
     return pluralStringResource(id = R.plurals.book_count, count, count)
 }
 
+@UnstableApi
 @SuppressLint("LocalContextGetResourceValueCall")
 @Composable
 fun LibraryScreen(
     viewModel: MainViewModel,
 ) {
+    val compStart = remember { System.currentTimeMillis() }
+    LaunchedEffect(Unit) {
+        ReaderPerfLog.d("LibraryScreen initial composition ${System.currentTimeMillis() - compStart}ms")
+    }
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val selectedItems = uiState.contextualActionItems
-    val isContextualModeActive = selectedItems.isNotEmpty()
-    val selectedShelves = uiState.contextualActionShelfIds
-    val isShelfContextualModeActive = selectedShelves.isNotEmpty()
-    val sortOrder = uiState.sortOrder
-    val shelves = uiState.shelves
-    val rawLibraryFiles = uiState.rawLibraryFiles
+    val screenModel = remember(uiState) { uiState.toLibraryScreenModel() }
+    val selectedItems = screenModel.selectedItems
+    val isContextualModeActive = screenModel.isContextualModeActive
+    val selectedShelves = screenModel.selectedShelves
+    val isShelfContextualModeActive = screenModel.isShelfContextualModeActive
+    val sortOrder = screenModel.sortOrder
+    val shelves = screenModel.shelves
+    val rawLibraryFiles = screenModel.rawLibraryFiles
     val tabTitles = remember {
         buildList {
             add(context.getString(R.string.tab_all_books))
@@ -183,21 +193,13 @@ fun LibraryScreen(
         pageCount = { tabTitles.size }
     )
 
-    val containsFolderItems = remember(selectedItems) {
-        selectedItems.any { it.sourceFolderUri != null }
-    }
-
-    LaunchedEffect(uiState.libraryScreenStartPage) {
-        if (pagerState.currentPage != uiState.libraryScreenStartPage) {
-            pagerState.animateScrollToPage(uiState.libraryScreenStartPage)
-        }
-    }
+    val containsFolderItems = screenModel.containsFolderItemsInSelection
 
     val scope = rememberCoroutineScope()
     var showFilterSheet by remember { mutableStateOf(false) }
 
-    val isSearchActive = uiState.isSearchActive
-    val searchQuery = uiState.searchQuery
+    val isSearchActive = screenModel.isSearchActive
+    val searchQuery = screenModel.searchQuery
 
     val pickFolderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -250,6 +252,8 @@ fun LibraryScreen(
 
     LaunchedEffect(pagerState) {
         androidx.compose.runtime.snapshotFlow { pagerState.settledPage }
+            .drop(1)
+            .distinctUntilChanged()
             .collect { page ->
                 viewModel.setLibraryScreenPage(page)
             }
@@ -401,6 +405,7 @@ fun LibraryScreen(
     }
 }
 
+@UnstableApi
 @Composable
 fun ShelfScreen(
     viewModel: MainViewModel,
@@ -577,6 +582,7 @@ fun LibraryScreenContent(
     val isShelfContextualModeActive = selectedShelves.isNotEmpty()
     var showSortMenu by remember { mutableStateOf(false) }
     val searchFocusRequester = remember { FocusRequester() }
+    val selectedBookIds = remember(selectedItems) { selectedItems.mapTo(mutableSetOf()) { it.bookId } }
 
     var textFieldValue by remember(isSearchActive) {
         mutableStateOf(TextFieldValue(searchQuery, TextRange(searchQuery.length)))
@@ -712,7 +718,16 @@ fun LibraryScreenContent(
                             Tab(
                                 selected = pagerState.currentPage == index,
                                 onClick = {
-                                    scope.launch { pagerState.animateScrollToPage(index) }
+                                    ReaderPerfLog.d("LibraryPager click page=$index title=$title")
+                                    if (pagerState.currentPage != index) {
+                                        scope.launch {
+                                            val start = ReaderPerfLog.nowNanos()
+                                            pagerState.animateScrollToPage(index)
+                                            ReaderPerfLog.d(
+                                                "LibraryPager settled page=$index elapsed=${ReaderPerfLog.elapsedMs(start)}ms"
+                                            )
+                                        }
+                                    }
                                 },
                                 text = { Text(title) }
                             )
@@ -798,6 +813,11 @@ fun LibraryScreenContent(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues),
+            flingBehavior = PagerDefaults.flingBehavior(
+                state = pagerState,
+                snapPositionalThreshold = 0.25f
+            ),
+            beyondViewportPageCount = 0,
             key = { it }
         ) { page ->
             when (page) {
@@ -822,7 +842,7 @@ fun LibraryScreenContent(
                             items(recentFiles, key = { it.bookId }) { item ->
                                 LibraryListItem(
                                     item = item,
-                                    isSelected = selectedItems.any { it.bookId == item.bookId },
+                                    isSelected = item.bookId in selectedBookIds,
                                     isPinned = item.bookId in pinnedLibraryBookIds,
                                     onItemClick = { onItemClick(item) },
                                     onItemLongClick = { onItemLongClick(item) },
@@ -1876,6 +1896,18 @@ private fun FolderSyncScreen(
     isLoading: Boolean
 ) {
     var editingFolder by remember { mutableStateOf<SyncedFolder?>(null) }
+    val folderStatsByUri = remember(allRecentFiles) {
+        allRecentFiles
+            .asSequence()
+            .filter { it.sourceFolderUri != null }
+            .groupBy { it.sourceFolderUri!! }
+            .mapValues { (_, files) ->
+                FolderFileStats(
+                    totalBooks = files.size,
+                    countsByType = files.groupingBy { it.type }.eachCount()
+                )
+            }
+    }
 
     Scaffold(
         floatingActionButton = {
@@ -1943,7 +1975,7 @@ private fun FolderSyncScreen(
                 items(syncedFolders, key = { it.uriString }) { folder ->
                     FolderCard(
                         folder = folder,
-                        allRecentFiles = allRecentFiles,
+                        stats = folderStatsByUri[folder.uriString] ?: FolderFileStats.Empty,
                         onRemoveClick = onRemoveFolderClick,
                         onEditFiltersClick = { editingFolder = folder }
                     )
@@ -1952,11 +1984,11 @@ private fun FolderSyncScreen(
         }
     }
 
-    if (editingFolder != null) {
+    editingFolder?.let { folder ->
         EditFolderFiltersDialog(
-            folder = editingFolder!!,
+            folder = folder,
             onConfirm = { newFilters ->
-                onEditFolderFiltersClick(editingFolder!!, newFilters)
+                onEditFolderFiltersClick(folder, newFilters)
                 editingFolder = null
             },
             onDismiss = { editingFolder = null }
@@ -1964,25 +1996,26 @@ private fun FolderSyncScreen(
     }
 }
 
+private data class FolderFileStats(
+    val totalBooks: Int,
+    val countsByType: Map<FileType, Int>
+) {
+    companion object {
+        val Empty = FolderFileStats(totalBooks = 0, countsByType = emptyMap())
+    }
+}
+
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun FolderCard(
     folder: SyncedFolder,
-    allRecentFiles: List<RecentFileItem>,
+    stats: FolderFileStats,
     onRemoveClick: (SyncedFolder) -> Unit,
     onEditFiltersClick: (SyncedFolder) -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
     val dateFormat = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
     val lastScanText = if (folder.lastScanTime == 0L) stringResource(R.string.never) else dateFormat.format(Date(folder.lastScanTime))
-
-    val folderFiles = remember(allRecentFiles, folder.uriString) {
-        allRecentFiles.filter { it.sourceFolderUri == folder.uriString }
-    }
-    val totalBooks = folderFiles.size
-    val countsByType = remember(folderFiles) {
-        folderFiles.groupBy { it.type }.mapValues { it.value.size }
-    }
 
     androidx.compose.material3.ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
@@ -2058,18 +2091,18 @@ private fun FolderCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontWeight = FontWeight.Bold
                     )
-                    Text(text = totalBooks.toString(), style = MaterialTheme.typography.bodyMedium)
+                    Text(text = stats.totalBooks.toString(), style = MaterialTheme.typography.bodyMedium)
                 }
             }
 
-            if (countsByType.isNotEmpty()) {
+            if (stats.countsByType.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(12.dp))
                 androidx.compose.foundation.layout.FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    countsByType.forEach { (type, count) ->
+                    stats.countsByType.forEach { (type, count) ->
                         AssistChip(
                             onClick = { },
                             label = { Text(stringResource(R.string.folder_filter_count, type.name, count)) }

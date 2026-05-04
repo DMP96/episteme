@@ -7,6 +7,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.core.content.edit
 import com.aryan.reader.BuildConfig
 import com.aryan.reader.ReaderTheme
+import com.aryan.reader.ReaderTexture
 import com.aryan.reader.epubreader.SystemUiMode
 
 internal const val VERTICAL_SCROLL_TAG = "PdfVerticalScroll"
@@ -39,6 +40,8 @@ private const val PREF_EXTERNAL_SEARCH_PKG = "external_search_package"
 private const val PDF_THEME_KEY = "pdf_reader_theme"
 private const val PDF_KEEP_SCREEN_ON_KEY = "pdf_keep_screen_on_enabled"
 private const val PDF_HIDDEN_TOOLS_KEY = "pdf_hidden_tools"
+private const val PDF_TOOL_ORDER_KEY = "pdf_tool_order"
+private const val PDF_BOTTOM_TOOLS_KEY = "pdf_bottom_tools"
 private const val PDF_SYSTEM_UI_MODE_KEY = "pdf_system_ui_mode"
 internal const val PDF_LAYOUT_DEBUG_TAG = "PdfLayoutDebug"
 
@@ -76,7 +79,13 @@ val PdfBuiltInThemes = listOf(
     ReaderTheme("dark", "Dark", Color(0xFF121212), Color(0xFFE0E0E0), true),
     ReaderTheme("sepia", "Sepia", Color(0xFFFBF0D9), Color(0xFF5F4B32), false),
     ReaderTheme("slate", "Slate", Color(0xFF2E3440), Color(0xFFECEFF4), true),
-    ReaderTheme("oled", "OLED", Color(0xFF000000), Color(0xFFB0B0B0), true)
+    ReaderTheme("oled", "OLED", Color(0xFF000000), Color(0xFFB0B0B0), true),
+    ReaderTheme("pdf_natural_white_texture", "Natural White", Color(0xFFF7F1E5), Color(0xFF1D1B18), false, textureId = ReaderTexture.NATURAL_WHITE.id),
+    ReaderTheme("pdf_retina_texture", "Retina", Color(0xFFF1E4CD), Color(0xFF2A2119), false, textureId = ReaderTexture.RETINA_WOOD.id),
+    ReaderTheme("pdf_veneer_texture", "Veneer", Color(0xFFF4E7CF), Color(0xFF2A2119), false, textureId = ReaderTexture.LIGHT_VENEER.id),
+    ReaderTheme("pdf_grey_wash_texture", "Grey Wash", Color(0xFF202124), Color(0xFFFFFFFF), true, textureId = ReaderTexture.GREY_WASH.id),
+    ReaderTheme("pdf_fabric_texture", "Fabric", Color(0xFF262626), Color(0xFFE8E2D8), true, textureId = ReaderTexture.CLASSY_FABRIC.id),
+    ReaderTheme("pdf_retro_texture", "Retro", Color(0xFFF6ECD8), Color(0xFF2F2118), false, textureId = ReaderTexture.RETRO_INTRO.id)
 )
 
 internal fun loadPdfHiddenTools(context: Context): Set<String> {
@@ -87,6 +96,32 @@ internal fun loadPdfHiddenTools(context: Context): Set<String> {
 internal fun savePdfHiddenTools(context: Context, hiddenTools: Set<String>) {
     val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
     prefs.edit { putStringSet(PDF_HIDDEN_TOOLS_KEY, hiddenTools) }
+}
+
+internal fun loadPdfToolOrder(context: Context): List<PdfReaderTool> {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    val savedTools = prefs.getString(PDF_TOOL_ORDER_KEY, null)
+        ?.split(',')
+        ?.filter { it.isNotBlank() }
+        ?.mapNotNull { name -> PdfReaderTool.entries.firstOrNull { it.name == name } }
+        .orEmpty()
+    return (savedTools + PdfReaderTool.entries.filterNot { it in savedTools }).distinct()
+}
+
+internal fun savePdfToolOrder(context: Context, toolOrder: List<PdfReaderTool>) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putString(PDF_TOOL_ORDER_KEY, toolOrder.joinToString(",") { it.name }) }
+}
+
+internal fun loadPdfBottomTools(context: Context): Set<String> {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    val defaultBottomTools = PdfReaderTool.entries.filter { it.category == "Bottom Bar" }.map { it.name }.toSet()
+    return prefs.getStringSet(PDF_BOTTOM_TOOLS_KEY, defaultBottomTools) ?: defaultBottomTools
+}
+
+internal fun savePdfBottomTools(context: Context, bottomTools: Set<String>) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putStringSet(PDF_BOTTOM_TOOLS_KEY, bottomTools) }
 }
 
 internal fun loadCustomHighlightColors(context: Context): Map<PdfHighlightColor, Color> {
@@ -139,7 +174,7 @@ internal fun loadPdfThemeId(context: Context): String {
 }
 
 internal fun loadUseOnlineDict(context: Context): Boolean {
-    @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss") return false
+    @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss" && BuildConfig.IS_OFFLINE) return false
     val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
     return prefs.getBoolean(PREF_USE_ONLINE_DICT, true)
 }

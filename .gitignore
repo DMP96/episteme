@@ -8,7 +8,7 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
-/build
+build/
 /captures
 .externalNativeBuild
 .cxx
@@ -18,3 +18,9 @@ local.properties
 google-services.json
 .kotlin/
 .idea/
+.gradle/
+third_party/pdfium/
+*.tgz
+kcef-bundle/
+cache/
+worker/

@@ -22,10 +22,9 @@ package com.aryan.reader
 
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
+import androidx.annotation.OptIn
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -33,17 +32,15 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.windowsizeclass.WindowSizeClass
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.util.UnstableApi
 import androidx.navigation.NavHostController
-import kotlinx.coroutines.launch
 
 sealed class BottomBarScreen(val route: String, val stringResId: Int, val iconResId: Int) {
     object Home : BottomBarScreen("home", R.string.nav_home, R.drawable.home)
@@ -55,6 +52,7 @@ private val bottomBarItems = listOf(
     BottomBarScreen.Library,
 )
 
+@OptIn(UnstableApi::class)
 @Composable
 fun MainScreen(
     viewModel: MainViewModel,
@@ -75,21 +73,7 @@ fun MainScreen(
         if (viewingShelfName != null) {
             ShelfScreen(viewModel = viewModel)
         } else {
-            val pagerState = rememberPagerState(
-                initialPage = uiState.mainScreenStartPage,
-                pageCount = { bottomBarItems.size }
-            )
-            val scope = rememberCoroutineScope()
-
-            LaunchedEffect(uiState.mainScreenStartPage) {
-                if (pagerState.currentPage != uiState.mainScreenStartPage) {
-                    pagerState.animateScrollToPage(uiState.mainScreenStartPage)
-                }
-            }
-
-            LaunchedEffect(pagerState.currentPage) {
-                viewModel.setMainScreenPage(pagerState.currentPage)
-            }
+            val selectedPage = uiState.mainScreenStartPage.coerceIn(0, bottomBarItems.lastIndex)
 
             Scaffold(
                 contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
@@ -99,23 +83,28 @@ fun MainScreen(
                             NavigationBarItem(
                                 icon = { Icon(painterResource(id = screen.iconResId), contentDescription = stringResource(screen.stringResId)) },
                                 label = { Text(stringResource(screen.stringResId)) },
-                                selected = pagerState.currentPage == index,
-                                onClick = { scope.launch { pagerState.animateScrollToPage(index) } }
+                                selected = selectedPage == index,
+                                onClick = {
+                                    ReaderPerfLog.d("MainPager click page=$index route=${screen.route}")
+                                    if (selectedPage != index) {
+                                        val animStart = ReaderPerfLog.nowNanos()
+                                        viewModel.setMainScreenPage(index)
+                                        ReaderPerfLog.d(
+                                            "MainPager settled page=$index elapsed=${ReaderPerfLog.elapsedMs(animStart)}ms"
+                                        )
+                                    }
+                                }
                             )
                         }
                     }
                 }
             ) { innerPadding ->
-                HorizontalPager(
-                    state = pagerState,
+                androidx.compose.foundation.layout.Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(innerPadding),
-                    key = { bottomBarItems[it].route },
-                    beyondViewportPageCount = 1,
-                    userScrollEnabled = false
-                ) { page ->
-                    when (page) {
+                        .padding(innerPadding)
+                ) {
+                    when (selectedPage) {
                         0 -> HomeScreen(
                             viewModel = viewModel,
                             windowSizeClass = windowSizeClass,

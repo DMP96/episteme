@@ -28,6 +28,7 @@ import me.zhanghai.android.libarchive.ArchiveException
 import okhttp3.Request
 import timber.log.Timber
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipFile
 import androidx.core.graphics.createBitmap
 
@@ -88,42 +89,97 @@ object DocumentFactory {
             ArchiveDocumentWrapper(cacheFile)
         } else {
             val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: throw Exception("Failed to open PDF")
-            PdfDocumentWrapper(pdfiumCore.newDocument(pfd, password))
+            PdfDocumentWrapper(PdfiumEngineProvider.withPdfium { pdfiumCore.newDocument(pfd, password) })
         }
     }
 }
 
 // ================= PDF IMPLEMENTATION =================
 
+private inline fun closePdfiumResource(tag: String, closeBlock: () -> Unit) {
+    try {
+        closeBlock()
+    } catch (e: IllegalStateException) {
+        if (e.message == "Already closed") {
+            Timber.tag(tag).d(e, "Ignoring duplicate Pdfium close")
+        } else {
+            throw e
+        }
+    }
+}
+
 class PdfDocumentWrapper(val pdfDocument: PdfDocumentKt) : ReaderDocument {
-    override suspend fun getPageCount() = pdfDocument.getPageCount()
+    private val isClosed = AtomicBoolean(false)
+
+    override suspend fun getPageCount() = PdfiumEngineProvider.withPdfium {
+        pdfDocument.getPageCount()
+    }
+
     override suspend fun openPage(pageIndex: Int): ReaderPage? {
-        val page = pdfDocument.openPage(pageIndex) ?: return null
+        if (isClosed.get()) return null
+        val page = PdfiumEngineProvider.withPdfium {
+            if (isClosed.get()) null else pdfDocument.openPage(pageIndex)
+        } ?: return null
         return PdfPageWrapper(page)
     }
-    override suspend fun getTableOfContents() = pdfDocument.getFixedTableOfContents()
-    override fun close() { pdfDocument.close() }
+
+    override suspend fun getTableOfContents() = PdfiumEngineProvider.withPdfium {
+        pdfDocument.getFixedTableOfContents()
+    }
+
+    override fun close() {
+        if (!isClosed.compareAndSet(false, true)) return
+        PdfiumEngineProvider.withPdfiumBlocking {
+            closePdfiumResource("PdfDocumentWrapper") { pdfDocument.close() }
+        }
+    }
 }
 
 class PdfPageWrapper(val pdfPage: PdfPageKt) : ReaderPage {
-    override suspend fun getPageWidthPoint() = pdfPage.getPageWidthPoint()
-    override suspend fun getPageHeightPoint() = pdfPage.getPageHeightPoint()
-    override suspend fun getPageRotation() = pdfPage.getPageRotation()
+    private val isClosed = AtomicBoolean(false)
+
+    override suspend fun getPageWidthPoint() = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) 0 else pdfPage.getPageWidthPoint()
+    }
+
+    override suspend fun getPageHeightPoint() = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) 0 else pdfPage.getPageHeightPoint()
+    }
+
+    override suspend fun getPageRotation() = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) 0 else pdfPage.getPageRotation()
+    }
 
     override suspend fun renderPageBitmap(bitmap: Bitmap, startX: Int, startY: Int, drawSizeX: Int, drawSizeY: Int, renderAnnot: Boolean) {
-        pdfPage.renderPageBitmap(bitmap, startX, startY, drawSizeX, drawSizeY, renderAnnot)
+        PdfiumEngineProvider.withPdfium {
+            if (!isClosed.get()) {
+                pdfPage.renderPageBitmap(bitmap, startX, startY, drawSizeX, drawSizeY, renderAnnot)
+            }
+        }
     }
 
     override suspend fun mapRectToDevice(startX: Int, startY: Int, sizeX: Int, sizeY: Int, rotate: Int, coords: RectF) =
-        pdfPage.mapRectToDevice(startX, startY, sizeX, sizeY, rotate, coords)
+        PdfiumEngineProvider.withPdfium {
+            if (isClosed.get()) Rect() else pdfPage.mapRectToDevice(startX, startY, sizeX, sizeY, rotate, coords)
+        }
 
     override suspend fun mapDeviceCoordsToPage(startX: Int, startY: Int, sizeX: Int, sizeY: Int, rotate: Int, deviceX: Int, deviceY: Int) =
-        pdfPage.mapDeviceCoordsToPage(startX, startY, sizeX, sizeY, rotate, deviceX, deviceY)
+        PdfiumEngineProvider.withPdfium {
+            if (isClosed.get()) PointF() else pdfPage.mapDeviceCoordsToPage(startX, startY, sizeX, sizeY, rotate, deviceX, deviceY)
+        }
 
-    override suspend fun openTextPage(): ReaderTextPage = PdfTextPageWrapper(pdfPage.openTextPage())
+    override suspend fun openTextPage(): ReaderTextPage = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) DummyTextPage() else PdfTextPageWrapper(pdfPage.openTextPage())
+    }
 
     override suspend fun getLinks(): List<ReaderLink> {
-        return pdfPage.getPageLinks().map { ReaderLink(it.uri, it.destPageIdx, it.bounds) }
+        return PdfiumEngineProvider.withPdfium {
+            if (isClosed.get()) {
+                emptyList()
+            } else {
+                pdfPage.getPageLinks().map { ReaderLink(it.uri, it.destPageIdx, it.bounds) }
+            }
+        }
     }
 
     override fun getNativePointer(): Long {
@@ -159,29 +215,80 @@ class PdfPageWrapper(val pdfPage: PdfPageKt) : ReaderPage {
         return 0L
     }
 
-    override fun close() { pdfPage.close() }
+    override fun close() {
+        if (!isClosed.compareAndSet(false, true)) return
+        PdfiumEngineProvider.withPdfiumBlocking {
+            closePdfiumResource("PdfPageWrapper") { pdfPage.close() }
+        }
+    }
 }
 
 class PdfTextPageWrapper(private val textPage: PdfTextPageKt) : ReaderTextPage {
-    override suspend fun textPageCountChars() = textPage.textPageCountChars()
-    override suspend fun textPageGetText(startIndex: Int, count: Int) = textPage.textPageGetText(startIndex, count)
-    override suspend fun textPageGetRectsForRanges(ranges: IntArray) = textPage.textPageGetRectsForRanges(ranges)?.map { ReaderTextRect(it.rect) }
-    override suspend fun textPageGetCharIndexAtPos(x: Double, y: Double, xTolerance: Double, yTolerance: Double) = textPage.textPageGetCharIndexAtPos(x, y, xTolerance, yTolerance)
-    override suspend fun textPageGetCharBox(index: Int) = textPage.textPageGetCharBox(index)
-    override suspend fun textPageGetUnicode(index: Int): Int {
-        return textPage.textPageGetUnicode(index).code
+    private val isClosed = AtomicBoolean(false)
+
+    override suspend fun textPageCountChars() = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) 0 else textPage.textPageCountChars()
     }
-    override suspend fun loadWebLink(): ReaderWebLinks? {
-        val links = textPage.loadWebLink() ?: return null
-        return object : ReaderWebLinks {
-            override suspend fun countWebLinks() = links.countWebLinks()
-            override suspend fun getURL(linkIndex: Int, maxLength: Int) = links.getURL(linkIndex, maxLength)
-            override suspend fun countRects(linkIndex: Int) = links.countRects(linkIndex)
-            override suspend fun getRect(linkIndex: Int, rectIndex: Int) = links.getRect(linkIndex, rectIndex)
-            override fun close() { links.close() }
+
+    override suspend fun textPageGetText(startIndex: Int, count: Int) = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) null else textPage.textPageGetText(startIndex, count)
+    }
+
+    override suspend fun textPageGetRectsForRanges(ranges: IntArray) = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) null else textPage.textPageGetRectsForRanges(ranges)?.map { ReaderTextRect(it.rect) }
+    }
+
+    override suspend fun textPageGetCharIndexAtPos(x: Double, y: Double, xTolerance: Double, yTolerance: Double) = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) -1 else textPage.textPageGetCharIndexAtPos(x, y, xTolerance, yTolerance)
+    }
+
+    override suspend fun textPageGetCharBox(index: Int) = PdfiumEngineProvider.withPdfium {
+        if (isClosed.get()) null else textPage.textPageGetCharBox(index)
+    }
+
+    override suspend fun textPageGetUnicode(index: Int): Int {
+        return PdfiumEngineProvider.withPdfium {
+            if (isClosed.get()) 0 else textPage.textPageGetUnicode(index).code
         }
     }
-    override fun close() { textPage.close() }
+
+    override suspend fun loadWebLink(): ReaderWebLinks? {
+        val links = PdfiumEngineProvider.withPdfium {
+            if (isClosed.get()) null else textPage.loadWebLink()
+        } ?: return null
+        return object : ReaderWebLinks {
+            private val isClosed = AtomicBoolean(false)
+
+            override suspend fun countWebLinks() = PdfiumEngineProvider.withPdfium {
+                if (isClosed.get()) 0 else links.countWebLinks()
+            }
+
+            override suspend fun getURL(linkIndex: Int, maxLength: Int) = PdfiumEngineProvider.withPdfium {
+                if (isClosed.get()) null else links.getURL(linkIndex, maxLength)
+            }
+
+            override suspend fun countRects(linkIndex: Int) = PdfiumEngineProvider.withPdfium {
+                if (isClosed.get()) 0 else links.countRects(linkIndex)
+            }
+
+            override suspend fun getRect(linkIndex: Int, rectIndex: Int) = PdfiumEngineProvider.withPdfium {
+                if (isClosed.get()) RectF() else links.getRect(linkIndex, rectIndex)
+            }
+
+            override fun close() {
+                if (!isClosed.compareAndSet(false, true)) return
+                PdfiumEngineProvider.withPdfiumBlocking {
+                    closePdfiumResource("PdfWebLinksWrapper") { links.close() }
+                }
+            }
+        }
+    }
+    override fun close() {
+        if (!isClosed.compareAndSet(false, true)) return
+        PdfiumEngineProvider.withPdfiumBlocking {
+            closePdfiumResource("PdfTextPageWrapper") { textPage.close() }
+        }
+    }
 }
 
 // ================= CBZ, CBR, CB7 IMPLEMENTATION =================

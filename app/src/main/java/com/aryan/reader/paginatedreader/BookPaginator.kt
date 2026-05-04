@@ -120,7 +120,8 @@ class BookPaginator(
     private val mathMLRenderer: MathMLRenderer,
     private val userTextAlign: TextAlign?,
     private val paragraphGapMultiplier: Float,
-    private val imageSizeMultiplier: Float
+    private val imageSizeMultiplier: Float,
+    private val verticalMarginMultiplier: Float
 ) : IPaginator {
     override var totalPageCount by mutableIntStateOf(0)
         private set
@@ -185,6 +186,14 @@ class BookPaginator(
                 isLoading = true
                 Timber.d("Initialization started.")
 
+                if (chapters.isEmpty()) {
+                    totalPageCount = 0
+                    pageCountsAreAccurate = true
+                    isLoading = false
+                    Timber.w("Paginator initialized with no chapters. Skipping pagination startup.")
+                    return@launch
+                }
+
                 // 1. Book processing check (Keep existing logic)
                 val bookRecord = bookCacheDao.getProcessedBook(bookId)
                 if (bookRecord == null || bookRecord.processingVersion < LATEST_PROCESSING_VERSION) {
@@ -214,7 +223,7 @@ class BookPaginator(
                 // 5. Prioritize CURRENT chapter only
                 // We no longer blindly queue neighbors immediately to keep startup fast.
                 // We only queue the requested chapter.
-                val startChapter = initialChapterToPaginate.coerceIn(0, chapters.size - 1)
+                val startChapter = initialChapterToPaginate.coerceIn(0, chapters.lastIndex)
 
                 // Trigger actual pagination for the current chapter to replace the estimate with reality
                 triggerPagination(startChapter, PRIORITY_HIGHEST)
@@ -277,6 +286,7 @@ class BookPaginator(
             append("-ta:$userTextAlign")
             append("-pg:$paragraphGapMultiplier")
             append("-img:$imageSizeMultiplier")
+            append("-vm:$verticalMarginMultiplier")
         }
         val hash = configString.hashCode()
         return hash
@@ -503,7 +513,7 @@ class BookPaginator(
             parsingCssRules = parsingCssRules.merge(bookCssResult.rules)
         }
 
-        val semanticBlocks = htmlToSemanticBlocks(
+        val semanticBlocks = androidHtmlToSemanticBlocks(
             html = processedHtml,
             cssRules = parsingCssRules,
             textStyle = textStyle.copy(color = Color.Black),
@@ -792,6 +802,10 @@ class BookPaginator(
     }
 
     private fun triggerPagination(chapterIndex: Int, priority: Int) {
+        if (chapterIndex !in chapters.indices) {
+            Timber.w("Trigger: Ignoring invalid chapter index $chapterIndex. Chapter count: ${chapters.size}.")
+            return
+        }
         if (pageCache[chapterIndex] != null) {
             Timber.v("Trigger: Chapter $chapterIndex is already in cache. Ignoring.")
             return

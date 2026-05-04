@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
+import com.aryan.reader.ReaderPerfLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -15,6 +16,116 @@ object LocalSyncUtils {
     private const val TAG = "FolderSync"
     private const val ANNOTATION_SUFFIX = "_annotations"
     private const val SYNC_SUBFOLDER_NAME = "EpistemeSyncData"
+
+    private data class SyncFileEntry(
+        val name: String,
+        val uri: Uri
+    )
+
+    private fun syncSubfolderDocId(rootDocId: String): String {
+        return if (rootDocId.endsWith("/$SYNC_SUBFOLDER_NAME")) {
+            rootDocId
+        } else if (rootDocId.endsWith(":")) {
+            rootDocId + SYNC_SUBFOLDER_NAME
+        } else {
+            "$rootDocId/$SYNC_SUBFOLDER_NAME"
+        }
+    }
+
+    private fun querySyncSubfolderFiles(context: Context, sourceFolderUri: Uri): List<SyncFileEntry> {
+        val start = ReaderPerfLog.nowNanos()
+        val resolver = context.contentResolver
+        val rootDocId = try {
+            DocumentsContract.getTreeDocumentId(sourceFolderUri)
+        } catch (_: Exception) {
+            ReaderPerfLog.w("LocalSync direct query skipped: invalid tree uri=$sourceFolderUri")
+            return emptyList()
+        }
+        val syncDocId = syncSubfolderDocId(rootDocId)
+        val syncDirUri = DocumentsContract.buildDocumentUriUsingTree(sourceFolderUri, syncDocId)
+        val documentProjection = arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE)
+        val isSyncDir = try {
+            resolver.query(syncDirUri, documentProjection, null, null, null)?.use { cursor ->
+                cursor.moveToFirst() &&
+                    cursor.getString(0) == DocumentsContract.Document.MIME_TYPE_DIR
+            } == true
+        } catch (_: Exception) {
+            false
+        }
+
+        if (!isSyncDir) {
+            ReaderPerfLog.d(
+                "LocalSync direct query sync dir missing rootDocId=$rootDocId syncDocId=$syncDocId"
+            )
+            return querySyncSubfolderFilesFallback(context, sourceFolderUri, "missing-direct-sync-dir")
+        }
+
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(sourceFolderUri, syncDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        val entries = mutableListOf<SyncFileEntry>()
+        try {
+            resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                while (cursor.moveToNext()) {
+                    val mimeType = cursor.getString(mimeCol)
+                    if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                    val name = cursor.getString(nameCol) ?: continue
+                    val docId = cursor.getString(idCol) ?: continue
+                    entries.add(
+                        SyncFileEntry(
+                            name = name,
+                            uri = DocumentsContract.buildDocumentUriUsingTree(sourceFolderUri, docId)
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to query sync subfolder directly")
+            return querySyncSubfolderFilesFallback(context, sourceFolderUri, "direct-query-error")
+        }
+        ReaderPerfLog.d(
+            "LocalSync direct query files=${entries.size} elapsed=${ReaderPerfLog.elapsedMs(start)}ms syncDocId=$syncDocId"
+        )
+        return entries
+    }
+
+    private fun querySyncSubfolderFilesFallback(
+        context: Context,
+        sourceFolderUri: Uri,
+        reason: String
+    ): List<SyncFileEntry> {
+        val start = ReaderPerfLog.nowNanos()
+        return try {
+            val rootTree = DocumentFile.fromTreeUri(context, sourceFolderUri)
+            val syncDir = rootTree?.findFile(SYNC_SUBFOLDER_NAME)
+            if (syncDir == null || !syncDir.isDirectory) {
+                ReaderPerfLog.w("LocalSync fallback query found no sync dir reason=$reason uri=$sourceFolderUri")
+                emptyList()
+            } else {
+                val entries = syncDir.listFiles()
+                    .asSequence()
+                    .filter { it.isFile }
+                    .mapNotNull { file ->
+                        val name = file.name ?: return@mapNotNull null
+                        SyncFileEntry(name = name, uri = file.uri)
+                    }
+                    .toList()
+                ReaderPerfLog.d(
+                    "LocalSync fallback query files=${entries.size} elapsed=${ReaderPerfLog.elapsedMs(start)}ms reason=$reason"
+                )
+                entries
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to query sync subfolder fallback")
+            emptyList()
+        }
+    }
 
     private fun getOrCreateSyncDir(rootTree: DocumentFile): DocumentFile? {
         val existing = rootTree.findFile(SYNC_SUBFOLDER_NAME)
@@ -209,28 +320,66 @@ object LocalSyncUtils {
 
     suspend fun preloadAnnotationSidecars(
         context: Context,
-        rootTree: DocumentFile
+        sourceFolderUri: Uri
     ): Map<String, Pair<Long, String>> = withContext(Dispatchers.IO) {
         val results = mutableMapOf<String, Pair<Long, String>>()
 
         try {
-            val syncDir = rootTree.findFile(SYNC_SUBFOLDER_NAME)
-            if (syncDir == null || !syncDir.isDirectory) return@withContext results
-            val bookIds = syncDir.listFiles()
-                .mapNotNull { extractAnnotationBookId(it.name) }
-                .toSet()
-
-            for (bookId in bookIds) {
-                val best = resolveAndCleanAnnotationConflicts(context, syncDir, bookId)
-                if (best != null) {
-                    results[bookId] = best
+            val groupedFiles = querySyncSubfolderFiles(context, sourceFolderUri)
+                .filter { file ->
+                    val name = file.name
+                    extractAnnotationBookId(name) != null &&
+                        !name.contains(".syncthing.")
                 }
+                .groupBy { file -> extractAnnotationBookId(file.name).orEmpty() }
+
+            for ((bookId, files) in groupedFiles) {
+                val best = resolveAnnotationConflictsReadOnly(context, bookId, files)
+                if (best != null) results[bookId] = best
             }
         } catch (e: Exception) {
             Timber.tag("FolderAnnotationSync").e(e, "Error preloading annotation sidecars")
         }
 
         return@withContext results
+    }
+
+    private fun resolveAnnotationConflictsReadOnly(
+        context: Context,
+        bookId: String,
+        files: List<SyncFileEntry>
+    ): Pair<Long, String>? {
+        val basePattern = ".${bookId}${ANNOTATION_SUFFIX}"
+        val legacyPattern = "${bookId}${ANNOTATION_SUFFIX}"
+        var bestTs = -1L
+        var bestData: String? = null
+
+        for (file in files) {
+            val name = file.name
+            if (!((name.startsWith(basePattern) || name.startsWith(legacyPattern)) &&
+                    name.endsWith(".json") &&
+                    !name.endsWith(".tmp") &&
+                    !name.contains(".syncthing."))
+            ) {
+                continue
+            }
+            try {
+                val content = context.contentResolver.openInputStream(file.uri)?.use {
+                    it.bufferedReader().readText()
+                } ?: continue
+                val json = JSONObject(content)
+                val ts = json.optLong("timestamp", 0L)
+                val data = json.optJSONObject("data")?.toString()
+                if (data != null && ts > bestTs) {
+                    bestTs = ts
+                    bestData = data
+                }
+            } catch (e: Exception) {
+                Timber.tag("FolderAnnotationSync").e(e, "Error parsing annotation sidecar: $name")
+            }
+        }
+
+        return bestData?.let { bestTs to it }
     }
 
     suspend fun getAnnotationSidecar(
@@ -253,12 +402,13 @@ object LocalSyncUtils {
     private fun resolveAndCleanAnnotationConflicts(
         context: Context,
         syncDir: DocumentFile,
-        bookId: String
+        bookId: String,
+        knownFiles: List<DocumentFile>? = null
     ): Pair<Long, String>? {
         val basePattern = ".${bookId}${ANNOTATION_SUFFIX}"
         val legacyPattern = "${bookId}${ANNOTATION_SUFFIX}"
 
-        val allFiles = syncDir.listFiles()
+        val allFiles = knownFiles ?: syncDir.listFiles().asList()
 
         val candidates = allFiles.filter { file ->
             val name = file.name ?: ""
@@ -475,21 +625,17 @@ object LocalSyncUtils {
         val finalResults = mutableMapOf<String, FolderBookMetadata>()
 
         try {
-            val rootTree = DocumentFile.fromTreeUri(context, sourceFolderUri) ?: return@withContext finalResults
-            val syncDir = rootTree.findFile(SYNC_SUBFOLDER_NAME)
-            if (syncDir == null || !syncDir.isDirectory) return@withContext finalResults
-            val allFiles = syncDir.listFiles()
-
+            val allFiles = querySyncSubfolderFiles(context, sourceFolderUri)
             val groupedFiles = allFiles
                 .filter {
-                    val name = it.name ?: ""
+                    val name = it.name
                     (name.endsWith(".json") || name.contains(".sync-conflict")) &&
                             !name.contains(ANNOTATION_SUFFIX) &&
                             !name.endsWith(".tmp") &&
                             !name.contains(".syncthing.")
                 }
                 .groupBy { file ->
-                    var name = file.name ?: ""
+                    var name = file.name
                     if (name.startsWith(".")) name = name.substring(1)
                     if (name.contains(".sync-conflict")) {
                         name.substringBefore(".sync-conflict")
@@ -499,17 +645,47 @@ object LocalSyncUtils {
                 }
 
             groupedFiles.forEach { (bookId, files) ->
-                val winner = resolveAndCleanConflicts(context, files, bookId)
+                val winner = resolveMetadataConflictsReadOnly(context, files, bookId)
                 if (winner != null) {
                     finalResults[bookId] = winner
                 }
             }
 
-            Timber.tag(TAG).d("getAllFolderMetadata: Consolidated ${groupedFiles.size} book records from root.")
+            Timber.tag(TAG).d("getAllFolderMetadata: Read ${finalResults.size}/${groupedFiles.size} book records from sync data.")
+            ReaderPerfLog.d(
+                "LocalSync metadata read files=${allFiles.size} groups=${groupedFiles.size} records=${finalResults.size}"
+            )
 
         } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Error scanning root folder for metadata")
+            Timber.tag(TAG).e(e, "Error scanning sync data folder for metadata")
+            ReaderPerfLog.w("LocalSync metadata read failed uri=$sourceFolderUri")
         }
         return@withContext finalResults
+    }
+
+    private fun resolveMetadataConflictsReadOnly(
+        context: Context,
+        files: List<SyncFileEntry>,
+        bookId: String
+    ): FolderBookMetadata? {
+        var bestMeta: FolderBookMetadata? = null
+        for (file in files) {
+            try {
+                val jsonString = context.contentResolver.openInputStream(file.uri)?.use { input ->
+                    input.bufferedReader().use { it.readText() }
+                }
+                if (jsonString != null) {
+                    val meta = FolderBookMetadata.fromJsonString(jsonString)
+                    if (meta.bookId == bookId &&
+                        (bestMeta == null || meta.lastModifiedTimestamp > bestMeta!!.lastModifiedTimestamp)
+                    ) {
+                        bestMeta = meta
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "Failed to parse metadata sidecar: ${file.name}")
+            }
+        }
+        return bestMeta
     }
 }

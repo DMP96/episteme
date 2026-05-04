@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.outlined.AccountCircle
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -134,6 +135,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.os.LocaleListCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.util.UnstableApi
 import androidx.navigation.NavHostController
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -151,11 +153,17 @@ internal fun Context.findActivity(): Activity? = when (this) {
     else -> null
 }
 
+@UnstableApi
+@androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     viewModel: MainViewModel, windowSizeClass: WindowSizeClass, navController: NavHostController
 ) {
+    val compStart = remember { System.currentTimeMillis() }
+    LaunchedEffect(Unit) {
+        ReaderPerfLog.d("HomeScreen initial composition ${System.currentTimeMillis() - compStart}ms")
+    }
     val context = LocalContext.current
     val customTabUriHandler = remember { CustomTabUriHandler(context) }
     var showCloseAllTabsDialog by remember { mutableStateOf(false) }
@@ -163,14 +171,15 @@ fun HomeScreen(
 
     CompositionLocalProvider(LocalUriHandler provides customTabUriHandler) {
         val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-        val recentFilesForHome = uiState.recentFiles.filter { it.isRecent }
-        val openTabs = uiState.openTabs
-        val selectedContextItems = uiState.contextualActionItems
-        val isContextualModeActive = selectedContextItems.isNotEmpty()
+        val screenModel = remember(uiState) { uiState.toHomeScreenModel() }
+        val recentFilesForHome = screenModel.recentFiles
+        val openTabs = screenModel.openTabs
+        val selectedContextItems = screenModel.selectedItems
+        val isContextualModeActive = screenModel.isContextualModeActive
         val scope = rememberCoroutineScope()
         val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
         val snackbarHostState = remember { SnackbarHostState() }
-        val deviceLimitState = uiState.deviceLimitState
+        val deviceLimitState = screenModel.deviceLimitState
 
         var showDeleteConfirmDialog by remember { mutableStateOf(false) }
         var showClearCloudDataDialog by remember { mutableStateOf(false) }
@@ -304,6 +313,12 @@ fun HomeScreen(
                                 navController.navigate(AppDestinations.FONTS_SCREEN_ROUTE)
                             }
                         },
+                        onAiSettingsClick = {
+                            scope.launch {
+                                drawerState.close()
+                                navController.navigate(AppDestinations.AI_SETTINGS_SCREEN_ROUTE)
+                            }
+                        },
                         navController = navController,
                         onFolderSyncToggle = viewModel::setFolderSyncEnabled
                     )
@@ -341,7 +356,10 @@ fun HomeScreen(
                                 onTestPanelDetectionClick = { viewModel.testPanelDetection(context) },
                                 onTestSpeechBubbleDetectionClick = { viewModel.testSpeechBubbleDetection(context) },
                                 onLanguageClick = { showLanguageDialog = true },
-                                onExportLogsClick = { viewModel.exportLogsToFile(context) }
+                                onExportLogsClick = { viewModel.exportLogsToFile(context) },
+                                onToggleHideReaderAi = {
+                                    saveHideReaderAiFeatures(context, !loadHideReaderAiFeatures(context))
+                                }
                             )
                         } else {
                             ContextualTopAppBar(
@@ -367,8 +385,8 @@ fun HomeScreen(
                                 .fillMaxSize()
                                 .padding(paddingValues)
                         ) {
-                            if (recentFilesForHome.isEmpty() && (!uiState.isTabsEnabled || openTabs.isEmpty())) {
-                                if (uiState.recentFiles.isEmpty()) {
+                            if (screenModel.isEmpty) {
+                                if (screenModel.isLibraryEmpty) {
                                     EmptyState(
                                         title = stringResource(R.string.your_library_empty),
                                         message = stringResource(R.string.your_library_empty_desc),
@@ -528,7 +546,8 @@ fun HomeScreen(
                             uiState = uiState,
                             onThemeModeChanged = viewModel::setAppThemeMode,
                             onContrastOptionChanged = viewModel::setAppContrastOption,
-                            onTextDimFactorChanged = viewModel::setAppTextDimFactor,
+                            onTextDimFactorLightChanged = viewModel::setAppTextDimFactorLight,
+                            onTextDimFactorDarkChanged = viewModel::setAppTextDimFactorDark,
                             onSeedColorChanged = viewModel::setAppSeedColor,
                             onCustomThemeAdded = viewModel::addCustomAppTheme,
                             onCustomThemeDeleted = viewModel::deleteCustomAppTheme,
@@ -596,6 +615,9 @@ private fun RecentFilesContent(
     hasSyncedFolder: Boolean
 ) {
     val canRefresh = isSyncEnabled || hasSyncedFolder
+    val selectedItemUris = remember(selectedContextItems) {
+        selectedContextItems.mapNotNullTo(mutableSetOf()) { it.uriString }
+    }
 
     val content = @Composable {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -608,7 +630,7 @@ private fun RecentFilesContent(
                 isTabsEnabled = isTabsEnabled,
                 onTabCloseClick = onTabCloseClick,
                 onCloseAllTabsClick = onCloseAllTabsClick,
-                selectedItemUris = selectedContextItems.mapNotNull { it.uriString }.toSet(),
+                selectedItemUris = selectedItemUris,
                 pinnedHomeBookIds = pinnedHomeBookIds,
                 onItemClick = onItemClick,
                 onItemLongClick = onItemLongClick,
@@ -996,10 +1018,13 @@ fun DefaultTopAppBar(
     onTestPanelDetectionClick: () -> Unit,
     onTestSpeechBubbleDetectionClick: () -> Unit,
     onLanguageClick: () -> Unit,
-    onExportLogsClick: () -> Unit
+    onExportLogsClick: () -> Unit,
+    onToggleHideReaderAi: () -> Unit
 ) {
     var showOptionsMenu by remember { mutableStateOf(false) }
     var showLimitMenu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var hideReaderAiFeatures by remember { mutableStateOf(loadHideReaderAiFeatures(context)) }
 
     CustomTopAppBar(title = { }, navigationIcon = {
         IconButton(onClick = onDrawerClick) {
@@ -1086,6 +1111,20 @@ fun DefaultTopAppBar(
                     showOptionsMenu = false
                 })
 
+                DropdownMenuItem(
+                    text = { Text(if (hideReaderAiFeatures) "Show AI in reader" else "Hide AI in reader") },
+                    onClick = {
+                        onToggleHideReaderAi()
+                        hideReaderAiFeatures = !hideReaderAiFeatures
+                        showOptionsMenu = false
+                    },
+                    trailingIcon = {
+                        if (hideReaderAiFeatures) {
+                            Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_enabled))
+                        }
+                    }
+                )
+
                 HorizontalDivider()
                 DropdownMenuItem(text = { Text(stringResource(R.string.options_clear_book_cache)) }, onClick = {
                     onClearCache()
@@ -1141,6 +1180,7 @@ private fun AppDrawerContent(
     onUpgradeClick: () -> Unit,
     onSyncUpsellClick: () -> Unit,
     onFontsClick: () -> Unit,
+    onAiSettingsClick: () -> Unit,
     navController: NavHostController,
     onFolderSyncToggle: (Boolean) -> Unit
 ) {
@@ -1310,6 +1350,26 @@ private fun AppDrawerContent(
                 onClick = onFontsClick,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
             )
+
+            if (isOss && !BuildConfig.IS_OFFLINE) {
+                NavigationDrawerItem(
+                    icon = { Icon(painterResource(id = R.drawable.ai), contentDescription = null) },
+                    label = { Text("AI keys and models") },
+                    selected = false,
+                    onClick = onAiSettingsClick,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
+
+            if (isOss) {
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Outlined.FavoriteBorder, contentDescription = null) },
+                    label = { Text(stringResource(R.string.drawer_support_project)) },
+                    selected = false,
+                    onClick = { navController.navigate(AppDestinations.SUPPORT_PROJECT_SCREEN_ROUTE) },
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
 
             NavigationDrawerItem(
                 icon = { Icon(painterResource(id = R.drawable.feedback), contentDescription = null) },
@@ -1692,7 +1752,8 @@ fun AppThemeBottomSheet(
     uiState: ReaderScreenState,
     onThemeModeChanged: (AppThemeMode) -> Unit,
     onContrastOptionChanged: (AppContrastOption) -> Unit,
-    onTextDimFactorChanged: (Float) -> Unit,
+    onTextDimFactorLightChanged: (Float) -> Unit,
+    onTextDimFactorDarkChanged: (Float) -> Unit,
     onSeedColorChanged: (Color?) -> Unit,
     onCustomThemeAdded: (CustomAppTheme) -> Unit,
     onCustomThemeDeleted: (String) -> Unit,
@@ -1756,24 +1817,68 @@ fun AppThemeBottomSheet(
 
             Spacer(Modifier.height(24.dp))
 
-            Text(stringResource(R.string.app_theme_text_brightness), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-                    .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
-                    .padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
-                androidx.compose.material3.Slider(
-                    value = uiState.appTextDimFactor,
-                    onValueChange = onTextDimFactorChanged,
-                    valueRange = 0.3f..1.0f,
-                    modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
-                )
-                Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+            if (uiState.appThemeMode == AppThemeMode.SYSTEM) {
+                Text("${stringResource(R.string.app_theme_text_brightness)} (Light)", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
+                    androidx.compose.material3.Slider(
+                        value = uiState.appTextDimFactorLight,
+                        onValueChange = onTextDimFactorLightChanged,
+                        valueRange = 0.3f..1.0f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                Text("${stringResource(R.string.app_theme_text_brightness)} (Dark)", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
+                    androidx.compose.material3.Slider(
+                        value = uiState.appTextDimFactorDark,
+                        onValueChange = onTextDimFactorDarkChanged,
+                        valueRange = 0.3f..1.0f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+                }
+            } else {
+                Text(stringResource(R.string.app_theme_text_brightness), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
+                    androidx.compose.material3.Slider(
+                        value = if (uiState.appThemeMode == AppThemeMode.DARK) uiState.appTextDimFactorDark else uiState.appTextDimFactorLight,
+                        onValueChange = if (uiState.appThemeMode == AppThemeMode.DARK) onTextDimFactorDarkChanged else onTextDimFactorLightChanged,
+                        valueRange = 0.3f..1.0f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+                }
             }
 
             Spacer(Modifier.height(24.dp))

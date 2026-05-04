@@ -38,7 +38,7 @@ import kotlinx.serialization.protobuf.ProtoBuf
 import com.aryan.reader.paginatedreader.semanticBlockModule
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
-import androidx.annotation.StringRes
+import androidx.annotation.OptIn
 import androidx.compose.ui.graphics.toArgb
 import androidx.core.content.edit
 import androidx.core.graphics.createBitmap
@@ -48,6 +48,7 @@ import androidx.credentials.exceptions.NoCredentialException
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.util.UnstableApi
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
@@ -64,8 +65,8 @@ import com.aryan.reader.data.RecentFileItem
 import com.aryan.reader.data.RecentFilesRepository
 import com.aryan.reader.data.RemoteConfigRepository
 import com.aryan.reader.data.ShelfMetadata
-import com.aryan.reader.data.SmartCollectionEngine
 import com.aryan.reader.data.TagEntity
+import com.aryan.reader.data.getUri
 import com.aryan.reader.data.toBookMetadata
 import com.aryan.reader.data.toRecentFileItem
 import com.aryan.reader.epub.CalibreBundleExtractor
@@ -75,6 +76,7 @@ import com.aryan.reader.epub.EpubParser
 import com.aryan.reader.epub.ImportedFileCache
 import com.aryan.reader.epub.MobiParser
 import com.aryan.reader.epub.SingleFileImporter
+import com.aryan.reader.epub.hasReadableExtractedContent
 import com.aryan.reader.ml.ISpeechBubbleDetector
 import com.aryan.reader.ml.SpeechBubble
 import com.aryan.reader.paginatedreader.Locator
@@ -120,59 +122,17 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.ExperimentalSerializationApi
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
-import java.util.Date
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors.newSingleThreadExecutor
 import java.util.concurrent.TimeUnit
-
-private const val KEY_RENDER_MODE = "render_mode"
-private const val KEY_FOLDER_SYNC_ENABLED = "folder_sync_enabled"
-private const val KEY_MAIN_SCREEN_START_PAGE = "main_screen_start_page"
-private const val KEY_LIBRARY_SCREEN_START_PAGE = "library_screen_start_page"
-private const val KEY_LAST_VIEWING_SHELF_ID = "last_viewing_shelf_id"
-private const val KEY_LAST_ADDING_BOOKS_TO_SHELF = "last_adding_books_to_shelf"
-
-private const val KEY_FILTER_FILE_TYPES = "filter_file_types"
-private const val KEY_FILTER_FOLDERS = "filter_folders"
-private const val KEY_FILTER_READ_STATUS = "filter_read_status"
-private const val KEY_FILTER_TAG_IDS = "filter_tag_ids"
-private const val KEY_DEFAULT_TAGS_SEEDED = "default_tags_seeded"
-private val PDF_VIEWER_FILE_TYPES = setOf(FileType.PDF, FileType.CBZ, FileType.CBR, FileType.CB7)
-private val EPUB_READER_FILE_TYPES = setOf(
-    FileType.EPUB,
-    FileType.MOBI,
-    FileType.MD,
-    FileType.TXT,
-    FileType.HTML,
-    FileType.FB2,
-    FileType.DOCX,
-    FileType.ODT,
-    FileType.FODT
-)
-
-data class BannerMessage(val message: String, val isError: Boolean = false, val isPersistent: Boolean = false)
-
-data class ImportResult(
-    val internalUri: Uri,
-    val bookId: String,
-    val type: FileType,
-    val bundleResult: CalibreBundleResult? = null
-)
-
-data class UserData(
-    val uid: String, val displayName: String?, val photoUrl: String?, val email: String?
-)
-
-data class NavigationEvent(
-    val route: String, val bookId: String? = null, val uri: Uri? = null
-)
 
 private data class SpeechBubbleCacheKey(
     val documentId: String,
@@ -187,166 +147,8 @@ private data class CachedSpeechBubble(
     val maskBitmap: Bitmap?
 )
 
-enum class AddBooksSource(@StringRes val labelRes: Int) {
-    UNSHELVED(R.string.add_books_source_unshelved),
-    ALL_BOOKS(R.string.add_books_source_all_books)
-}
-
-enum class AppThemeMode(@StringRes val labelRes: Int) {
-    SYSTEM(R.string.app_theme_mode_system),
-    LIGHT(R.string.app_theme_mode_light),
-    DARK(R.string.app_theme_mode_dark)
-}
-
-enum class AppContrastOption(@StringRes val labelRes: Int, val value: Double) {
-    STANDARD(R.string.app_contrast_standard, 0.0),
-    MEDIUM(R.string.app_contrast_medium, 0.5),
-    HIGH(R.string.app_contrast_high, 1.0)
-}
-
-data class CustomAppTheme(
-    val id: String,
-    val name: String,
-    val seedColor: androidx.compose.ui.graphics.Color
-)
-
-enum class FileType {
-    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, DOCX, ODT, FODT
-}
-
-enum class RenderMode {
-    VERTICAL_SCROLL, PAGINATED
-}
-
-data class DeviceItem(val deviceId: String, val deviceName: String, val lastSeen: Date?)
-
-data class DeviceLimitReachedState(
-    val isLimitReached: Boolean = false, val registeredDevices: List<DeviceItem> = emptyList()
-)
-
-data class SyncedFolder(
-    val uriString: String, val name: String, val lastScanTime: Long, val allowedFileTypes: Set<FileType> = FileType.entries.toSet()
-)
-
-enum class ShelfType { MANUAL, SMART, TAG, SERIES, FOLDER }
-
-data class Shelf(
-    val id: String,
-    val name: String,
-    val type: ShelfType,
-    val books: List<RecentFileItem>,
-    val directBooks: List<RecentFileItem> = books,
-    val parentShelfId: String? = null,
-    val childShelfIds: List<String> = emptyList(),
-    val depth: Int = 0,
-    val sortKey: String = name.lowercase()
-) {
-    val bookCount: Int get() = books.size
-    val topBook: RecentFileItem? get() = books.maxByOrNull { it.timestamp }
-    val directBookCount: Int get() = directBooks.size
-    val childShelfCount: Int get() = childShelfIds.size
-}
-
-enum class SortOrder(@StringRes val labelRes: Int) {
-    RECENT(R.string.sort_recent),
-    TITLE_ASC(R.string.sort_title_az),
-    AUTHOR_ASC(R.string.sort_author_az),
-    PERCENT_ASC(R.string.sort_percent_asc),
-    PERCENT_DESC(R.string.sort_percent_desc),
-    SIZE_ASC(R.string.sort_size_smallest),
-    SIZE_DESC(R.string.sort_size_biggest)
-}
-
-enum class ReadStatusFilter(@StringRes val labelRes: Int) {
-    ALL(R.string.read_status_all),
-    UNREAD(R.string.read_status_unread),
-    IN_PROGRESS(R.string.read_status_in_progress),
-    COMPLETED(R.string.read_status_completed)
-}
-
-data class LibraryFilters(
-    val fileTypes: Set<FileType> = emptySet(),
-    val sourceFolders: Set<String> = emptySet(),
-    val readStatus: ReadStatusFilter = ReadStatusFilter.ALL,
-    val tagIds: Set<String> = emptySet()
-) {
-    val isActive: Boolean
-        get() = fileTypes.isNotEmpty() ||
-            sourceFolders.isNotEmpty() ||
-            readStatus != ReadStatusFilter.ALL ||
-            tagIds.isNotEmpty()
-}
-
-data class ReaderScreenState(
-    val selectedPdfUri: Uri? = null,
-    val selectedBookId: String? = null,
-    val selectedEpubBook: EpubBook? = null,
-    val selectedEpubUri: Uri? = null,
-    val selectedFileType: FileType? = null,
-    val isLoading: Boolean = false,
-    val errorMessage: String? = null,
-    val contextualActionItems: Set<RecentFileItem> = emptySet(),
-    val renderMode: RenderMode = RenderMode.VERTICAL_SCROLL,
-    val sortOrder: SortOrder = SortOrder.RECENT,
-    val initialLocator: Locator? = null,
-    val initialCfi: String? = null,
-    val initialBookmarksJson: String? = null,
-    val initialHighlightsJson: String? = null,
-    val initialPageInBook: Int? = null,
-    val shelves: List<Shelf> = emptyList(),
-    val viewingShelfId: String? = null,
-    val isAddingBooksToShelf: Boolean = false,
-    val showCreateShelfDialog: Boolean = false,
-    val mainScreenStartPage: Int = 0,
-    val libraryScreenStartPage: Int = 0,
-    val showRenameShelfDialogFor: String? = null,
-    val showDeleteShelfDialogFor: String? = null,
-    val addBooksSource: AddBooksSource = AddBooksSource.UNSHELVED,
-    val booksSelectedForAdding: Set<String> = emptySet(),
-    val booksAvailableForAdding: List<RecentFileItem> = emptyList(),
-    val contextualActionShelfIds: Set<String> = emptySet(),
-    val currentUser: UserData? = null,
-    val isAuthMenuExpanded: Boolean = false,
-    val isProUser: Boolean = false,
-    val credits: Int = 0,
-    val isSyncEnabled: Boolean = false,
-    val isFolderSyncEnabled: Boolean = false,
-    val bannerMessage: BannerMessage? = null,
-    val deviceLimitState: DeviceLimitReachedState = DeviceLimitReachedState(),
-    val isReplacingDevice: Boolean = false,
-    val isRequestingDrivePermission: Boolean = false,
-    val downloadingBookIds: Set<String> = emptySet(),
-    val uploadingBookIds: Set<String> = emptySet(),
-    val syncedFolders: List<SyncedFolder> = emptyList(),
-    val lastFolderScanTime: Long? = null,
-    val hasUnreadFeedback: Boolean = false,
-    val searchQuery: String = "",
-    val isSearchActive: Boolean = false,
-    val isRefreshing: Boolean = false,
-    val reflowProgress: Float? = null,
-    val recentFiles: List<RecentFileItem> = emptyList(),
-    val allRecentFiles: List<RecentFileItem> = emptyList(),
-    val rawLibraryFiles: List<RecentFileItem> = emptyList(),
-    val pinnedHomeBookIds: Set<String> = emptySet(),
-    val pinnedLibraryBookIds: Set<String> = emptySet(),
-    val libraryFilters: LibraryFilters = LibraryFilters(),
-    val recentFilesLimit: Int = 0,
-    val isTabsEnabled: Boolean = false,
-    val openTabIds: List<String> = emptyList(),
-    val openTabs: List<RecentFileItem> = emptyList(),
-    val activeTabBookId: String? = null,
-    val showExternalFileSavePromptFor: String? = null,
-    val externalFileBehavior: String = "ASK",
-    val useStrictFileFilter: Boolean = false,
-    val appThemeMode: AppThemeMode = AppThemeMode.SYSTEM,
-    val appContrastOption: AppContrastOption = AppContrastOption.STANDARD,
-    val appTextDimFactor: Float = 1.0f,
-    val appSeedColor: androidx.compose.ui.graphics.Color? = null,
-    val customAppThemes: List<CustomAppTheme> = emptyList(),
-    val allTags: List<TagEntity> = emptyList(),
-    val showTagSelectionDialogFor: Set<String> = emptySet(),
-)
-
+@kotlin.OptIn(ExperimentalSerializationApi::class)
+@UnstableApi
 open class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext: Context = application.applicationContext
     private val authRepository = AuthRepository(appContext)
@@ -380,6 +182,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private val _prefsUpdateFlow = MutableStateFlow(0L)
     private val prefsListener: SharedPreferences.OnSharedPreferenceChangeListener
     private val feedbackRepository = FeedbackRepository(appContext)
+    private val libraryStateProjector = LibraryStateProjector(AndroidFolderPathResolver())
     private var feedbackListener: Any? = null
     private val importMutex = Mutex()
     private val epubRecoveryMutex = Mutex()
@@ -611,7 +414,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     val totalFileLength = if (contentLength != -1L) downloadedBytes + contentLength else -1L
 
                     val input = connection.inputStream
-                    val output = java.io.FileOutputStream(tempFile, isPartial)
+                    val output = FileOutputStream(tempFile, isPartial)
                     val data = ByteArray(16 * 1024)
                     var count: Int
 
@@ -744,7 +547,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             appContrastOption = try {
                 AppContrastOption.valueOf(prefs.getString(KEY_APP_CONTRAST_OPTION, AppContrastOption.STANDARD.name) ?: AppContrastOption.STANDARD.name)
             } catch (_: Exception) { AppContrastOption.STANDARD },
-            appTextDimFactor = prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR, 1.0f),
+            appTextDimFactorLight = prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR_LIGHT, prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR, 1.0f)),
+            appTextDimFactorDark = prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR_DARK, prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR, 1.0f)),
             appSeedColor = if (prefs.contains(KEY_APP_SEED_COLOR)) androidx.compose.ui.graphics.Color(prefs.getInt(KEY_APP_SEED_COLOR, 0)) else null,
             customAppThemes = loadCustomAppThemes(prefs)
         )
@@ -808,298 +612,23 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     open val uiState: StateFlow<ReaderScreenState> = combine(
         _internalState, libraryFlow, tagFlow
     ) { internalState, (recentFilesFromDb, dbShelves, shelfRefs), (dbTags, tagRefs) ->
-        val tagsById = dbTags.associateBy { it.id }
-        val bookTagsMap = tagRefs.groupBy { it.bookId }.mapValues { entry ->
-            entry.value.mapNotNull { tagsById[it.tagId] }
+        withContext(Dispatchers.Default) {
+            libraryStateProjector.project(
+                LibraryProjectionInput(
+                    state = internalState,
+                    recentFilesFromDb = recentFilesFromDb,
+                    dbShelves = dbShelves,
+                    shelfRefs = shelfRefs,
+                    dbTags = dbTags,
+                    tagRefs = tagRefs
+                )
+            )
         }
-
-        val allLibraryFiles = recentFilesFromDb
-            .filterNot { it.bookId.endsWith("_reflow") }
-            .map { item ->
-            item.copy(tags = bookTagsMap[item.bookId] ?: emptyList())
-        }
-
-        val query = internalState.searchQuery.trim()
-        val rawFilteredByQuery = if (query.isBlank()) {
-            allLibraryFiles
-        } else {
-            allLibraryFiles.filter { item ->
-                item.displayName.contains(query, ignoreCase = true) ||
-                    item.title?.contains(query, ignoreCase = true) == true ||
-                    item.author?.contains(query, ignoreCase = true) == true ||
-                    item.tags.any { tag -> tag.name.contains(query, ignoreCase = true) }
-            }
-        }
-
-        val filters = internalState.libraryFilters
-        val libraryFiltered = rawFilteredByQuery.filter { item ->
-            val matchType = if (filters.fileTypes.isNotEmpty()) item.type in filters.fileTypes else true
-            val matchFolder = if (filters.sourceFolders.isNotEmpty()) {
-                val matchesInApp = filters.sourceFolders.contains("IN_APP_STORAGE") && item.sourceFolderUri == null && item.uriString?.startsWith("opds-pse") != true
-                val matchesSynced = item.sourceFolderUri in filters.sourceFolders
-                matchesInApp || matchesSynced
-            } else true
-            val progress = item.progressPercentage ?: 0f
-            val matchStatus = when (filters.readStatus) {
-                ReadStatusFilter.ALL -> true
-                ReadStatusFilter.UNREAD -> progress == 0f
-                ReadStatusFilter.IN_PROGRESS -> progress > 0f && progress < 100f
-                ReadStatusFilter.COMPLETED -> progress >= 100f
-            }
-            val matchTags = if (filters.tagIds.isNotEmpty()) {
-                item.tags.any { it.id in filters.tagIds }
-            } else true
-            matchType && matchFolder && matchStatus && matchTags
-        }
-
-        fun sortFiles(files: List<RecentFileItem>): List<RecentFileItem> {
-            return when (internalState.sortOrder) {
-                SortOrder.RECENT -> files.sortedByDescending { it.timestamp }
-                SortOrder.TITLE_ASC -> files.sortedBy { it.title?.lowercase() ?: it.displayName.lowercase() }
-                SortOrder.AUTHOR_ASC -> files.sortedWith(compareBy(nullsLast()) { it.author?.lowercase() })
-                SortOrder.PERCENT_ASC -> files.sortedBy { it.progressPercentage ?: 0f }
-                SortOrder.PERCENT_DESC -> files.sortedByDescending { it.progressPercentage ?: 0f }
-                SortOrder.SIZE_ASC -> files.sortedBy { it.fileSize }
-                SortOrder.SIZE_DESC -> files.sortedByDescending { it.fileSize }
-            }
-        }
-
-        val sortedLibraryFiles = sortFiles(libraryFiltered)
-        val visibleRecentFiles = sortFiles(allLibraryFiles.filter { it.isRecent }).take(
-            if (internalState.recentFilesLimit > 0) internalState.recentFilesLimit else Int.MAX_VALUE
-        )
-        val openTabsList = internalState.openTabIds.mapNotNull { tabId -> allLibraryFiles.find { it.bookId == tabId } }
-        val allShelves = mutableListOf<Shelf>()
-        val shelvedBookIds = mutableSetOf<String>()
-        val baseFilesMap = allLibraryFiles.associateBy { it.bookId }
-
-        dbShelves.forEach { shelfEntity ->
-            if (shelfEntity.isSmart && shelfEntity.smartRulesJson != null) {
-                val rules = SmartCollectionEngine.fromJson(shelfEntity.smartRulesJson)
-                if (rules != null) {
-                    val matchingBooks = allLibraryFiles.filter { SmartCollectionEngine.evaluate(it, rules) }
-                    allShelves.add(Shelf(shelfEntity.id, shelfEntity.name, ShelfType.SMART, sortFiles(matchingBooks)))
-                    shelvedBookIds.addAll(matchingBooks.map { it.bookId })
-                }
-            } else {
-                val bookIdsInShelf = shelfRefs.filter { it.shelfId == shelfEntity.id }.sortedBy { it.addedAt }.map { it.bookId }
-                val booksInShelf = bookIdsInShelf.mapNotNull { baseFilesMap[it] }
-                allShelves.add(Shelf(shelfEntity.id, shelfEntity.name, ShelfType.MANUAL, sortFiles(booksInShelf)))
-                shelvedBookIds.addAll(bookIdsInShelf)
-            }
-        }
-
-        val tagShelves = dbTags.mapNotNull { tag ->
-            val taggedBooks = allLibraryFiles.filter { item -> item.tags.any { it.id == tag.id } }
-            if (taggedBooks.isEmpty()) {
-                null
-            } else {
-                Shelf("tag_${tag.id}", tag.name, ShelfType.TAG, sortFiles(taggedBooks))
-            }
-        }
-        allShelves.addAll(tagShelves)
-
-        val seriesShelves = allLibraryFiles
-            .filter { !it.seriesName.isNullOrBlank() }
-            .groupBy { it.seriesName!! }
-            .filter { it.value.size >= 2 }
-            .map { (series, books) ->
-                val sortedSeries = books.sortedBy { it.seriesIndex ?: 999.0 }
-                shelvedBookIds.addAll(books.map { it.bookId })
-                Shelf("series_$series", series, ShelfType.SERIES, sortedSeries)
-            }
-        allShelves.addAll(seriesShelves)
-
-        val folderShelves = buildFolderShelves(
-            allLibraryFiles = allLibraryFiles,
-            syncedFolders = internalState.syncedFolders,
-            sortFiles = ::sortFiles
-        ).also { shelves ->
-            shelves.forEach { shelf ->
-                shelvedBookIds.addAll(shelf.books.map { it.bookId })
-            }
-        }
-        allShelves.addAll(folderShelves)
-
-        val unshelvedBooks = allLibraryFiles.filter { it.bookId !in shelvedBookIds }
-        allShelves.add(Shelf("unshelved", "Unshelved", ShelfType.MANUAL, sortFiles(unshelvedBooks)))
-
-        allShelves.sortWith(compareBy({ it.type.ordinal }, { it.sortKey }))
-
-        val validShelfIds = allShelves.mapTo(mutableSetOf()) { it.id }
-        val viewingShelfId = internalState.viewingShelfId?.takeIf { it in validShelfIds }
-        val selectedShelfIds = internalState.contextualActionShelfIds.filterTo(mutableSetOf()) { it in validShelfIds }
-
-        val booksAvailableForAdding = if (internalState.isAddingBooksToShelf && viewingShelfId != null) {
-            val currentShelfBookIds = allShelves
-                .find { it.id == viewingShelfId }
-                ?.books
-                ?.map { it.bookId }
-                ?.toSet()
-                ?: emptySet()
-            when (internalState.addBooksSource) {
-                AddBooksSource.UNSHELVED -> unshelvedBooks
-                AddBooksSource.ALL_BOOKS -> allLibraryFiles.filter { it.bookId !in currentShelfBookIds }
-            }
-        } else emptyList()
-
-        internalState.copy(
-            recentFiles = visibleRecentFiles,
-            allRecentFiles = sortedLibraryFiles,
-            rawLibraryFiles = allLibraryFiles,
-            viewingShelfId = viewingShelfId,
-            isAddingBooksToShelf = internalState.isAddingBooksToShelf && viewingShelfId != null,
-            contextualActionShelfIds = selectedShelfIds,
-            contextualActionItems = internalState.contextualActionItems.mapNotNull { ctx -> allLibraryFiles.find { it.bookId == ctx.bookId } }.toSet(),
-            shelves = allShelves,
-            openTabs = openTabsList,
-            booksAvailableForAdding = booksAvailableForAdding,
-            allTags = dbTags
-        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = _internalState.value
     )
-
-    private data class FolderShelfAccumulator(
-        val id: String,
-        val name: String,
-        val depth: Int,
-        val parentShelfId: String?,
-        val sortPath: String,
-        val books: MutableList<RecentFileItem> = mutableListOf(),
-        val directBooks: MutableList<RecentFileItem> = mutableListOf(),
-        val childShelfIds: MutableList<String> = mutableListOf()
-    )
-
-    private fun buildFolderShelves(
-        allLibraryFiles: List<RecentFileItem>,
-        syncedFolders: List<SyncedFolder>,
-        sortFiles: (List<RecentFileItem>) -> List<RecentFileItem>
-    ): List<Shelf> {
-        val folderNamesByUri = syncedFolders.associate { it.uriString to it.name }
-
-        return allLibraryFiles
-            .filter { it.sourceFolderUri != null }
-            .groupBy { it.sourceFolderUri!! }
-            .flatMap { (folderUri, books) ->
-                val rootName = folderNamesByUri[folderUri] ?: "Local Folder"
-                val rootShelfId = "folder_$folderUri"
-                val rootAccumulator = FolderShelfAccumulator(
-                    id = rootShelfId,
-                    name = rootName,
-                    depth = 0,
-                    parentShelfId = null,
-                    sortPath = ""
-                )
-                val rootShelf = Shelf(
-                    id = rootShelfId,
-                    name = rootName,
-                    type = ShelfType.FOLDER,
-                    books = sortFiles(books),
-                    directBooks = mutableListOf<RecentFileItem>().also { direct ->
-                        direct.addAll(books.filter { getRelativeFolderSegments(it).isEmpty() })
-                    },
-                    childShelfIds = emptyList(),
-                    depth = 0,
-                    sortKey = "folder:${rootName.lowercase()}:"
-                )
-
-                val nestedShelves = linkedMapOf<String, FolderShelfAccumulator>()
-                books.forEach { book ->
-                    rootAccumulator.books.add(book)
-                    val segments = getRelativeFolderSegments(book)
-                    if (segments.isEmpty()) {
-                        rootAccumulator.directBooks.add(book)
-                    }
-                    var currentPath = ""
-                    var parentShelfId = rootShelfId
-                    segments.forEachIndexed { index, segment ->
-                        currentPath = if (currentPath.isEmpty()) segment else "$currentPath/$segment"
-                        val shelfId = "folder_$folderUri::$currentPath"
-                        val accumulator = nestedShelves.getOrPut(currentPath) {
-                            val newShelf = FolderShelfAccumulator(
-                                id = shelfId,
-                                name = segment,
-                                depth = index + 1,
-                                parentShelfId = parentShelfId,
-                                sortPath = currentPath.lowercase()
-                            )
-                            if (parentShelfId == rootShelfId) {
-                                rootAccumulator.childShelfIds.add(shelfId)
-                            } else {
-                                nestedShelves.values.find { it.id == parentShelfId }?.childShelfIds?.add(shelfId)
-                            }
-                            newShelf
-                        }
-                        accumulator.books.add(book)
-                        if (index == segments.lastIndex) {
-                            accumulator.directBooks.add(book)
-                        }
-                        parentShelfId = shelfId
-                    }
-                }
-
-                val sortedNestedShelves = nestedShelves
-                    .values
-                    .sortedBy { it.sortPath }
-                    .map { shelf ->
-                        Shelf(
-                            id = shelf.id,
-                            name = shelf.name,
-                            type = ShelfType.FOLDER,
-                            books = sortFiles(shelf.books),
-                            directBooks = sortFiles(shelf.directBooks),
-                            parentShelfId = shelf.parentShelfId,
-                            childShelfIds = shelf.childShelfIds.sortedBy { it.substringAfterLast("::").lowercase() },
-                            depth = shelf.depth,
-                            sortKey = "folder:${rootName.lowercase()}:${shelf.sortPath}"
-                        )
-                    }
-
-                listOf(
-                    rootShelf.copy(
-                        directBooks = sortFiles(rootAccumulator.directBooks),
-                        childShelfIds = rootAccumulator.childShelfIds.sortedBy { it.substringAfterLast("::").lowercase() }
-                    )
-                ) + sortedNestedShelves
-            }
-    }
-
-    private fun getRelativeFolderSegments(item: RecentFileItem): List<String> {
-        val documentUriString = item.uriString ?: return emptyList()
-        val rootFolderUriString = item.sourceFolderUri ?: return emptyList()
-
-        return try {
-            val documentUri = documentUriString.toUri()
-            val rootFolderUri = rootFolderUriString.toUri()
-            val rootDocId = DocumentsContract.getTreeDocumentId(rootFolderUri)
-            val documentId = when {
-                DocumentsContract.isDocumentUri(appContext, documentUri) -> DocumentsContract.getDocumentId(documentUri)
-                DocumentsContract.isTreeUri(documentUri) -> DocumentsContract.getTreeDocumentId(documentUri)
-                else -> return emptyList()
-            }
-
-            val rootPath = rootDocId.substringAfter(':', "")
-            val documentPath = documentId.substringAfter(':', "")
-            val relativeDocumentPath = when {
-                rootPath.isBlank() -> documentPath
-                documentPath == rootPath -> ""
-                documentPath.startsWith("$rootPath/") -> documentPath.removePrefix("$rootPath/")
-                else -> documentPath
-            }
-
-            relativeDocumentPath
-                .substringBeforeLast('/', "")
-                .split('/')
-                .map { Uri.decode(it).trim() }
-                .filter { it.isNotEmpty() }
-        } catch (e: Exception) {
-            Timber.tag("FolderShelves").w(e, "Failed to derive relative folder path for ${item.displayName}")
-            emptyList()
-        }
-    }
 
     fun setTabsEnabled(enabled: Boolean) {
         prefs.edit { putBoolean(KEY_TABS_ENABLED, enabled) }
@@ -1529,7 +1058,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         Timber.d("ViewModel instance created.")
         WorkManager.getInstance(application).cancelUniqueWork(FolderSyncWorker.WORK_NAME)
 
-        // --- ADD THIS BLOCK ---
         val locatorConverter = LocatorConverter(
             bookCacheDao,
             ProtoBuf { serializersModule = semanticBlockModule },
@@ -1814,7 +1342,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     inputStream = inputStream,
                     bookId = bookId,
                     originalBookNameHint = displayName
-                ) ?: throw Exception("MobiParser returned null. The file might be DRM-protected or invalid.")
+                ) ?: throw Exception(
+                    if (MobiParser.isNativeParserAvailable) {
+                        "MobiParser returned null. The file might be DRM-protected or invalid."
+                    } else {
+                        MobiParser.nativeParserUnavailableMessage()
+                    }
+                )
 
                 FileType.FB2 -> fb2Parser.createFb2Book(
                     inputStream = inputStream,
@@ -1860,10 +1394,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 if (latestState.selectedBookId != bookId || latestState.selectedEpubUri != uri) {
                     return@withLock
                 }
-                if (latestState.selectedEpubBook?.extractionBasePath?.let { path ->
-                        path.isNotBlank() && File(path).exists()
-                    } == true
-                ) {
+                if (latestState.selectedEpubBook?.hasReadableExtractedContent() == true) {
                     return@withLock
                 }
 
@@ -2822,7 +2353,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                 }
 
-                scanSyncedFolder()
+                triggerFolderSyncWorker(
+                    metadataOnly = false,
+                    showFeedback = true,
+                    targetFolderUriString = newFolder.uriString
+                )
 
                 showBanner(appContext.getString(R.string.banner_folder_added, name))
 
@@ -2835,6 +2370,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun removeSyncedFolder(folder: SyncedFolder) {
         viewModelScope.launch {
+            val workManager = WorkManager.getInstance(appContext)
+            ReaderPerfLog.d("FolderRemove request folder=${folder.uriString}")
+            workManager.cancelUniqueWork(FolderSyncWorker.WORK_NAME_ONETIME)
+            workManager.cancelUniqueWork(MetadataExtractionWorker.WORK_NAME)
+
             val currentFolders = _internalState.value.syncedFolders.toMutableList()
             currentFolders.removeAll { it.uriString == folder.uriString }
 
@@ -2842,9 +2382,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             _internalState.update { it.copy(syncedFolders = currentFolders) }
 
             val filesToRemove = recentFilesRepository.getFilesBySourceFolder(folder.uriString)
-            filesToRemove.forEach { cleanupBookDataLocally(it.bookId) }
-
             recentFilesRepository.deleteFilesBySourceFolder(folder.uriString)
+            filesToRemove.forEach { cleanupBookDataLocally(it.bookId) }
             try {
                 appContext.contentResolver.releasePersistableUriPermission(
                     folder.uriString.toUri(),
@@ -2855,7 +2394,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             if (currentFolders.isEmpty()) {
-                WorkManager.getInstance(appContext).cancelUniqueWork(FolderSyncWorker.WORK_NAME)
+                workManager.cancelUniqueWork(FolderSyncWorker.WORK_NAME)
             }
 
             showBanner(appContext.getString(R.string.banner_folder_removed))
@@ -2870,16 +2409,33 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         triggerFolderSyncWorker(metadataOnly = false, showFeedback = true)
     }
 
-    private fun triggerFolderSyncWorker(metadataOnly: Boolean, showFeedback: Boolean) {
+    private fun triggerFolderSyncWorker(
+        metadataOnly: Boolean,
+        showFeedback: Boolean,
+        targetFolderUriString: String? = null
+    ) {
         val folders = _internalState.value.syncedFolders
         if (folders.isEmpty()) return
 
-        Timber.tag("FolderSync")
-            .d("Requesting folder sync for ${folders.size} folders (metadataOnly=$metadataOnly, feedback=$showFeedback)")
+        val targetFolderName = targetFolderUriString
+            ?.let { target -> folders.firstOrNull { it.uriString == target }?.name ?: target }
+        ReaderPerfLog.d(
+            "FolderSync request folders=${folders.size} target=${targetFolderName ?: "ALL"} " +
+                "metadataOnly=$metadataOnly feedback=$showFeedback"
+        )
 
         val workManager = WorkManager.getInstance(appContext)
+        if (!metadataOnly) {
+            workManager.cancelUniqueWork(MetadataExtractionWorker.WORK_NAME)
+        }
         val data = androidx.work.Data.Builder()
-            .putBoolean(FolderSyncWorker.KEY_METADATA_ONLY, metadataOnly).build()
+            .putBoolean(FolderSyncWorker.KEY_METADATA_ONLY, metadataOnly)
+            .apply {
+                if (!targetFolderUriString.isNullOrBlank()) {
+                    putString(FolderSyncWorker.KEY_TARGET_FOLDER_URI, targetFolderUriString)
+                }
+            }
+            .build()
 
         val request = OneTimeWorkRequestBuilder<FolderSyncWorker>().setInputData(data).build()
 
@@ -2958,7 +2514,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
 
                 withContext(Dispatchers.Main) {
-                    scanSyncedFolder()
+                    triggerFolderSyncWorker(
+                        metadataOnly = false,
+                        showFeedback = true,
+                        targetFolderUriString = folder.uriString
+                    )
                 }
             }
         }
@@ -2966,12 +2526,17 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun disconnectAllSyncedFolders() {
         viewModelScope.launch {
+            val workManager = WorkManager.getInstance(appContext)
+            ReaderPerfLog.d("FolderRemove disconnect all folders=${_internalState.value.syncedFolders.size}")
+            workManager.cancelUniqueWork(FolderSyncWorker.WORK_NAME_ONETIME)
+            workManager.cancelUniqueWork(FolderSyncWorker.WORK_NAME)
+            workManager.cancelUniqueWork(MetadataExtractionWorker.WORK_NAME)
+
             val folders = _internalState.value.syncedFolders
             folders.forEach { folder ->
                 val filesToRemove = recentFilesRepository.getFilesBySourceFolder(folder.uriString)
-                filesToRemove.forEach { cleanupBookDataLocally(it.bookId) }
-
                 recentFilesRepository.deleteFilesBySourceFolder(folder.uriString)
+                filesToRemove.forEach { cleanupBookDataLocally(it.bookId) }
                 try {
                     appContext.contentResolver.releasePersistableUriPermission(
                         folder.uriString.toUri(), Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -2985,8 +2550,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 remove(KEY_SYNCED_FOLDER_URI)
             }
             _internalState.update { it.copy(syncedFolders = emptyList()) }
-
-            WorkManager.getInstance(appContext).cancelUniqueWork(FolderSyncWorker.WORK_NAME)
         }
     }
 
@@ -3869,6 +3432,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 val oneHourAgo = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)
                 val allDbIds = recentFilesRepository.getAllFilesForSync().map { it.bookId }.toSet()
                 val validStreamHashes = allDbIds.map { it.hashCode().toString() }.toSet()
+                val validActiveBookCacheDirs = allDbIds.mapTo(mutableSetOf()) {
+                    ImportedFileCache.activeBookDirName(it)
+                }
                 ImportedFileCache.deleteStaleTemporaryBookDirs(appContext, TimeUnit.HOURS.toMillis(1))
 
                 cacheDir.listFiles()?.forEach { file ->
@@ -3879,10 +3445,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             if (deleted) Timber.d("Sweeper cleaned old temp file: $name")
                         }
                     } else if (ImportedFileCache.isActiveBookDir(name)) {
-                        val bookId = name.removePrefix("imported_file_")
-                        if (bookId !in allDbIds) {
+                        val legacyBookId = name.removePrefix("imported_file_")
+                        if (name !in validActiveBookCacheDirs && legacyBookId !in allDbIds && file.lastModified() < oneHourAgo) {
                             val deleted = file.deleteRecursively()
-                            if (deleted) Timber.d("Sweeper cleaned orphaned extracted cache for: $bookId")
+                            if (deleted) Timber.d("Sweeper cleaned orphaned extracted cache: $name")
                         }
                     } else if (name.startsWith("opds_stream_")) {
                         val bookIdHash = name.removePrefix("opds_stream_")
@@ -4274,6 +3840,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         uri: Uri, bookId: String, type: FileType, originalDisplayName: String? = null, suppressNavigation: Boolean = false, bundleResult: CalibreBundleResult? = null
     ) {
         val openBookStartTime = System.currentTimeMillis()
+        ReaderPerfLog.d("FileOpen start bookId=$bookId type=$type")
         Timber.tag("FileOpenPerf")
             .d("[$bookId] openBook START | type=$type | displayName=$originalDisplayName")
 
@@ -4341,12 +3908,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 viewModelScope.launch {
                     val recentItem = recentFilesRepository.getFileByBookId(bookId)
 
-                    if (recentItem?.sourceFolderUri != null) {
-                        launch(Dispatchers.IO) {
-                            recentFilesRepository.syncLocalMetadataToFolder(bookId)
-                        }
-                    }
-
                     Timber.tag("FileOpenPerf")
                         .d("[$bookId] Branch: PDF | elapsed=${System.currentTimeMillis() - openBookStartTime}ms")
                     _internalState.update {
@@ -4357,6 +3918,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             isLoading = false
                         )
                     }
+                    ReaderPerfLog.d("FileOpen ready bookId=$bookId type=$type elapsed=${System.currentTimeMillis() - openBookStartTime}ms")
                     persistReaderSession(bookId, type)
                     addFileToRecent(
                         uri,
@@ -4378,11 +3940,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX || type == FileType.ODT || type == FileType.FODT) {
                 viewModelScope.launch {
                     val recentItem = recentFilesRepository.getFileByBookId(bookId)
-                    if (recentItem?.sourceFolderUri != null) {
-                        launch(Dispatchers.IO) {
-                            recentFilesRepository.syncLocalMetadataToFolder(bookId)
-                        }
-                    }
                     Timber.tag("FileOpenPerf")
                         .d("[$bookId] Branch: ${type.name} | elapsed=${System.currentTimeMillis() - openBookStartTime}ms")
                     val locator =
@@ -4405,6 +3962,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             initialHighlightsJson = recentItem?.highlightsJson,
                         )
                     }
+                    ReaderPerfLog.d("FileOpen ready bookId=$bookId type=$type elapsed=${System.currentTimeMillis() - openBookStartTime}ms")
                     persistReaderSession(bookId, type)
 
                     if (!suppressNavigation) {
@@ -4617,87 +4175,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             "text/x-c", "text/x-c++", "text/x-csharp", "text/x-ruby", "text/x-go", "text/x-log" -> FileType.HTML
 
             "text/plain" -> {
-                if (fileName?.endsWith(".md", ignoreCase = true) == true || fileName?.endsWith(".markdown", ignoreCase = true) == true) {
-                    FileType.MD
-                } else if (fileName?.let {
-                        it.endsWith(".csv", ignoreCase = true) || it.endsWith(".tsv", ignoreCase = true) ||
-                                it.endsWith(".json", ignoreCase = true) || it.endsWith(".xml", ignoreCase = true) ||
-                                it.endsWith(".log", ignoreCase = true) || it.endsWith(".java", ignoreCase = true) ||
-                                it.endsWith(".kt", ignoreCase = true) || it.endsWith(".py", ignoreCase = true) ||
-                                it.endsWith(".js", ignoreCase = true) || it.endsWith(".cpp", ignoreCase = true) ||
-                                it.endsWith(".c", ignoreCase = true) || it.endsWith(".cs", ignoreCase = true) ||
-                                it.endsWith(".rb", ignoreCase = true) || it.endsWith(".go", ignoreCase = true)
-                    } == true) {
-                    FileType.HTML
-                } else {
-                    FileType.TXT
-                }
+                resolveFileTypeFromName(fileName) ?: FileType.TXT
             }
 
             else -> {
-                when {
-                    fileName?.endsWith(".cbz", ignoreCase = true) == true -> FileType.CBZ
-                    fileName?.endsWith(".cbr", ignoreCase = true) == true -> FileType.CBR
-                    fileName?.endsWith(".cb7", ignoreCase = true) == true -> FileType.CB7
-                    fileName?.endsWith(".pdf", ignoreCase = true) == true -> FileType.PDF
-                    fileName?.endsWith(".epub", ignoreCase = true) == true -> FileType.EPUB
-                    fileName?.endsWith(
-                        ".mobi",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(
-                        ".azw3",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(
-                        ".prc",
-                        ignoreCase = true
-                    ) == true -> FileType.MOBI
-
-                    fileName?.endsWith(
-                        ".md",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(
-                        ".markdown",
-                        ignoreCase = true
-                    ) == true -> FileType.MD
-
-                    fileName?.endsWith(".txt", ignoreCase = true) == true -> FileType.TXT
-                    fileName?.endsWith(
-                        ".fb2",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(
-                        ".fb2.zip",
-                        ignoreCase = true
-                    ) == true -> FileType.FB2
-                    fileName?.endsWith(
-                        ".html",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(
-                        ".xhtml",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(
-                        ".htm",
-                        ignoreCase = true
-                    ) == true -> FileType.HTML
-                    fileName?.endsWith(".docx", ignoreCase = true) == true -> FileType.DOCX
-                    fileName?.endsWith(".odt", ignoreCase = true) == true -> FileType.ODT
-                    fileName?.endsWith(".fodt", ignoreCase = true) == true -> FileType.FODT
-                    fileName?.endsWith(".csv", ignoreCase = true) == true ||
-                    fileName?.endsWith(".tsv", ignoreCase = true) == true ||
-                    fileName?.endsWith(".json", ignoreCase = true) == true ||
-                    fileName?.endsWith(".xml", ignoreCase = true) == true ||
-                    fileName?.endsWith(".log", ignoreCase = true) == true ||
-                    fileName?.endsWith(".java", ignoreCase = true) == true ||
-                    fileName?.endsWith(".kt", ignoreCase = true) == true ||
-                    fileName?.endsWith(".py", ignoreCase = true) == true ||
-                    fileName?.endsWith(".js", ignoreCase = true) == true ||
-                    fileName?.endsWith(".cpp", ignoreCase = true) == true ||
-                    fileName?.endsWith(".c", ignoreCase = true) == true ||
-                    fileName?.endsWith(".cs", ignoreCase = true) == true ||
-                    fileName?.endsWith(".rb", ignoreCase = true) == true ||
-                    fileName?.endsWith(".go", ignoreCase = true) == true -> FileType.HTML
-
-                    else -> null
-                }
+                resolveFileTypeFromName(fileName)
             }
         }
     }
@@ -4739,7 +4221,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 } else {
                     throw Exception(
-                        "MobiParser returned null. The file might be DRM-protected or invalid."
+                        if (MobiParser.isNativeParserAvailable) {
+                            "MobiParser returned null. The file might be DRM-protected or invalid."
+                        } else {
+                            MobiParser.nativeParserUnavailableMessage()
+                        }
                     )
                 }
             } catch (e: Exception) {
@@ -4945,6 +4431,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun onRecentFileClicked(item: RecentFileItem) {
+        ReaderPerfLog.d("FileOpen click bookId=${item.bookId} name=${item.displayName}")
         val currentSelection = _internalState.value.contextualActionItems
         if (currentSelection.isNotEmpty()) {
             Timber.d("Toggling selection for: ${item.displayName}")
@@ -5125,6 +4612,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setMainScreenPage(page: Int) {
         val sanitizedPage = page.coerceIn(0, 1)
+        if (_internalState.value.mainScreenStartPage == sanitizedPage) return
         _internalState.update { it.copy(mainScreenStartPage = sanitizedPage) }
         persistLibraryLandingState()
     }
@@ -5132,6 +4620,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     fun setLibraryScreenPage(page: Int) {
         val maxLibraryPage = if (BuildConfig.IS_OFFLINE) 2 else 3
         val sanitizedPage = page.coerceIn(0, maxLibraryPage)
+        if (_internalState.value.libraryScreenStartPage == sanitizedPage) return
         _internalState.update {
             it.copy(libraryScreenStartPage = sanitizedPage)
         }
@@ -5701,9 +5190,14 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         prefs.edit { putString(KEY_APP_CONTRAST_OPTION, option.name) }
     }
 
-    fun setAppTextDimFactor(factor: Float) {
-        _internalState.update { it.copy(appTextDimFactor = factor) }
-        prefs.edit { putFloat(KEY_APP_TEXT_DIM_FACTOR, factor) }
+    fun setAppTextDimFactorLight(factor: Float) {
+        _internalState.update { it.copy(appTextDimFactorLight = factor) }
+        prefs.edit { putFloat(KEY_APP_TEXT_DIM_FACTOR_LIGHT, factor) }
+    }
+
+    fun setAppTextDimFactorDark(factor: Float) {
+        _internalState.update { it.copy(appTextDimFactorDark = factor) }
+        prefs.edit { putFloat(KEY_APP_TEXT_DIM_FACTOR_DARK, factor) }
     }
 
     fun setAppSeedColor(color: androidx.compose.ui.graphics.Color?) {
@@ -5948,6 +5442,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         private const val KEY_APP_CONTRAST_OPTION = "app_contrast_option"
         private const val KEY_APP_SEED_COLOR = "app_seed_color"
         private const val KEY_APP_TEXT_DIM_FACTOR = "app_text_dim_factor"
+        private const val KEY_APP_TEXT_DIM_FACTOR_LIGHT = "app_text_dim_factor_light"
+        private const val KEY_APP_TEXT_DIM_FACTOR_DARK = "app_text_dim_factor_dark"
         private const val KEY_CUSTOM_APP_THEMES = "custom_app_themes"
 
         val SUPPORTED_MIME_TYPES = arrayOf(

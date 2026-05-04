@@ -193,6 +193,7 @@ internal fun PdfVerticalReader(
     state: VerticalPdfReaderState,
     pdfDocument: StableHolder<ReaderDocument>,
     activeTheme: com.aryan.reader.ReaderTheme,
+    activeTextureAlpha: Float = 0.55f,
     excludeImages: Boolean = false,
     totalPages: Int,
     virtualPages: List<VirtualPage> = emptyList(),
@@ -988,7 +989,7 @@ internal fun PdfVerticalReader(
                 }
 
                 val buttons = currentEvent.buttons
-                Timber.tag("StylusEraserDiagnostic").d(
+                Timber.tag("StylusDebug").d(
                     "VerticalReader | Type: ${down.type} | isPrimary: ${buttons.isPrimaryPressed} | isSecondary: ${buttons.isSecondaryPressed} | isTertiary: ${buttons.isTertiaryPressed} | buttonsString: $buttons"
                 )
 
@@ -1688,6 +1689,7 @@ internal fun PdfVerticalReader(
                                     virtualPage = virtualPage,
                                     totalPages = totalPages,
                                     activeTheme = activeTheme,
+                                    activeTextureAlpha = activeTextureAlpha,
                                     excludeImages = excludeImages,
                                     externalScale = highResScale,
                                     onScaleChanged = {},

@@ -92,7 +92,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
@@ -113,8 +112,6 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -198,9 +195,12 @@ import androidx.media3.common.util.UnstableApi
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.work.WorkInfo
 import com.aryan.reader.AiDefinitionPopup
+import com.aryan.reader.AiFeature
 import com.aryan.reader.AiDefinitionResult
 import com.aryan.reader.AiHubBottomSheet
+import com.aryan.reader.BannerMessage
 import com.aryan.reader.BuildConfig
+import com.aryan.reader.CustomTopBanner
 import com.aryan.reader.FileType
 import com.aryan.reader.HighlightColorPickerDialog
 import com.aryan.reader.MainViewModel
@@ -219,7 +219,11 @@ import com.aryan.reader.epubreader.TtsOverlayControls
 import com.aryan.reader.epubreader.loadTapToNavigateSetting
 import com.aryan.reader.epubreader.saveTapToNavigateSetting
 import com.aryan.reader.fetchAiDefinition
+import com.aryan.reader.areReaderAiFeaturesEnabled
+import com.aryan.reader.callByokGeminiInlineAi
+import com.aryan.reader.isByokCloudTtsAvailable
 import com.aryan.reader.loadCustomThemes
+import com.aryan.reader.loadGlobalTextureTransparency
 import com.aryan.reader.paginatedreader.TtsChunk
 import com.aryan.reader.pdf.data.AnnotationSettingsRepository
 import com.aryan.reader.pdf.data.PdfAnnotation
@@ -233,6 +237,7 @@ import com.aryan.reader.pdf.data.TextStyleConfig
 import com.aryan.reader.pdf.data.VirtualPage
 import com.aryan.reader.rememberSearchState
 import com.aryan.reader.saveCustomThemes
+import com.aryan.reader.saveGlobalTextureTransparency
 import com.aryan.reader.summarizationUrl
 import com.aryan.reader.tts.SpeakerSamplePlayer
 import com.aryan.reader.tts.TtsPlaybackManager
@@ -265,6 +270,12 @@ import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.isPrimaryPressed
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.isTertiaryPressed
+import androidx.compose.ui.input.pointer.isBackPressed
+import androidx.compose.ui.input.pointer.isForwardPressed
 
 @Suppress("KotlinConstantConditions")
 @SuppressLint("UnusedBoxWithConstraintsScope", "ObsoleteSdkInt", "LocalContextGetResourceValueCall")
@@ -300,6 +311,7 @@ fun PdfViewerScreen(
     var currentThemeId by remember { mutableStateOf(loadPdfThemeId(context)) }
     var excludeImages by remember { mutableStateOf(com.aryan.reader.loadExcludeImages(context)) }
     var customThemes by remember { mutableStateOf(loadCustomThemes(context)) }
+    var globalTextureTransparency by remember { mutableFloatStateOf(loadGlobalTextureTransparency(context)) }
     val documentCache = remember { DocumentCache(3) }
     val summaryCacheManager = remember(context) { SummaryCacheManager(context) }
     val tabStateMap = remember { mutableStateMapOf<String, Int>() }
@@ -335,10 +347,22 @@ fun PdfViewerScreen(
 
     var showCustomizeToolsSheet by remember { mutableStateOf(false) }
     var hiddenTools by remember { mutableStateOf(loadPdfHiddenTools(context)) }
+    var toolOrder by remember { mutableStateOf(loadPdfToolOrder(context)) }
+    var bottomTools by remember { mutableStateOf(loadPdfBottomTools(context)) }
 
     val onUpdateHiddenTools = { newSet: Set<String> ->
         hiddenTools = newSet
         savePdfHiddenTools(context, newSet)
+    }
+
+    val onUpdateToolOrder = { newOrder: List<PdfReaderTool> ->
+        toolOrder = newOrder
+        savePdfToolOrder(context, newOrder)
+    }
+
+    val onUpdateBottomTools = { newBottomTools: Set<String> ->
+        bottomTools = newBottomTools
+        savePdfBottomTools(context, newBottomTools)
     }
 
     val isOss = BuildConfig.FLAVOR == "oss"
@@ -412,7 +436,7 @@ fun PdfViewerScreen(
     var currentTtsMode by remember {
         mutableStateOf(
             com.aryan.reader.tts.loadTtsMode(context).let {
-                if (BuildConfig.FLAVOR == "oss") TtsPlaybackManager.TtsMode.BASE else it
+                if (BuildConfig.FLAVOR == "oss" && !isByokCloudTtsAvailable(context)) TtsPlaybackManager.TtsMode.BASE else it
             }
         )
     }
@@ -455,7 +479,10 @@ fun PdfViewerScreen(
 
     val customFonts by viewModel.customFonts.collectAsState()
 
-    val snackbarHostState = remember { SnackbarHostState() }
+    var bannerMessage by remember { mutableStateOf<BannerMessage?>(null) }
+    fun showBanner(message: String, isError: Boolean = false) {
+        bannerMessage = BannerMessage(message, isError = isError)
+    }
     val onOcrStateChange: (Boolean) -> Unit = {}
 
     var showZoomIndicator by remember { mutableStateOf(false) }
@@ -498,9 +525,7 @@ fun PdfViewerScreen(
             )
         } catch (e: Exception) {
             Timber.tag("PdfPrint").e(e, "Failed to initialize print job")
-            coroutineScope.launch {
-                snackbarHostState.showSnackbar(context.getString(R.string.error_open_print_settings))
-            }
+            showBanner(context.getString(R.string.error_open_print_settings), isError = true)
         }
     }
 
@@ -655,12 +680,6 @@ fun PdfViewerScreen(
     val searchState = rememberSearchState(scope = coroutineScope, searcher = dummySearcher)
     val navBarHeight = WindowInsets.systemBars.getBottom(density)
 
-    val effectiveNavBarForSnackbar = if (systemUiMode == SystemUiMode.DEFAULT || (systemUiMode == SystemUiMode.SYNC && showStandardBars)) with(density) { navBarHeight.toDp() } else 0.dp
-    val snackbarPadding by animateDpAsState(
-        targetValue = if (showStandardBars && !searchState.isSearchActive) 56.dp + effectiveNavBarForSnackbar else effectiveNavBarForSnackbar,
-        label = "SnackbarPadding"
-    )
-
     val targetVerticalHeaderHeight = remember(
         dockLocation,
         snapPreviewLocation,
@@ -733,6 +752,7 @@ fun PdfViewerScreen(
             }
         }
     }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(ocrLanguage) { OcrHelper.init(ocrLanguage) }
 
@@ -754,10 +774,20 @@ fun PdfViewerScreen(
                 showInsufficientCreditsDialog = true
                 ttsController.stop()
             } else {
-                coroutineScope.launch {
-                    snackbarHostState.showSnackbar(message)
-                }
+                showBanner(message, isError = true)
             }
+        }
+    }
+
+    LaunchedEffect(errorMessage) {
+        errorMessage?.let { showBanner(it, isError = true) }
+    }
+
+    LaunchedEffect(bannerMessage) {
+        val message = bannerMessage ?: return@LaunchedEffect
+        if (!message.isPersistent) {
+            delay(2500L)
+            bannerMessage = null
         }
     }
 
@@ -985,13 +1015,80 @@ fun PdfViewerScreen(
     }
 
     val jumpHistory = remember { mutableStateListOf<Int>() }
-    var showJumpPill by remember { mutableStateOf(false) }
+    var jumpHistoryCursor by remember { mutableIntStateOf(-1) }
 
-    LaunchedEffect(showJumpPill, jumpHistory.size) {
-        if (showJumpPill && jumpHistory.isNotEmpty()) {
-            delay(4000)
-            showJumpPill = false
+    fun pruneJumpHistoryForDocument() {
+        if (totalPages <= 0) {
+            jumpHistory.clear()
+            jumpHistoryCursor = -1
+            return
         }
+
+        var index = jumpHistory.lastIndex
+        while (index >= 0) {
+            if (jumpHistory[index] !in 0 until totalPages) {
+                jumpHistory.removeAt(index)
+                if (jumpHistoryCursor >= index) jumpHistoryCursor--
+            }
+            index--
+        }
+        jumpHistoryCursor = jumpHistoryCursor.coerceIn(-1, jumpHistory.lastIndex)
+    }
+
+    fun recordJumpHistory(currentPageIndex: Int, targetPageIndex: Int) {
+        if (totalPages <= 0 || currentPageIndex !in 0 until totalPages || targetPageIndex !in 0 until totalPages || currentPageIndex == targetPageIndex) {
+            return
+        }
+
+        pruneJumpHistoryForDocument()
+        while (jumpHistory.lastIndex > jumpHistoryCursor) {
+            jumpHistory.removeAt(jumpHistory.lastIndex)
+        }
+
+        if (jumpHistoryCursor > 0 && jumpHistory.getOrNull(jumpHistoryCursor - 1) == currentPageIndex) {
+            jumpHistory[jumpHistoryCursor] = targetPageIndex
+            return
+        }
+
+        if (jumpHistoryCursor == -1 || jumpHistory.getOrNull(jumpHistoryCursor) != currentPageIndex) {
+            jumpHistory.add(currentPageIndex)
+            jumpHistoryCursor = jumpHistory.lastIndex
+        }
+
+        if (jumpHistory.lastOrNull() != targetPageIndex) {
+            jumpHistory.add(targetPageIndex)
+            jumpHistoryCursor = jumpHistory.lastIndex
+        }
+
+        while (jumpHistory.size > 21) {
+            jumpHistory.removeAt(0)
+            jumpHistoryCursor--
+        }
+        jumpHistoryCursor = jumpHistoryCursor.coerceIn(0, jumpHistory.lastIndex)
+    }
+
+    fun clearJumpHistory() {
+        jumpHistory.clear()
+        jumpHistoryCursor = -1
+    }
+
+    fun navigateToJumpHistoryPage(targetPageIndex: Int) {
+        if (targetPageIndex !in 0 until totalPages) {
+            pruneJumpHistoryForDocument()
+            return
+        }
+
+        coroutineScope.launch {
+            if (displayMode == DisplayMode.PAGINATION) {
+                pagerState.animateScrollToPage(targetPageIndex)
+            } else {
+                verticalReaderState.scrollToPage(targetPageIndex)
+            }
+        }
+    }
+
+    LaunchedEffect(totalPages) {
+        pruneJumpHistoryForDocument()
     }
 
     LaunchedEffect(currentPage, isDocumentReady, totalPages, initialScrollDone) {
@@ -1154,9 +1251,8 @@ fun PdfViewerScreen(
     var isHighlightingLoading by remember { mutableStateOf(false) }
 
     var ttsPageData by remember { mutableStateOf<TtsPageData?>(null) }
+    var ttsDisplayPageIndex by remember { mutableStateOf<Int?>(null) }
     var ttsHighlightData by remember { mutableStateOf<TtsHighlightData?>(null) }
-
-    var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoadingDocument by remember { mutableStateOf(true) }
 
     var selectionClearTrigger by remember { mutableLongStateOf(0L) }
@@ -1177,6 +1273,26 @@ fun PdfViewerScreen(
                 }
             }
         }
+    }
+
+    fun displayPageToPdfPage(displayPageIndex: Int): Int? {
+        if (displayPageIndex !in 0 until totalDisplayPages) return null
+        if (virtualPages.isEmpty()) return displayPageIndex.takeIf { it in 0 until totalPages }
+
+        return when (val virtualPage = virtualPages.getOrNull(displayPageIndex)) {
+            is VirtualPage.PdfPage -> virtualPage.pdfIndex.takeIf { it in 0 until totalPages }
+            is VirtualPage.BlankPage -> null
+            null -> null
+        }
+    }
+
+    fun pdfPageToDisplayPage(pdfPageIndex: Int): Int? {
+        if (pdfPageIndex !in 0 until totalPages) return null
+        if (virtualPages.isEmpty()) return pdfPageIndex.takeIf { it in 0 until totalDisplayPages }
+
+        return virtualPages.indexOfFirst {
+            it is VirtualPage.PdfPage && it.pdfIndex == pdfPageIndex
+        }.takeIf { it >= 0 }
     }
 
     LaunchedEffect(richTextController, toolSettings.textStyle) {
@@ -1416,7 +1532,7 @@ fun PdfViewerScreen(
                 bookmarks = loadPdfBookmarksFromJson(result.bookmarksJson)
                 onBookmarksChanged(result.bookmarksJson)
 
-                snackbarHostState.showSnackbar("Page added at ${targetIndex + 1}")
+                showBanner("Page added at ${targetIndex + 1}")
             }
         }
     }
@@ -1504,7 +1620,7 @@ fun PdfViewerScreen(
                 bookmarks = loadPdfBookmarksFromJson(result.bookmarksJson)
                 onBookmarksChanged(result.bookmarksJson)
 
-                snackbarHostState.showSnackbar("Page deleted")
+                showBanner("Page deleted")
 
                 val newMax = (virtualPages.size - 1).coerceAtLeast(0)
                 if (currentPage > newMax) {
@@ -1689,7 +1805,7 @@ fun PdfViewerScreen(
             }
 
             if (pageRemoved) {
-                snackbarHostState.showSnackbar("Extra page removed")
+                showBanner("Extra page removed")
             }
         }
     }
@@ -2051,11 +2167,11 @@ fun PdfViewerScreen(
     val onDictionaryLookupStable = remember(executeWithOcrCheck, useOnlineDictionary, selectedDictPackage, uiState.credits, isProUser) {
         { text: String ->
             executeWithOcrCheck {
-                val effectiveUseOnline = !isOss && useOnlineDictionary
+                val effectiveUseOnline = areReaderAiFeaturesEnabled(context) && useOnlineDictionary
 
                 if (effectiveUseOnline) {
                     val wordCount = com.aryan.reader.countWords(text)
-                    if (wordCount > 1 && !isProUser) {
+                    if (BuildConfig.FLAVOR != "oss" && wordCount > 1 && !isProUser) {
                         showDictionaryUpsellDialog = true
                     } else {
                         selectedTextForAi = text
@@ -2128,9 +2244,7 @@ fun PdfViewerScreen(
                     val current = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
 
                     if (current != targetPage) {
-                        if (jumpHistory.size > 20) jumpHistory.removeAt(0)
-                        jumpHistory.add(current)
-                        showJumpPill = true
+                        recordJumpHistory(current, targetPage)
                     }
 
                     if (displayMode == DisplayMode.PAGINATION) {
@@ -2218,6 +2332,27 @@ fun PdfViewerScreen(
                 val base64Image = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
                 pageBitmap.recycle()
                 pageBitmap = null
+
+                @Suppress("KotlinConstantConditions")
+                if (BuildConfig.FLAVOR == "oss") {
+                    val fullText = StringBuilder()
+                    callByokGeminiInlineAi(
+                        context = context,
+                        feature = AiFeature.SUMMARIZE,
+                        mimeType = "image/jpeg",
+                        base64Data = base64Image,
+                        systemInstruction = "You are an expert in analyzing visual content. You will be given an image of a page. Describe what is happening, identify key information, and summarize the text. Do not add a preamble.",
+                        temperature = 0.2,
+                        maxTokens = 8192,
+                        onUpdate = {
+                            fullText.append(it)
+                            onUpdate(SummarizationResult(summary = fullText.toString()))
+                        },
+                        onError = { onUpdate(SummarizationResult(error = it)) }
+                    )
+                    onFinish()
+                    return@withContext
+                }
 
                 val url = URL(summarizationUrl)
                 connection = url.openConnection() as HttpURLConnection
@@ -2394,8 +2529,12 @@ fun PdfViewerScreen(
         return false
     }
 
-    fun startTts(pageToReadOverride: Int? = null, startCharIndex: Int? = null) {
-        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && uiState.credits <= 0) {
+    fun startTts(
+        pageToReadOverride: Int? = null,
+        startCharIndex: Int? = null,
+        continueSession: Boolean = false
+    ) {
+        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && uiState.credits <= 0) {
             showInsufficientCreditsDialog = true
             return
         }
@@ -2406,7 +2545,13 @@ fun PdfViewerScreen(
         }
         coroutineScope.launch {
             val token = viewModel.getAuthToken()
-            val pageToRead = pageToReadOverride ?: currentPage
+            val requestedDisplayPage = pageToReadOverride ?: currentPage
+            val pageToRead = displayPageToPdfPage(requestedDisplayPage)
+            if (pageToRead == null) {
+                Timber.w("TTS: Ignoring blank or invalid display page $requestedDisplayPage.")
+                return@launch
+            }
+            val displayPageForTts = pdfPageToDisplayPage(pageToRead) ?: requestedDisplayPage
             var rawPageText: String? = null
             var tempPage: ReaderPage? = null
             var tempTextPage: ReaderTextPage? = null
@@ -2454,6 +2599,7 @@ fun PdfViewerScreen(
             if (rawPageText != null && rawPageText!!.isNotBlank()) {
                 val processedText = preprocessTextForTts(rawPageText!!)
                 ttsPageData = TtsPageData(pageToRead, processedText, ocrUsedForCurrentPageTts)
+                ttsDisplayPageIndex = displayPageForTts
 
                 val cleanStartIndex = if (startCharIndex != null && startCharIndex >= 0) {
                     processedText.indexMap.indexOfFirst { it >= startCharIndex }.coerceAtLeast(0)
@@ -2476,6 +2622,7 @@ fun PdfViewerScreen(
                     bookTitle = bookTitle,
                     chapterTitle = pageTitle,
                     coverImageUri = null,
+                    continueSession = continueSession,
                     ttsMode = currentTtsMode,
                     playbackSource = "READER",
                     authToken = token
@@ -2495,10 +2642,16 @@ fun PdfViewerScreen(
                 if (nextPage < totalPages) {
                     Timber.i("TTS found no text on page $pageToRead. Skipping to $nextPage.")
                     isAutoPagingForTts = true
+                    val nextDisplayPage = pdfPageToDisplayPage(nextPage)
                     if (displayMode == DisplayMode.PAGINATION) {
-                        coroutineScope.launch { pagerState.animateScrollToPage(nextPage) }
+                        nextDisplayPage?.let { coroutineScope.launch { pagerState.animateScrollToPage(it) } }
                     } else {
-                        startTts(pageToReadOverride = nextPage)
+                        if (nextDisplayPage != null) {
+                            startTts(pageToReadOverride = nextDisplayPage, continueSession = true)
+                        } else {
+                            ttsController.stop()
+                            isAutoPagingForTts = false
+                        }
                     }
                 } else {
                     ttsController.stop()
@@ -2556,12 +2709,24 @@ fun PdfViewerScreen(
                     DisplayMode.PAGINATION -> {
                         Timber.d("TTS auto-paging to next page: ${nextPage + 1}")
                         isAutoPagingForTts = true
-                        coroutineScope.launch { pagerState.animateScrollToPage(nextPage) }
+                        val nextDisplayPage = pdfPageToDisplayPage(nextPage)
+                        if (nextDisplayPage != null) {
+                            coroutineScope.launch { pagerState.animateScrollToPage(nextDisplayPage) }
+                        } else {
+                            ttsController.stop()
+                            isAutoPagingForTts = false
+                        }
                     }
 
                     DisplayMode.VERTICAL_SCROLL -> {
                         Timber.d("TTS auto-starting on next page (no scroll): ${nextPage + 1}")
-                        startTts(pageToReadOverride = nextPage)
+                        val nextDisplayPage = pdfPageToDisplayPage(nextPage)
+                        if (nextDisplayPage != null) {
+                            startTts(pageToReadOverride = nextDisplayPage, continueSession = true)
+                        } else {
+                            ttsController.stop()
+                            isAutoPagingForTts = false
+                        }
                     }
                 }
             } else {
@@ -2719,7 +2884,11 @@ fun PdfViewerScreen(
                 }
 
                 pdfDocument = doc
-                documentMetadataTitle = (doc as? PdfDocumentWrapper)?.pdfDocument?.getDocumentMeta()?.title?.takeIf { it.isNotBlank() }
+                documentMetadataTitle = (doc as? PdfDocumentWrapper)?.let { wrapper ->
+                    PdfiumEngineProvider.withPdfium {
+                        wrapper.pdfDocument.getDocumentMeta().title?.takeIf { it.isNotBlank() }
+                    }
+                }
                 pfdState = currentPfdOpened
                 val pagesCount = doc.getPageCount()
 
@@ -2891,7 +3060,7 @@ fun PdfViewerScreen(
     LaunchedEffect(currentPage) {
         if (previousPage != -1 && previousPage != currentPage) {
             if (isAutoPagingForTts) {
-                startTts()
+                startTts(continueSession = true)
             } else if (displayMode == DisplayMode.PAGINATION && (ttsState.isPlaying || ttsState.isLoading)) {
                 Timber.d("Page changed manually while TTS active, stopping.")
                 ttsController.stop()
@@ -2969,8 +3138,11 @@ fun PdfViewerScreen(
                 )
 
                 bgPfd = context.contentResolver.openFileDescriptor(effectivePdfUri, "r")
-                if (bgPfd != null) {
-                    bgDoc = pdfiumCore.newDocument(bgPfd, documentPassword)
+                val openedBgPfd = bgPfd
+                if (openedBgPfd != null) {
+                    bgDoc = PdfiumEngineProvider.withPdfium {
+                        pdfiumCore.newDocument(openedBgPfd, documentPassword)
+                    }
 
                     val pagesToIndex = (0 until totalPages).filter { !existingPages.contains(it) }
                     val totalToDo = pagesToIndex.size
@@ -3001,7 +3173,9 @@ fun PdfViewerScreen(
                 Timber.e(e, "Indexer: Fatal error")
             } finally {
                 try {
-                    bgDoc?.close()
+                    PdfiumEngineProvider.withPdfium {
+                        bgDoc?.close()
+                    }
                     bgPfd?.close()
                 } catch (e: Exception) {
                     Timber.e(e, "Indexer: Cleanup failed")
@@ -3157,9 +3331,7 @@ fun PdfViewerScreen(
                 val current = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
 
                 if (current != targetPage) {
-                    if (jumpHistory.size > 20) jumpHistory.removeAt(0)
-                    jumpHistory.add(current)
-                    showJumpPill = true
+                    recordJumpHistory(current, targetPage)
                 }
 
                 if (displayMode == DisplayMode.PAGINATION) {
@@ -3197,9 +3369,7 @@ fun PdfViewerScreen(
             val current = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
 
             if (current != targetPage) {
-                if (jumpHistory.size > 20) jumpHistory.removeAt(0)
-                jumpHistory.add(current)
-                showJumpPill = true
+                recordJumpHistory(current, targetPage)
             }
 
             if (displayMode == DisplayMode.PAGINATION) {
@@ -3288,9 +3458,7 @@ fun PdfViewerScreen(
                             val current = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
 
                             if (current != targetPage) {
-                                if (jumpHistory.size > 20) jumpHistory.removeAt(0)
-                                jumpHistory.add(current)
-                                showJumpPill = true
+                                recordJumpHistory(current, targetPage)
                             }
 
                             if (displayMode == DisplayMode.PAGINATION) {
@@ -3322,14 +3490,34 @@ fun PdfViewerScreen(
         @SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
         Scaffold(
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
-            snackbarHost = {
-                SnackbarHost(
-                    hostState = snackbarHostState,
-                    modifier = Modifier.padding(bottom = snackbarPadding)
-                )
-            }
         ) { _ ->
-            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                event.changes.forEach { change ->
+                                    if (change.type == androidx.compose.ui.input.pointer.PointerType.Stylus ||
+                                        change.type == androidx.compose.ui.input.pointer.PointerType.Eraser) {
+                                        val buttons = event.buttons
+                                        Timber.tag("StylusDebug").d(
+                                            "GlobalPointer | type=${change.type}, pressed=${change.pressed}, " +
+                                                    "primary=${buttons.isPrimaryPressed}, secondary=${buttons.isSecondaryPressed}, " +
+                                                    "tertiary=${buttons.isTertiaryPressed}, back=${buttons.isBackPressed}, " +
+                                                    "forward=${buttons.isForwardPressed}"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .onPreviewKeyEvent { keyEvent ->
+                        Timber.tag("StylusDebug").d("GlobalKey | key=${keyEvent.key}, type=${keyEvent.type}")
+                        false
+                    }
+            ) {
                 IntSize(constraints.maxWidth, constraints.maxHeight)
                 val boxConstraints = constraints
                 val boxMaxWidthFloat = boxConstraints.maxWidth.toFloat()
@@ -3617,6 +3805,7 @@ fun PdfViewerScreen(
                                                 virtualPage = virtualPage,
                                                 totalPages = totalDisplayPages,
                                                 activeTheme = activeTheme,
+                                                activeTextureAlpha = 1f - globalTextureTransparency,
                                                 excludeImages = excludeImages,
                                                 isScrollLocked = isScrollLocked,
                                                 customHighlightColors = customHighlightColors,
@@ -3629,7 +3818,7 @@ fun PdfViewerScreen(
                                                         currentPageScale = newScale
                                                     }
                                                 },
-                                                ttsHighlightData = if (pagerState.currentPage == pageIndex) ttsHighlightData else null,
+                                                ttsHighlightData = if (ttsDisplayPageIndex == pageIndex) ttsHighlightData else null,
                                                 searchQuery = searchState.searchQuery,
                                                 searchHighlightMode = searchHighlightMode,
                                                 searchResultToHighlight = if (pagerState.currentPage == pageIndex) searchHighlightTarget else null,
@@ -4055,6 +4244,7 @@ fun PdfViewerScreen(
                                             state = verticalReaderState,
                                             pdfDocument = docHolder,
                                             activeTheme = activeTheme,
+                                            activeTextureAlpha = 1f - globalTextureTransparency,
                                             excludeImages = excludeImages,
                                             isScrollLocked = isScrollLocked,
                                             customHighlightColors = customHighlightColors,
@@ -4078,7 +4268,7 @@ fun PdfViewerScreen(
                                             onTranslateText = onTranslateTextStable,
                                             onSearchText = onSearchTextStable,
                                             ttsHighlightData = ttsHighlightData,
-                                            ttsReadingPage = ttsPageData?.pageIndex,
+                                            ttsReadingPage = ttsDisplayPageIndex,
                                             userHighlights = userHighlights,
                                             onHighlightAdd = onHighlightAdd,
                                             onHighlightUpdate = onHighlightUpdate,
@@ -4517,11 +4707,7 @@ fun PdfViewerScreen(
                                                     val targetPage = newValue.roundToInt()
 
                                                     if (targetPage != sliderStartPage) {
-                                                        if (jumpHistory.lastOrNull() != sliderStartPage) {
-                                                            if (jumpHistory.size > 20) jumpHistory.removeAt(0)
-                                                            jumpHistory.add(sliderStartPage)
-                                                        }
-                                                        showJumpPill = true
+                                                        recordJumpHistory(sliderStartPage, targetPage)
                                                     }
                                                     if (displayMode == DisplayMode.PAGINATION) {
                                                         pagerState.scrollToPage(
@@ -4653,6 +4839,71 @@ fun PdfViewerScreen(
                     }
                 }
 
+                val isPdfTtsPlayingOrLoading = ttsState.isPlaying || ttsState.isLoading
+                val showPdfThemePanel = { showThemePanel = true }
+                val showPdfDictionarySettings = { showDictionarySettingsSheet = true }
+                val togglePdfScrollLock = {
+                    isScrollLocked = !isScrollLocked
+                    savePdfScrollLocked(context, bookId, isScrollLocked)
+                    if (isScrollLocked) {
+                        savePdfLockedState(context, bookId, currentActiveScale, currentActiveOffset.x, currentActiveOffset.y)
+                        lockedState = Triple(currentActiveScale, currentActiveOffset.x, currentActiveOffset.y)
+                    }
+                }
+                val showPdfSlider = {
+                    val currentPageForSlider = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
+                    sliderStartPage = currentPageForSlider
+                    sliderCurrentPage = currentPageForSlider.toFloat()
+                    isPageSliderVisible = true
+                    showBars = false
+                }
+                val showPdfToc = {
+                    coroutineScope.launch { drawerState.open() }
+                    Unit
+                }
+                val showPdfSearch = {
+                    executeWithOcrCheck {
+                        searchState.isSearchActive = true
+                        showBars = true
+                    }
+                }
+                val togglePdfHighlights = {
+                    if (!showAllTextHighlights && !isHighlightingLoading) {
+                        showAllTextHighlights = true
+                        isHighlightingLoading = true
+                    } else if (showAllTextHighlights) {
+                        showAllTextHighlights = false
+                        isHighlightingLoading = false
+                    }
+                }
+                val showPdfAiHub = { showAiHubSheet = true }
+                val togglePdfEditMode = {
+                    val newEditMode = !isEditMode
+                    val currentActivePage = richTextController?.activePageIndex ?: -1
+                    Timber.tag("RichTextMigration").i("Edit Toggle: $isEditMode -> $newEditMode (ActivePage: $currentActivePage)")
+
+                    if (!newEditMode && richTextController != null) {
+                        coroutineScope.launch {
+                            richTextController.saveImmediate()
+                            withContext(Dispatchers.Main) {
+                                keyboardController?.hide()
+                            }
+                        }
+                    }
+
+                    isEditMode = newEditMode
+                    if (!newEditMode) showBars = true
+                }
+                val togglePdfTts = {
+                    if (isTtsSessionActive) {
+                        Timber.d("TTS button clicked: Stopping TTS")
+                        ttsController.stop()
+                        isAutoPagingForTts = false
+                    } else {
+                        startTtsWithPermissionCheck(null, null)
+                    }
+                }
+
                 // Custom Top Bar
                 PdfTopBar(
                     modifier = Modifier.align(Alignment.TopCenter),
@@ -4677,6 +4928,8 @@ fun PdfViewerScreen(
                     totalPages = totalPages,
                     pagerStatePageCount = pagerState.pageCount,
                     hiddenTools = hiddenTools,
+                    toolOrder = toolOrder,
+                    bottomTools = bottomTools,
                     isScrollLocked = isScrollLocked,
                     isEditMode = isEditMode,
                     displayMode = displayMode,
@@ -4692,16 +4945,9 @@ fun PdfViewerScreen(
                     activeTabBookId = activeTabBookId,
                     effectiveFileType = effectiveFileType,
                     onNavigateBack = { saveStateAndExit() },
-                    onShowThemePanel = { showThemePanel = true },
-                    onToggleScrollLock = {
-                        isScrollLocked = !isScrollLocked
-                        savePdfScrollLocked(context, bookId, isScrollLocked)
-                        if (isScrollLocked) {
-                            savePdfLockedState(context, bookId, currentActiveScale, currentActiveOffset.x, currentActiveOffset.y)
-                            lockedState = Triple(currentActiveScale, currentActiveOffset.x, currentActiveOffset.y)
-                        }
-                    },
-                    onShowDictionarySettings = { showDictionarySettingsSheet = true },
+                    onShowThemePanel = showPdfThemePanel,
+                    onToggleScrollLock = togglePdfScrollLock,
+                    onShowDictionarySettings = showPdfDictionarySettings,
                     onShowPenPlayground = { showPenPlayground = true },
                     onImportSvg = {
                         val page = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
@@ -4723,9 +4969,12 @@ fun PdfViewerScreen(
                                     }
                                     redoStack.clear()
 
-                                    snackbarHostState.showSnackbar(context.getString(R.string.msg_imported_svg_strokes))
+                                    showBanner(context.getString(R.string.msg_imported_svg_strokes))
                                 } else {
-                                    snackbarHostState.showSnackbar(context.getString(R.string.error_import_svg_failed))
+                                    showBanner(
+                                        context.getString(R.string.error_import_svg_failed),
+                                        isError = true
+                                    )
                                 }
                             }
                         }
@@ -4738,6 +4987,16 @@ fun PdfViewerScreen(
                         }
                     },
                     onShowVisualOptions = { showVisualOptionsSheet = true },
+                    isTtsPlayingOrLoading = isPdfTtsPlayingOrLoading,
+                    showAllTextHighlights = showAllTextHighlights,
+                    isHighlightingLoading = isHighlightingLoading,
+                    onShowSlider = showPdfSlider,
+                    onShowToc = showPdfToc,
+                    onSearchClick = showPdfSearch,
+                    onToggleHighlights = togglePdfHighlights,
+                    onShowAiHub = showPdfAiHub,
+                    onToggleEditMode = togglePdfEditMode,
+                    onToggleTts = togglePdfTts,
                     tapToNavigateEnabled = tapToNavigateEnabled,
                     onToggleTapToNavigate = {
                         tapToNavigateEnabled = !tapToNavigateEnabled
@@ -5017,55 +5276,32 @@ fun PdfViewerScreen(
                     )
                 }
 
-                val effectiveNavBarForPill = if (systemUiMode == SystemUiMode.DEFAULT || (systemUiMode == SystemUiMode.SYNC && showStandardBars)) with(density) { navBarHeight.toDp() } else 0.dp
+                val jumpBackPage = jumpHistory.getOrNull(jumpHistoryCursor - 1)
+                val jumpForwardPage = jumpHistory.getOrNull(jumpHistoryCursor + 1)
+                val effectiveNavBarForJumpBar = if (systemUiMode == SystemUiMode.DEFAULT || (systemUiMode == SystemUiMode.SYNC && showStandardBars)) with(density) { navBarHeight.toDp() } else 0.dp
 
-                val isBottomBarVisibleForPill = showStandardBars && !searchState.isSearchActive
-                val targetPillBottomPadding = if (isBottomBarVisibleForPill) 56.dp + 16.dp + effectiveNavBarForPill else 16.dp + effectiveNavBarForPill
-
-                val pillBottomPadding by animateDpAsState(
-                    targetValue = targetPillBottomPadding,
-                    label = "PillBottomPadding"
-                )
-
-                AnimatedVisibility(
-                    visible = showJumpPill && jumpHistory.isNotEmpty(),
-                    enter = fadeIn() + slideInVertically { it },
-                    exit = fadeOut() + slideOutVertically { it },
+                PdfJumpHistoryBar(
                     modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(bottom = pillBottomPadding)
-                        .padding(start = 16.dp)
-                ) {
-                    val lastPage = jumpHistory.lastOrNull() ?: 0
-                    Surface(
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.secondaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                        shadowElevation = 6.dp,
-                        onClick = {
-                            val target = jumpHistory.removeLastOrNull()
-                            if (target != null) {
-                                showJumpPill = false
-                                coroutineScope.launch {
-                                    if (displayMode == DisplayMode.PAGINATION) {
-                                        pagerState.animateScrollToPage(target)
-                                    } else {
-                                        verticalReaderState.scrollToPage(target)
-                                    }
-                                }
-                            }
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 56.dp + effectiveNavBarForJumpBar),
+                    showStandardBars = showStandardBars,
+                    searchStateActive = searchState.isSearchActive,
+                    backPage = jumpBackPage,
+                    forwardPage = jumpForwardPage,
+                    onBack = {
+                        jumpBackPage?.let { target ->
+                            jumpHistoryCursor = (jumpHistoryCursor - 1).coerceAtLeast(0)
+                            navigateToJumpHistoryPage(target)
                         }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = stringResource(R.string.content_desc_jump_back), modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(stringResource(R.string.pdf_back_to_page_short, lastPage + 1), style = MaterialTheme.typography.labelLarge)
+                    },
+                    onForward = {
+                        jumpForwardPage?.let { target ->
+                            jumpHistoryCursor = (jumpHistoryCursor + 1).coerceAtMost(jumpHistory.lastIndex)
+                            navigateToJumpHistoryPage(target)
                         }
-                    }
-                }
+                    },
+                    onClear = { clearJumpHistory() }
+                )
 
                 // Bottom Bar
                 PdfBottomBar(
@@ -5075,80 +5311,31 @@ fun PdfViewerScreen(
                     systemUiMode = systemUiMode,
                     navBarHeightDp = with(density) { navBarHeight.toDp() },
                     hiddenTools = hiddenTools,
-                    isTtsPlayingOrLoading = ttsState.isPlaying || ttsState.isLoading,
+                    toolOrder = toolOrder,
+                    bottomTools = bottomTools,
+                    isTtsPlayingOrLoading = isPdfTtsPlayingOrLoading,
                     showAllTextHighlights = showAllTextHighlights,
                     isHighlightingLoading = isHighlightingLoading,
                     isEditMode = isEditMode,
                     isTtsSessionActive = isTtsSessionActive,
-                    ttsErrorMessage = ttsState.errorMessage,
-                    jumpBackPage = jumpHistory.lastOrNull(),
-                    onJumpBack = {
-                        val target = jumpHistory.removeLastOrNull()
-                        if (target != null) {
-                            showJumpPill = false
-                            coroutineScope.launch {
-                                if (displayMode == DisplayMode.PAGINATION) {
-                                    pagerState.animateScrollToPage(target)
-                                } else {
-                                    verticalReaderState.scrollToPage(target)
-                                }
-                            }
-                        }
-                    },
-                    onShowSlider = {
-                        val currentPageForSlider = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
-                        sliderStartPage = currentPageForSlider
-                        sliderCurrentPage = currentPageForSlider.toFloat()
-                        isPageSliderVisible = true
-                        showBars = false
-                    },
-                    onShowToc = { coroutineScope.launch { drawerState.open() } },
-                    onSearchClick = {
-                        executeWithOcrCheck {
-                            searchState.isSearchActive = true
-                            showBars = true
-                        }
-                    },
-                    onToggleHighlights = {
-                        if (!showAllTextHighlights && !isHighlightingLoading) {
-                            showAllTextHighlights = true
-                            isHighlightingLoading = true
-                        } else if (showAllTextHighlights) {
-                            showAllTextHighlights = false
-                            isHighlightingLoading = false
-                        }
-                    },
-                    onShowAiHub = { showAiHubSheet = true },
-                    onToggleEditMode = {
-                        val newEditMode = !isEditMode
-                        val currentActivePage = richTextController?.activePageIndex ?: -1
-                        Timber.tag("RichTextMigration").i("Edit Toggle: $isEditMode -> $newEditMode (ActivePage: $currentActivePage)")
-
-                        if (!newEditMode && richTextController != null) {
-                            coroutineScope.launch {
-                                richTextController.saveImmediate()
-                                withContext(Dispatchers.Main) {
-                                    keyboardController?.hide()
-                                }
-                            }
-                        }
-
-                        isEditMode = newEditMode
-                        if (!newEditMode) showBars = true
-                    },
-                    onToggleTts = {
-                        if (isTtsSessionActive) {
-                            Timber.d("TTS button clicked: Stopping TTS")
-                            ttsController.stop()
-                            isAutoPagingForTts = false
-                        } else {
-                            startTtsWithPermissionCheck(null, null)
-                        }
-                    },
+                    ttsErrorMessage = null,
+                    onShowThemePanel = showPdfThemePanel,
+                    onToggleScrollLock = togglePdfScrollLock,
+                    onShowDictionarySettings = showPdfDictionarySettings,
+                    onShowSlider = showPdfSlider,
+                    onShowToc = showPdfToc,
+                    onSearchClick = showPdfSearch,
+                    onToggleHighlights = togglePdfHighlights,
+                    onShowAiHub = showPdfAiHub,
+                    onToggleEditMode = togglePdfEditMode,
+                    onToggleTts = togglePdfTts,
                     isBubbleZoomModeActive = isBubbleZoomModeActive,
                     onToggleBubbleZoom = {
                         if (isOss) {
-                            coroutineScope.launch { snackbarHostState.showSnackbar("Bubble Zoom is only available in Playstore version of Episteme") }
+                            showBanner(
+                                "Bubble Zoom is only available in Playstore version of Episteme",
+                                isError = true
+                            )
                         } else if (!isBubbleZoomModeActive && !viewModel.isSpeechBubbleModelAvailable(context)) {
                             showBubbleZoomDownloadDialog = true
                         } else {
@@ -5499,7 +5686,7 @@ fun PdfViewerScreen(
                     }
                 }
 
-                val ttsReadingPage = ttsPageData?.pageIndex
+                val ttsReadingPage = ttsDisplayPageIndex
 
                 val isTtsPageVisible by remember(
                     ttsReadingPage,
@@ -5731,728 +5918,6 @@ fun PdfViewerScreen(
                     }
                 }
 
-                if (showAiHubSheet) {
-                    val currentPageForDisplay = if (displayMode == DisplayMode.PAGINATION) {
-                        pagerState.currentPage
-                    } else {
-                        verticalReaderState.currentPage
-                    }
-                    val bookTitle = documentMetadataTitle ?: originalFileName
-
-                    AiHubBottomSheet(
-                        bookTitle = bookTitle,
-                        currentChapterIndex = currentPageForDisplay,
-                        chapterTitle = "Page ${currentPageForDisplay + 1}",
-                        summaryCacheManager = summaryCacheManager,
-                        summarizationResult = summarizationResult,
-                        isSummarizationLoading = isSummarizationLoading,
-                        onClearSummary = { summarizationResult = null },
-                        onGenerateSummary = { force ->
-                            if (!isProUser && uiState.credits <= 0) {
-                                showInsufficientCreditsDialog = true
-                                showAiHubSheet = false
-                            } else {
-                                coroutineScope.launch {
-                                    isSummarizationLoading = true
-                                    summarizationResult = null
-
-                                    val cached = if (!force) summaryCacheManager.getSummary(bookTitle, currentPageForDisplay) else null
-                                    if (cached != null) {
-                                        summarizationResult = SummarizationResult(summary = cached, isCacheHit = true)
-                                        isSummarizationLoading = false
-                                        return@launch
-                                    }
-
-                                    val token = viewModel.getAuthToken()
-                                    summarizeCurrentPage(
-                                        authToken = token,
-                                        onUpdate = { result ->
-                                            if (result.error == "INSUFFICIENT_CREDITS") {
-                                                showInsufficientCreditsDialog = true
-                                                showAiHubSheet = false
-                                                isSummarizationLoading = false
-                                            } else {
-                                                summarizationResult = result
-                                            }
-                                        }, onFinish = {
-                                            isSummarizationLoading = false
-                                            val finalSummary = summarizationResult?.summary
-                                            if (!finalSummary.isNullOrBlank() && summarizationResult?.error == null) {
-                                                summaryCacheManager.saveSummary(bookTitle, currentPageForDisplay, "Page ${currentPageForDisplay + 1}", finalSummary)
-                                            }
-                                        }
-                                    )
-                                }
-                            }
-                        },
-                        recapResult = null,
-                        isRecapLoading = false,
-                        onGenerateRecap = null,
-                        onDismiss = { showAiHubSheet = false },
-                        isMainTtsActive = isTtsSessionActive,
-                        getAuthToken = { viewModel.getAuthToken() },
-                        credits = uiState.credits,
-                        isProUser = isProUser
-                    )
-                }
-
-                if (showPermissionRationaleDialog) {
-                    AlertDialog(
-                        onDismissRequest = { showPermissionRationaleDialog = false },
-                        title = { Text(stringResource(R.string.dialog_permission_required)) },
-                        text = {
-                            Text(
-                                stringResource(R.string.dialog_permission_notification_desc)
-                            )
-                        },
-                        confirmButton = {
-                            TextButton(
-                                onClick = {
-                                    showPermissionRationaleDialog = false
-                                    permissionLauncher.launch(
-                                        Manifest.permission.POST_NOTIFICATIONS
-                                    )
-                                }) { Text(stringResource(R.string.action_continue)) }
-                        },
-                        dismissButton = {
-                            TextButton(
-                                onClick = {
-                                    showPermissionRationaleDialog = false
-                                    startTts()
-                                }) { Text(stringResource(R.string.action_not_now)) }
-                        })
-                }
-                if (showSummarizationUpsellDialog) {
-                    AlertDialog(
-                        onDismissRequest = { showSummarizationUpsellDialog = false },
-                        icon = {
-                            Icon(
-                                painter = painterResource(id = R.drawable.summarize),
-                                contentDescription = null
-                            )
-                        },
-                        title = { Text(stringResource(R.string.dialog_unlock_page_summarization)) },
-                        text = {
-                            Text(
-                                stringResource(R.string.dialog_unlock_page_summarization_desc)
-                            )
-                        },
-                        confirmButton = {
-                            TextButton(
-                                onClick = {
-                                    showSummarizationUpsellDialog = false
-                                    onNavigateToPro()
-                                }) { Text(stringResource(R.string.action_learn_more)) }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { showSummarizationUpsellDialog = false }) {
-                                Text(stringResource(R.string.action_not_now))
-                            }
-                        })
-                }
-
-                if (showInsufficientCreditsDialog) {
-                    AlertDialog(
-                        onDismissRequest = { showInsufficientCreditsDialog = false },
-                        icon = { Icon(painterResource(id = R.drawable.crown), contentDescription = null) },
-                        title = { Text(stringResource(R.string.dialog_out_of_credits_title)) },
-                        text = { Text(stringResource(R.string.dialog_out_of_credits_desc)) },
-                        confirmButton = {
-                            TextButton(onClick = {
-                                showInsufficientCreditsDialog = false
-                                onNavigateToPro()
-                            }) { Text(stringResource(R.string.action_get_pro_or_add_credits)) }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { showInsufficientCreditsDialog = false }) {
-                                Text(stringResource(R.string.action_cancel))
-                            }
-                        }
-                    )
-                }
-
-                // --- PANEL POPUP ---
-                if (poppedUpPanelBitmap != null) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.85f))
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null
-                            ) {
-                                poppedUpPanelBitmap?.recycle()
-                                poppedUpPanelBitmap = null
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Image(
-                            bitmap = poppedUpPanelBitmap!!.asImageBitmap(),
-                            contentDescription = stringResource(R.string.content_desc_annotated_page),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp)
-                                .clip(RoundedCornerShape(12.dp)),
-                            contentScale = ContentScale.Fit
-                        )
-
-                        IconButton(
-                            onClick = {
-                                poppedUpPanelBitmap?.recycle()
-                                poppedUpPanelBitmap = null
-                            },
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(24.dp)
-                                .background(Color.Black.copy(alpha = 0.6f), CircleShape)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = stringResource(R.string.content_desc_close_image),
-                                tint = Color.White
-                            )
-                        }
-                    }
-                }
-                // --- END PANEL POPUP ---
-
-                if (showPasswordDialog) {
-                    PasswordDialog(
-                        isError = isPasswordError,
-                        onDismiss = { onNavigateBack() },
-                        onConfirm = { password -> documentPassword = password })
-                }
-
-                if (showBubbleZoomDownloadDialog) {
-                    AlertDialog(
-                        onDismissRequest = { showBubbleZoomDownloadDialog = false },
-                        icon = { Icon(Icons.Default.Info, contentDescription = null) },
-                        title = { Text(stringResource(R.string.dialog_download_bubble_zoom_model)) },
-                        text = {
-                            Text(stringResource(R.string.dialog_download_bubble_zoom_model_desc))
-                        },
-                        confirmButton = {
-                            TextButton(onClick = {
-                                showBubbleZoomDownloadDialog = false
-                                viewModel.downloadSpeechBubbleModel(context)
-                            }) {
-                                Text(stringResource(R.string.action_download))
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { showBubbleZoomDownloadDialog = false }) {
-                                Text(stringResource(R.string.action_cancel))
-                            }
-                        }
-                    )
-                }
-
-                if (showNewTabSheet) {
-                    ModalBottomSheet(
-                        onDismissRequest = { showNewTabSheet = false },
-                        sheetState = sheetState,
-                        containerColor = MaterialTheme.colorScheme.surface
-                    ) {
-                        val pdfFiles = remember(uiState.rawLibraryFiles, openTabs) {
-                            val openIds = openTabs.map { it.bookId }
-                            uiState.rawLibraryFiles
-                                .filter { it.type == FileType.PDF && it.bookId !in openIds }
-                                .sortedByDescending { it.timestamp }
-                        }
-
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 16.dp)
-                        ) {
-                            Text(
-                                text = stringResource(R.string.title_add_pdf_to_tab),
-                                style = MaterialTheme.typography.titleLarge,
-                                modifier = Modifier.padding(16.dp)
-                            )
-                            if (pdfFiles.isEmpty()) {
-                                Text(
-                                    stringResource(R.string.msg_no_other_pdfs_found),
-                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            } else {
-                                LazyColumn(modifier = Modifier.fillMaxWidth()) {
-                                    items(pdfFiles, key = { it.bookId }) { file ->
-                                        ListItem(
-                                            headlineContent = { Text(file.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                                            supportingContent = { file.author?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis) } },
-                                            modifier = Modifier.clickable {
-                                                coroutineScope.launch {
-                                                    sheetState.hide()
-                                                    showNewTabSheet = false
-                                                    viewModel.switchTab(file.bookId)
-                                                }
-                                            }
-                                        )
-                                        HorizontalDivider()
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (showPenPlayground) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.6f))
-                            .clickable { showPenPlayground = false },
-                        contentAlignment = Alignment.Center
-                    ) { PenPlayground(onClose = { showPenPlayground = false }) }
-                }
-
-                if (showAiDefinitionPopup) {
-                    AiDefinitionPopup(
-                        word = selectedTextForAi,
-                        result = aiDefinitionResult,
-                        isLoading = isAiDefinitionLoading,
-                        onDismiss = {
-                            showAiDefinitionPopup = false
-                            selectedTextForAi = null
-                            aiDefinitionResult = null
-                        },
-                        isMainTtsActive = isTtsSessionActive,
-                        onOpenExternalDictionary = {
-                            selectedTextForAi?.let { text ->
-                                if (!selectedDictPackage.isNullOrEmpty()) {
-                                    ExternalDictionaryHelper.launchDictionary(context, selectedDictPackage!!, text)
-                                } else {
-                                    Toast.makeText(context, context.getString(R.string.toast_select_offline_dict_first), Toast.LENGTH_SHORT).show()
-                                    showDictionarySettingsSheet = true
-                                }
-                            }
-                        },
-                        getAuthToken = { viewModel.getAuthToken() }
-                    )
-                }
-                if (showDictionaryUpsellDialog) {
-                    AlertDialog(onDismissRequest = { showDictionaryUpsellDialog = false }, icon = {
-                        Icon(
-                            painter = painterResource(id = R.drawable.ai),
-                            contentDescription = null
-                        )
-                    }, title = { Text(stringResource(R.string.ai_unlock_smart_dict)) }, text = {
-                        Text(
-                            stringResource(R.string.ai_unlock_smart_dict_desc)
-                        )
-                    }, confirmButton = {
-                        TextButton(
-                            onClick = {
-                                showDictionaryUpsellDialog = false
-                                onNavigateToPro()
-                            }) { Text(stringResource(R.string.action_learn_more)) }
-                    }, dismissButton = {
-                        TextButton(onClick = { showDictionaryUpsellDialog = false }) {
-                            Text(stringResource(R.string.action_not_now))
-                        }
-                    })
-                }
-
-                showReindexDialog?.let { newLanguage ->
-                    if (BuildConfig.IS_PRO) {
-                        AlertDialog(
-                            onDismissRequest = { showReindexDialog = null },
-                            icon = { Icon(Icons.Default.Info, contentDescription = null) },
-                            title = { Text(stringResource(R.string.title_reindex_document)) },
-                            text = {
-                                Text(
-                                    stringResource(R.string.desc_reindex_document_warning)
-                                )
-                            },
-                            confirmButton = {
-                                TextButton(
-                                    onClick = {
-                                        coroutineScope.launch {
-                                            ocrLanguage = newLanguage
-                                            saveOcrLanguage(context, newLanguage)
-                                            hasSelectedOcrLanguage = true
-
-                                            currentBookId?.let { id ->
-                                                isBackgroundIndexing = true
-                                                backgroundIndexingProgress = 0f
-                                                withContext(Dispatchers.IO) {
-                                                    pdfTextRepository.clearBookText(id)
-                                                    pdfTextRepository.setBookLanguage(id, newLanguage.name)
-                                                }
-                                                isBackgroundIndexing = false
-                                            }
-
-                                            pendingActionAfterOcrSelection?.invoke()
-                                            pendingActionAfterOcrSelection = null
-                                            showReindexDialog = null
-                                            showOcrLanguageDialog = false
-                                        }
-                                    }
-                                ) { Text(stringResource(R.string.action_reindex)) }
-                            },
-                            dismissButton = {
-                                TextButton(onClick = { showReindexDialog = null }) {
-                                    Text(stringResource(R.string.action_cancel))
-                                }
-                            }
-                        )
-                    } else {
-                        showReindexDialog = null
-                    }
-                }
-
-                if (showOcrLanguageDialog && !isOss) {
-                    OcrLanguageSelectionDialog(
-                        currentLanguage = ocrLanguage,
-                        isFirstRun = !hasSelectedOcrLanguage,
-                        onDismiss = {
-                            showOcrLanguageDialog = false
-                            pendingActionAfterOcrSelection = null
-                        },
-                        onLanguageSelected = { selected ->
-                            coroutineScope.launch {
-                                val storedLangName = currentBookId?.let {
-                                    pdfTextRepository.getBookLanguage(it)
-                                }
-
-                                val hasIndexedPages = currentBookId?.let {
-                                    pdfTextRepository.getIndexedPages(it).isNotEmpty()
-                                } == true
-
-                                if (hasIndexedPages && storedLangName != null && storedLangName != selected.name) {
-                                    showReindexDialog = selected
-                                    showOcrLanguageDialog = false
-                                } else {
-                                    ocrLanguage = selected
-                                    saveOcrLanguage(context, selected)
-                                    hasSelectedOcrLanguage = true
-
-                                    currentBookId?.let {
-                                        pdfTextRepository.setBookLanguage(it, selected.name)
-                                    }
-
-                                    showOcrLanguageDialog = false
-                                    pendingActionAfterOcrSelection?.invoke()
-                                    pendingActionAfterOcrSelection = null
-                                }
-                            }
-                        })
-                }
-
-                if (showTtsSettingsSheet) {
-                    val bookTitle = documentMetadataTitle ?: originalFileName
-                    TtsSettingsSheet(
-                        isVisible = true,
-                        onDismiss = { showTtsSettingsSheet = false },
-                        currentMode = currentTtsMode,
-                        onModeChange = { newMode ->
-                            currentTtsMode = newMode
-                            saveTtsMode(context, newMode)
-                            ttsController.changeTtsMode(newMode.name)
-                        },
-                        currentSpeakerId = ttsState.speakerId,
-                        onSpeakerChange = { newSpeaker ->
-                            ttsController.changeSpeaker(newSpeaker)
-                        },
-                        isTtsActive = isTtsSessionActive,
-                        getAuthToken = { viewModel.getAuthToken() },
-                        bookTitle = bookTitle
-                    )
-                }
-
-                if (showDictionarySettingsSheet) {
-                    DictionarySettingsDialog(
-                        isVisible = true,
-                        onDismiss = { showDictionarySettingsSheet = false },
-                        isProUser = isProUser,
-                        useOnlineDictionary = useOnlineDictionary,
-                        onToggleOnlineDictionary = { newState ->
-                            useOnlineDictionary = newState
-                            saveUseOnlineDict(context, newState)
-                        },
-                        selectedDictionaryPackageName = selectedDictPackage,
-                        onSelectDictionaryPackage = { pkg ->
-                            selectedDictPackage = pkg
-                            saveExternalDictPackage(context, pkg)
-                        },
-                        selectedTranslatePackageName = selectedTranslatePackage,
-                        onSelectTranslatePackage = { pkg ->
-                            selectedTranslatePackage = pkg
-                            saveExternalTranslatePackage(context, pkg)
-                        },
-                        selectedSearchPackageName = selectedSearchPackage,
-                        onSelectSearchPackage = { pkg ->
-                            selectedSearchPackage = pkg
-                            saveExternalSearchPackage(context, pkg)
-                        }
-                    )
-                }
-
-                if (highlightToNoteId != null) {
-                    val targetHighlight = userHighlights.find { it.id == highlightToNoteId }
-                    if (targetHighlight != null) {
-                        val effectiveBg = if (activeTheme.backgroundColor == Color.Unspecified) MaterialTheme.colorScheme.surface else activeTheme.backgroundColor
-                        val effectiveText = if (activeTheme.textColor == Color.Unspecified) MaterialTheme.colorScheme.onSurface else activeTheme.textColor
-
-                        PdfAnnotationBottomSheet(
-                            highlight = targetHighlight,
-                            effectiveBg = effectiveBg,
-                            effectiveText = effectiveText,
-                            customHighlightColors = customHighlightColors,
-                            onPaletteClick = {
-                                highlightColorPickerInitialSlot = targetHighlight.color
-                                showHighlightColorPicker = true
-                            },
-                            onColorChange = { newColor ->
-                                onHighlightUpdate(
-                                    targetHighlight.id,
-                                    newColor
-                                )
-                            },
-                            onDismiss = { highlightToNoteId = null },
-                            onSave = { noteText ->
-                                val index =
-                                    userHighlights.indexOfFirst { it.id == targetHighlight.id }
-                                if (index != -1) {
-                                    userHighlights[index] =
-                                        targetHighlight.copy(note = noteText.takeIf { it.isNotBlank() })
-                                }
-                                highlightToNoteId = null
-                            },
-                            onDelete = {
-                                onHighlightDelete(targetHighlight.id)
-                                highlightToNoteId = null
-                            },
-                            onCopy = {
-                                val clip = ClipData.newPlainText(
-                                    "Copied Text",
-                                    targetHighlight.text
-                                )
-                                clipboardManager.setText(
-                                    androidx.compose.ui.text.AnnotatedString(
-                                        targetHighlight.text
-                                    )
-                                )
-                                highlightToNoteId = null
-                            },
-                            onDictionary = {
-                                onDictionaryLookupStable(targetHighlight.text)
-                                highlightToNoteId = null
-                            },
-                            onTranslate = {
-                                onTranslateTextStable(targetHighlight.text)
-                                highlightToNoteId = null
-                            },
-                            onSearch = {
-                                onSearchTextStable(targetHighlight.text)
-                                highlightToNoteId = null
-                            }
-                        )
-                    } else {
-                        highlightToNoteId = null
-                    }
-                }
-
-                if (showHighlightColorPicker) {
-                    HighlightColorPickerDialog(
-                        initialColors = customHighlightColors,
-                        initialSelection = highlightColorPickerInitialSlot,
-                        onDismiss = { showHighlightColorPicker = false },
-                        onSave = { newColors ->
-                            customHighlightColors = newColors
-                            saveCustomHighlightColors(context, newColors)
-                            showHighlightColorPicker = false
-                        }
-                    )
-                }
-
-                if (showThemePanel) {
-                    ReaderThemePanel(
-                        isVisible = true,
-                        currentThemeId = currentThemeId,
-                        excludeImages = excludeImages,
-                        onExcludeImagesChange = {
-                            excludeImages = it
-                            com.aryan.reader.saveExcludeImages(context, it)
-                        },
-                        showExcludeImagesOption = true,
-                        builtInThemes = PdfBuiltInThemes,
-                        onThemeSelected = {
-                            currentThemeId = it
-                            savePdfThemeId(context, it)
-                            showThemePanel = false
-                        },
-                        onDismiss = { showThemePanel = false },
-                        customThemes = customThemes,
-                        onCustomThemesUpdated = {
-                            customThemes = it
-                            saveCustomThemes(context, it)
-                        }
-                    )
-                }
-
-                if (clickedLinkUrl != null) {
-                    val url = clickedLinkUrl!!
-                    AlertDialog(
-                        onDismissRequest = { clickedLinkUrl = null },
-                        title = { Text(stringResource(R.string.dialog_external_link_title)) },
-                        text = { Text(stringResource(R.string.desc_external_link_warning)) },
-                        confirmButton = {
-                            TextButton(
-                                onClick = {
-                                    try {
-                                        uriHandler.openUri(url)
-                                    } catch (e: Exception) {
-                                        Timber.e(e, "Failed to open URI")
-                                    }
-                                    clickedLinkUrl = null
-                                }) { Text(stringResource(R.string.action_visit)) }
-                        },
-                        dismissButton = {
-                            Row {
-                                TextButton(
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(url))
-                                        clickedLinkUrl = null
-                                    }) { Text(stringResource(R.string.action_copy)) }
-                                TextButton(onClick = { clickedLinkUrl = null }) {
-                                    Text(stringResource(R.string.action_cancel))
-                                }
-                            }
-                        })
-                }
-
-                if (showSaveDialog) {
-                    AlertDialog(
-                        onDismissRequest = { showSaveDialog = false },
-                        title = { Text(stringResource(R.string.title_save_to_device)) },
-                        text = { Text(stringResource(R.string.desc_choose_format_save)) },
-                        confirmButton = {
-                            TextButton(
-                                onClick = {
-                                    showSaveDialog = false
-                                    pendingSaveMode = SaveMode.ANNOTATED
-                                    val suggestedName = getSuggestedFilename(
-                                        originalFileName, isAnnotated = true
-                                    )
-                                    saveLauncher.launch(suggestedName)
-                                }) { Text(stringResource(R.string.action_with_annotations)) }
-                        },
-                        dismissButton = {
-                            Row {
-                                TextButton(
-                                    onClick = {
-                                        showSaveDialog = false
-                                        pendingSaveMode = SaveMode.ORIGINAL
-                                        val suggestedName = getSuggestedFilename(
-                                            originalFileName, isAnnotated = false
-                                        )
-                                        saveLauncher.launch(suggestedName)
-                                    }) { Text(stringResource(R.string.action_original)) }
-
-                                Spacer(Modifier.width(8.dp))
-
-                                TextButton(
-                                    onClick = {
-                                        showSaveDialog = false
-                                        pendingSaveMode = null
-                                    }) { Text(stringResource(R.string.action_cancel)) }
-                            }
-                        })
-                }
-
-                if (showShareDialog) {
-                    AlertDialog(
-                        onDismissRequest = { showShareDialog = false },
-                        title = { Text(stringResource(R.string.share_chooser_title)) },
-                        text = { Text(stringResource(R.string.desc_choose_format_share)) },
-                        confirmButton = {
-                            TextButton(
-                                onClick = {
-                                    showShareDialog = false
-                                    isShareLoading = true
-                                    Timber.tag("PdfExportDebug").i("SHARE TRIGGERED: userHighlights count: ${userHighlights.size}")
-                                    val filename = getSuggestedFilename(
-                                        originalFileName, isAnnotated = true
-                                    )
-                                    coroutineScope.launch {
-                                        val currentRichTextLayouts = richTextController?.pageLayouts
-
-                                        viewModel.sharePdf(
-                                            activityContext = context,
-                                            sourceUri = effectivePdfUri,
-                                            annotations = allAnnotations,
-                                            richTextPageLayouts = currentRichTextLayouts,
-                                            textBoxes = textBoxes.toList(),
-                                            highlights = userHighlights.toList(),
-                                            includeAnnotations = true,
-                                            filename = filename,
-                                            bookId = currentBookId
-                                        )
-                                        isShareLoading = false
-                                    }
-                                }) { Text(stringResource(R.string.action_with_annotations)) }
-                        },
-                        dismissButton = {
-                            Row {
-                                TextButton(
-                                    onClick = {
-                                        showShareDialog = false
-                                        isShareLoading = true
-                                        val filename = getSuggestedFilename(
-                                            originalFileName, isAnnotated = false
-                                        )
-                                        coroutineScope.launch {
-                                            viewModel.sharePdf(
-                                                activityContext = context,
-                                                sourceUri = pdfUri,
-                                                annotations = allAnnotations,
-                                                includeAnnotations = false,
-                                                filename = filename
-                                            )
-                                            isShareLoading = false
-                                        }
-                                    }) { Text(stringResource(R.string.action_original)) }
-                                Spacer(Modifier.width(8.dp))
-                                TextButton(onClick = { showShareDialog = false }) {
-                                    Text(stringResource(R.string.action_cancel))
-                                }
-                            }
-                        })
-                }
-
-                if (isShareLoading) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.5f))
-                            .clickable(enabled = false) {}, contentAlignment = Alignment.Center
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = MaterialTheme.colorScheme.surface,
-                            tonalElevation = 6.dp
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(24.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.Center
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(32.dp), strokeWidth = 3.dp
-                                )
-                                Spacer(modifier = Modifier.height(16.dp))
-                                Text(
-                                    text = stringResource(R.string.msg_preparing_pdf),
-                                    style = MaterialTheme.typography.bodyLarge
-                                )
-                            }
-                        }
-                    }
-                }
-
                 val effectiveNavBarPaddingForOverlays = if (systemUiMode == SystemUiMode.DEFAULT || (systemUiMode == SystemUiMode.SYNC && showStandardBars)) with(density) { navBarHeight.toDp() } else 0.dp
                 val autoScrollPadding by animateDpAsState(
                     targetValue = if (showStandardBars) (56.dp + 16.dp + effectiveNavBarPaddingForOverlays) else (16.dp + effectiveNavBarPaddingForOverlays),
@@ -6485,7 +5950,7 @@ fun PdfViewerScreen(
                         isCollapsed = isTtsCollapsed,
                         onCollapseChange = { isTtsCollapsed = it },
                         onLocateCurrentChunk = {
-                            ttsPageData?.pageIndex?.let { targetPage ->
+                            ttsDisplayPageIndex?.let { targetPage ->
                                 coroutineScope.launch {
                                     if (displayMode == DisplayMode.PAGINATION) {
                                         pagerState.scrollToPage(targetPage)
@@ -6603,24 +6068,758 @@ fun PdfViewerScreen(
                         }
                     )
                 }
-                if (showVisualOptionsSheet) {
-                    PdfVisualOptionsSheet(
-                        systemUiMode = systemUiMode,
-                        onSystemUiModeChange = { mode ->
-                            systemUiMode = mode
-                            savePdfSystemUiMode(context, mode)
-                        },
-                        onDismiss = { showVisualOptionsSheet = false }
-                    )
+
+                CustomTopBanner(bannerMessage = bannerMessage)
+            }
+        }
+    }
+
+    if (showAiHubSheet) {
+        val currentPageForDisplay = if (displayMode == DisplayMode.PAGINATION) {
+            pagerState.currentPage
+        } else {
+            verticalReaderState.currentPage
+        }
+        val bookTitle = documentMetadataTitle ?: originalFileName
+
+        AiHubBottomSheet(
+            bookTitle = bookTitle,
+            currentChapterIndex = currentPageForDisplay,
+            chapterTitle = "Page ${currentPageForDisplay + 1}",
+            summaryCacheManager = summaryCacheManager,
+            summarizationResult = summarizationResult,
+            isSummarizationLoading = isSummarizationLoading,
+            onClearSummary = { summarizationResult = null },
+            onGenerateSummary = { force ->
+                if (BuildConfig.FLAVOR != "oss" && !isProUser && uiState.credits <= 0) {
+                    showInsufficientCreditsDialog = true
+                    showAiHubSheet = false
+                } else {
+                    coroutineScope.launch {
+                        isSummarizationLoading = true
+                        summarizationResult = null
+
+                        val cached = if (!force) summaryCacheManager.getSummary(bookTitle, currentPageForDisplay) else null
+                        if (cached != null) {
+                            summarizationResult = SummarizationResult(summary = cached, isCacheHit = true)
+                            isSummarizationLoading = false
+                            return@launch
+                        }
+
+                        val token = viewModel.getAuthToken()
+                        summarizeCurrentPage(
+                            authToken = token,
+                            onUpdate = { result ->
+                                if (result.error == "INSUFFICIENT_CREDITS") {
+                                    showInsufficientCreditsDialog = true
+                                    showAiHubSheet = false
+                                    isSummarizationLoading = false
+                                } else {
+                                    summarizationResult = result
+                                }
+                            }, onFinish = {
+                                isSummarizationLoading = false
+                                val finalSummary = summarizationResult?.summary
+                                if (!finalSummary.isNullOrBlank() && summarizationResult?.error == null) {
+                                    summaryCacheManager.saveSummary(bookTitle, currentPageForDisplay, "Page ${currentPageForDisplay + 1}", finalSummary)
+                                }
+                            }
+                        )
+                    }
                 }
-                if (showCustomizeToolsSheet) {
-                    PdfCustomizeToolsSheet(
-                        hiddenTools = hiddenTools,
-                        onUpdate = onUpdateHiddenTools,
-                        onDismiss = { showCustomizeToolsSheet = false }
+            },
+            recapResult = null,
+            isRecapLoading = false,
+            onGenerateRecap = null,
+            onDismiss = { showAiHubSheet = false },
+            isMainTtsActive = isTtsSessionActive,
+            getAuthToken = { viewModel.getAuthToken() },
+            credits = uiState.credits,
+            isProUser = isProUser
+        )
+    }
+
+    if (showPermissionRationaleDialog) {
+        AlertDialog(
+            onDismissRequest = { showPermissionRationaleDialog = false },
+            title = { Text(stringResource(R.string.dialog_permission_required)) },
+            text = {
+                Text(
+                    stringResource(R.string.dialog_permission_notification_desc)
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showPermissionRationaleDialog = false
+                        permissionLauncher.launch(
+                            Manifest.permission.POST_NOTIFICATIONS
+                        )
+                    }) { Text(stringResource(R.string.action_continue)) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showPermissionRationaleDialog = false
+                        startTts()
+                    }) { Text(stringResource(R.string.action_not_now)) }
+            })
+    }
+    if (showSummarizationUpsellDialog) {
+        AlertDialog(
+            onDismissRequest = { showSummarizationUpsellDialog = false },
+            icon = {
+                Icon(
+                    painter = painterResource(id = R.drawable.summarize),
+                    contentDescription = null
+                )
+            },
+            title = { Text(stringResource(R.string.dialog_unlock_page_summarization)) },
+            text = {
+                Text(
+                    stringResource(R.string.dialog_unlock_page_summarization_desc)
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showSummarizationUpsellDialog = false
+                        onNavigateToPro()
+                    }) { Text(stringResource(R.string.action_learn_more)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSummarizationUpsellDialog = false }) {
+                    Text(stringResource(R.string.action_not_now))
+                }
+            })
+    }
+
+    if (showInsufficientCreditsDialog) {
+        AlertDialog(
+            onDismissRequest = { showInsufficientCreditsDialog = false },
+            icon = { Icon(painterResource(id = R.drawable.crown), contentDescription = null) },
+            title = { Text(stringResource(R.string.dialog_out_of_credits_title)) },
+            text = { Text(stringResource(R.string.dialog_out_of_credits_desc)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showInsufficientCreditsDialog = false
+                    onNavigateToPro()
+                }) { Text(stringResource(R.string.action_get_pro_or_add_credits)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showInsufficientCreditsDialog = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+
+    // --- PANEL POPUP ---
+    if (poppedUpPanelBitmap != null) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.85f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) {
+                    poppedUpPanelBitmap?.recycle()
+                    poppedUpPanelBitmap = null
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Image(
+                bitmap = poppedUpPanelBitmap!!.asImageBitmap(),
+                contentDescription = stringResource(R.string.content_desc_annotated_page),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .clip(RoundedCornerShape(12.dp)),
+                contentScale = ContentScale.Fit
+            )
+
+            IconButton(
+                onClick = {
+                    poppedUpPanelBitmap?.recycle()
+                    poppedUpPanelBitmap = null
+                },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(24.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = stringResource(R.string.content_desc_close_image),
+                    tint = Color.White
+                )
+            }
+        }
+    }
+    // --- END PANEL POPUP ---
+
+    if (showPasswordDialog) {
+        PasswordDialog(
+            isError = isPasswordError,
+            onDismiss = { onNavigateBack() },
+            onConfirm = { password -> documentPassword = password })
+    }
+
+    if (showBubbleZoomDownloadDialog) {
+        AlertDialog(
+            onDismissRequest = { showBubbleZoomDownloadDialog = false },
+            icon = { Icon(Icons.Default.Info, contentDescription = null) },
+            title = { Text(stringResource(R.string.dialog_download_bubble_zoom_model)) },
+            text = {
+                Text(stringResource(R.string.dialog_download_bubble_zoom_model_desc))
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBubbleZoomDownloadDialog = false
+                    viewModel.downloadSpeechBubbleModel(context)
+                }) {
+                    Text(stringResource(R.string.action_download))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBubbleZoomDownloadDialog = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+
+    if (showNewTabSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showNewTabSheet = false },
+            sheetState = sheetState,
+            containerColor = MaterialTheme.colorScheme.surface
+        ) {
+            val pdfFiles = remember(uiState.rawLibraryFiles, openTabs) {
+                val openIds = openTabs.map { it.bookId }
+                uiState.rawLibraryFiles
+                    .filter { it.type == FileType.PDF && it.bookId !in openIds }
+                    .sortedByDescending { it.timestamp }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 16.dp)
+            ) {
+                Text(
+                    text = stringResource(R.string.title_add_pdf_to_tab),
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(16.dp)
+                )
+                if (pdfFiles.isEmpty()) {
+                    Text(
+                        stringResource(R.string.msg_no_other_pdfs_found),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                        items(pdfFiles, key = { it.bookId }) { file ->
+                            ListItem(
+                                headlineContent = { Text(file.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                supportingContent = { file.author?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis) } },
+                                modifier = Modifier.clickable {
+                                    coroutineScope.launch {
+                                        sheetState.hide()
+                                        showNewTabSheet = false
+                                        viewModel.switchTab(file.bookId)
+                                    }
+                                }
+                            )
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showPenPlayground) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.6f))
+                .clickable { showPenPlayground = false },
+            contentAlignment = Alignment.Center
+        ) { PenPlayground(onClose = { showPenPlayground = false }) }
+    }
+
+    if (showAiDefinitionPopup) {
+        AiDefinitionPopup(
+            word = selectedTextForAi,
+            result = aiDefinitionResult,
+            isLoading = isAiDefinitionLoading,
+            onDismiss = {
+                showAiDefinitionPopup = false
+                selectedTextForAi = null
+                aiDefinitionResult = null
+            },
+            isMainTtsActive = isTtsSessionActive,
+            onOpenExternalDictionary = {
+                selectedTextForAi?.let { text ->
+                    if (!selectedDictPackage.isNullOrEmpty()) {
+                        ExternalDictionaryHelper.launchDictionary(context, selectedDictPackage!!, text)
+                    } else {
+                        Toast.makeText(context, context.getString(R.string.toast_select_offline_dict_first), Toast.LENGTH_SHORT).show()
+                        showDictionarySettingsSheet = true
+                    }
+                }
+            },
+            getAuthToken = { viewModel.getAuthToken() }
+        )
+    }
+    if (showDictionaryUpsellDialog) {
+        AlertDialog(onDismissRequest = { showDictionaryUpsellDialog = false }, icon = {
+            Icon(
+                painter = painterResource(id = R.drawable.ai),
+                contentDescription = null
+            )
+        }, title = { Text(stringResource(R.string.ai_unlock_smart_dict)) }, text = {
+            Text(
+                stringResource(R.string.ai_unlock_smart_dict_desc)
+            )
+        }, confirmButton = {
+            TextButton(
+                onClick = {
+                    showDictionaryUpsellDialog = false
+                    onNavigateToPro()
+                }) { Text(stringResource(R.string.action_learn_more)) }
+        }, dismissButton = {
+            TextButton(onClick = { showDictionaryUpsellDialog = false }) {
+                Text(stringResource(R.string.action_not_now))
+            }
+        })
+    }
+
+    showReindexDialog?.let { newLanguage ->
+        if (BuildConfig.IS_PRO) {
+            AlertDialog(
+                onDismissRequest = { showReindexDialog = null },
+                icon = { Icon(Icons.Default.Info, contentDescription = null) },
+                title = { Text(stringResource(R.string.title_reindex_document)) },
+                text = {
+                    Text(
+                        stringResource(R.string.desc_reindex_document_warning)
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            coroutineScope.launch {
+                                ocrLanguage = newLanguage
+                                saveOcrLanguage(context, newLanguage)
+                                hasSelectedOcrLanguage = true
+
+                                currentBookId?.let { id ->
+                                    isBackgroundIndexing = true
+                                    backgroundIndexingProgress = 0f
+                                    withContext(Dispatchers.IO) {
+                                        pdfTextRepository.clearBookText(id)
+                                        pdfTextRepository.setBookLanguage(id, newLanguage.name)
+                                    }
+                                    isBackgroundIndexing = false
+                                }
+
+                                pendingActionAfterOcrSelection?.invoke()
+                                pendingActionAfterOcrSelection = null
+                                showReindexDialog = null
+                                showOcrLanguageDialog = false
+                            }
+                        }
+                    ) { Text(stringResource(R.string.action_reindex)) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showReindexDialog = null }) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                }
+            )
+        } else {
+            showReindexDialog = null
+        }
+    }
+
+    if (showOcrLanguageDialog && !isOss) {
+        OcrLanguageSelectionDialog(
+            currentLanguage = ocrLanguage,
+            isFirstRun = !hasSelectedOcrLanguage,
+            onDismiss = {
+                showOcrLanguageDialog = false
+                pendingActionAfterOcrSelection = null
+            },
+            onLanguageSelected = { selected ->
+                coroutineScope.launch {
+                    val storedLangName = currentBookId?.let {
+                        pdfTextRepository.getBookLanguage(it)
+                    }
+
+                    val hasIndexedPages = currentBookId?.let {
+                        pdfTextRepository.getIndexedPages(it).isNotEmpty()
+                    } == true
+
+                    if (hasIndexedPages && storedLangName != null && storedLangName != selected.name) {
+                        showReindexDialog = selected
+                        showOcrLanguageDialog = false
+                    } else {
+                        ocrLanguage = selected
+                        saveOcrLanguage(context, selected)
+                        hasSelectedOcrLanguage = true
+
+                        currentBookId?.let {
+                            pdfTextRepository.setBookLanguage(it, selected.name)
+                        }
+
+                        showOcrLanguageDialog = false
+                        pendingActionAfterOcrSelection?.invoke()
+                        pendingActionAfterOcrSelection = null
+                    }
+                }
+            })
+    }
+
+    if (showTtsSettingsSheet) {
+        val bookTitle = documentMetadataTitle ?: originalFileName
+        TtsSettingsSheet(
+            isVisible = true,
+            onDismiss = { showTtsSettingsSheet = false },
+            currentMode = currentTtsMode,
+            onModeChange = { newMode ->
+                currentTtsMode = newMode
+                saveTtsMode(context, newMode)
+                ttsController.changeTtsMode(newMode.name)
+            },
+            currentSpeakerId = ttsState.speakerId,
+            onSpeakerChange = { newSpeaker ->
+                ttsController.changeSpeaker(newSpeaker)
+            },
+            isTtsActive = isTtsSessionActive,
+            getAuthToken = { viewModel.getAuthToken() },
+            bookTitle = bookTitle
+        )
+    }
+
+    if (showDictionarySettingsSheet) {
+        DictionarySettingsDialog(
+            isVisible = true,
+            onDismiss = { showDictionarySettingsSheet = false },
+            isProUser = isProUser,
+            useOnlineDictionary = useOnlineDictionary,
+            onToggleOnlineDictionary = { newState ->
+                useOnlineDictionary = newState
+                saveUseOnlineDict(context, newState)
+            },
+            selectedDictionaryPackageName = selectedDictPackage,
+            onSelectDictionaryPackage = { pkg ->
+                selectedDictPackage = pkg
+                saveExternalDictPackage(context, pkg)
+            },
+            selectedTranslatePackageName = selectedTranslatePackage,
+            onSelectTranslatePackage = { pkg ->
+                selectedTranslatePackage = pkg
+                saveExternalTranslatePackage(context, pkg)
+            },
+            selectedSearchPackageName = selectedSearchPackage,
+            onSelectSearchPackage = { pkg ->
+                selectedSearchPackage = pkg
+                saveExternalSearchPackage(context, pkg)
+            }
+        )
+    }
+
+    if (highlightToNoteId != null) {
+        val targetHighlight = userHighlights.find { it.id == highlightToNoteId }
+        if (targetHighlight != null) {
+            val effectiveBg = if (activeTheme.backgroundColor == Color.Unspecified) MaterialTheme.colorScheme.surface else activeTheme.backgroundColor
+            val effectiveText = if (activeTheme.textColor == Color.Unspecified) MaterialTheme.colorScheme.onSurface else activeTheme.textColor
+
+            PdfAnnotationBottomSheet(
+                highlight = targetHighlight,
+                effectiveBg = effectiveBg,
+                effectiveText = effectiveText,
+                customHighlightColors = customHighlightColors,
+                onPaletteClick = {
+                    highlightColorPickerInitialSlot = targetHighlight.color
+                    showHighlightColorPicker = true
+                },
+                onColorChange = { newColor ->
+                    onHighlightUpdate(
+                        targetHighlight.id,
+                        newColor
+                    )
+                },
+                onDismiss = { highlightToNoteId = null },
+                onSave = { noteText ->
+                    val index =
+                        userHighlights.indexOfFirst { it.id == targetHighlight.id }
+                    if (index != -1) {
+                        userHighlights[index] =
+                            targetHighlight.copy(note = noteText.takeIf { it.isNotBlank() })
+                    }
+                    highlightToNoteId = null
+                },
+                onDelete = {
+                    onHighlightDelete(targetHighlight.id)
+                    highlightToNoteId = null
+                },
+                onCopy = {
+                    val clip = ClipData.newPlainText(
+                        "Copied Text",
+                        targetHighlight.text
+                    )
+                    clipboardManager.setText(
+                        androidx.compose.ui.text.AnnotatedString(
+                            targetHighlight.text
+                        )
+                    )
+                    highlightToNoteId = null
+                },
+                onDictionary = {
+                    onDictionaryLookupStable(targetHighlight.text)
+                    highlightToNoteId = null
+                },
+                onTranslate = {
+                    onTranslateTextStable(targetHighlight.text)
+                    highlightToNoteId = null
+                },
+                onSearch = {
+                    onSearchTextStable(targetHighlight.text)
+                    highlightToNoteId = null
+                }
+            )
+        } else {
+            highlightToNoteId = null
+        }
+    }
+
+    if (showHighlightColorPicker) {
+        HighlightColorPickerDialog(
+            initialColors = customHighlightColors,
+            initialSelection = highlightColorPickerInitialSlot,
+            onDismiss = { showHighlightColorPicker = false },
+            onSave = { newColors ->
+                customHighlightColors = newColors
+                saveCustomHighlightColors(context, newColors)
+                showHighlightColorPicker = false
+            }
+        )
+    }
+
+    if (showThemePanel) {
+        ReaderThemePanel(
+            isVisible = true,
+            currentThemeId = currentThemeId,
+            excludeImages = excludeImages,
+            onExcludeImagesChange = {
+                excludeImages = it
+                com.aryan.reader.saveExcludeImages(context, it)
+            },
+            showExcludeImagesOption = true,
+            builtInThemes = PdfBuiltInThemes,
+            globalTextureTransparency = globalTextureTransparency,
+            onGlobalTextureTransparencyChange = {
+                globalTextureTransparency = it
+                saveGlobalTextureTransparency(context, it)
+            },
+            onThemeSelected = {
+                currentThemeId = it
+                savePdfThemeId(context, it)
+                showThemePanel = false
+            },
+            onDismiss = { showThemePanel = false },
+            customThemes = customThemes,
+            onCustomThemesUpdated = {
+                customThemes = it
+                saveCustomThemes(context, it)
+            }
+        )
+    }
+
+    if (clickedLinkUrl != null) {
+        val url = clickedLinkUrl!!
+        AlertDialog(
+            onDismissRequest = { clickedLinkUrl = null },
+            title = { Text(stringResource(R.string.dialog_external_link_title)) },
+            text = { Text(stringResource(R.string.desc_external_link_warning)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        try {
+                            uriHandler.openUri(url)
+                        } catch (e: Exception) {
+                            Timber.e(e, "Failed to open URI")
+                        }
+                        clickedLinkUrl = null
+                    }) { Text(stringResource(R.string.action_visit)) }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(url))
+                            clickedLinkUrl = null
+                        }) { Text(stringResource(R.string.action_copy)) }
+                    TextButton(onClick = { clickedLinkUrl = null }) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                }
+            })
+    }
+
+    if (showSaveDialog) {
+        AlertDialog(
+            onDismissRequest = { showSaveDialog = false },
+            title = { Text(stringResource(R.string.title_save_to_device)) },
+            text = { Text(stringResource(R.string.desc_choose_format_save)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showSaveDialog = false
+                        pendingSaveMode = SaveMode.ANNOTATED
+                        val suggestedName = getSuggestedFilename(
+                            originalFileName, isAnnotated = true
+                        )
+                        saveLauncher.launch(suggestedName)
+                    }) { Text(stringResource(R.string.action_with_annotations)) }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            showSaveDialog = false
+                            pendingSaveMode = SaveMode.ORIGINAL
+                            val suggestedName = getSuggestedFilename(
+                                originalFileName, isAnnotated = false
+                            )
+                            saveLauncher.launch(suggestedName)
+                        }) { Text(stringResource(R.string.action_original)) }
+
+                    Spacer(Modifier.width(8.dp))
+
+                    TextButton(
+                        onClick = {
+                            showSaveDialog = false
+                            pendingSaveMode = null
+                        }) { Text(stringResource(R.string.action_cancel)) }
+                }
+            })
+    }
+
+    if (showShareDialog) {
+        AlertDialog(
+            onDismissRequest = { showShareDialog = false },
+            title = { Text(stringResource(R.string.share_chooser_title)) },
+            text = { Text(stringResource(R.string.desc_choose_format_share)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showShareDialog = false
+                        isShareLoading = true
+                        Timber.tag("PdfExportDebug").i("SHARE TRIGGERED: userHighlights count: ${userHighlights.size}")
+                        val filename = getSuggestedFilename(
+                            originalFileName, isAnnotated = true
+                        )
+                        coroutineScope.launch {
+                            val currentRichTextLayouts = richTextController?.pageLayouts
+
+                            viewModel.sharePdf(
+                                activityContext = context,
+                                sourceUri = effectivePdfUri,
+                                annotations = allAnnotations,
+                                richTextPageLayouts = currentRichTextLayouts,
+                                textBoxes = textBoxes.toList(),
+                                highlights = userHighlights.toList(),
+                                includeAnnotations = true,
+                                filename = filename,
+                                bookId = currentBookId
+                            )
+                            isShareLoading = false
+                        }
+                    }) { Text(stringResource(R.string.action_with_annotations)) }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            showShareDialog = false
+                            isShareLoading = true
+                            val filename = getSuggestedFilename(
+                                originalFileName, isAnnotated = false
+                            )
+                            coroutineScope.launch {
+                                viewModel.sharePdf(
+                                    activityContext = context,
+                                    sourceUri = pdfUri,
+                                    annotations = allAnnotations,
+                                    includeAnnotations = false,
+                                    filename = filename
+                                )
+                                isShareLoading = false
+                            }
+                        }) { Text(stringResource(R.string.action_original)) }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = { showShareDialog = false }) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                }
+            })
+    }
+
+    if (isShareLoading) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.5f))
+                .clickable(enabled = false) {}, contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 6.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(32.dp), strokeWidth = 3.dp
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = stringResource(R.string.msg_preparing_pdf),
+                        style = MaterialTheme.typography.bodyLarge
                     )
                 }
             }
         }
+    }
+
+    if (showVisualOptionsSheet) {
+        PdfVisualOptionsSheet(
+            systemUiMode = systemUiMode,
+            onSystemUiModeChange = { mode ->
+                systemUiMode = mode
+                savePdfSystemUiMode(context, mode)
+            },
+            onDismiss = { showVisualOptionsSheet = false }
+        )
+    }
+    if (showCustomizeToolsSheet) {
+        PdfCustomizeToolsSheet(
+            hiddenTools = hiddenTools,
+            toolOrder = toolOrder,
+            bottomTools = bottomTools,
+            onUpdate = onUpdateHiddenTools,
+            onOrderUpdate = onUpdateToolOrder,
+            onPlacementUpdate = onUpdateBottomTools,
+            onDismiss = { showCustomizeToolsSheet = false }
+        )
     }
 }

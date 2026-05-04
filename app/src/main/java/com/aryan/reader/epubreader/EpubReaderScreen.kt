@@ -19,7 +19,7 @@
  */
 // EpubReaderScreen.kt
 @file:OptIn(ExperimentalSerializationApi::class) @file:Suppress("VariableNeverRead",
-    "UnusedVariable", "Unused", "SimplifyBooleanWithConstants"
+    "UnusedVariable", "Unused", "SimplifyBooleanWithConstants", "KotlinConstantConditions"
 )
 
 package com.aryan.reader.epubreader
@@ -35,6 +35,8 @@ import android.graphics.Bitmap
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.view.RoundedCorner
+import android.view.View
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -119,9 +121,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageShader
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -134,6 +141,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -158,12 +166,17 @@ import com.aryan.reader.SearchResult
 import com.aryan.reader.SummarizationResult
 import com.aryan.reader.SummaryCacheManager
 import com.aryan.reader.TtsSettingsSheet
+import com.aryan.reader.areReaderAiFeaturesEnabled
 import com.aryan.reader.countWords
+import com.aryan.reader.isByokCloudTtsAvailable
 import com.aryan.reader.data.CustomFontEntity
 import com.aryan.reader.epub.EpubBook
+import com.aryan.reader.epub.hasReadableExtractedContent
 import com.aryan.reader.fetchAiDefinition
 import com.aryan.reader.loadCustomThemes
+import com.aryan.reader.loadGlobalTextureTransparency
 import com.aryan.reader.loadReaderThemeId
+import com.aryan.reader.loadReaderTextureBitmap
 import com.aryan.reader.paginatedreader.BookPaginator
 import com.aryan.reader.paginatedreader.CfiUtils
 import com.aryan.reader.paginatedreader.HeaderBlock
@@ -180,11 +193,11 @@ import com.aryan.reader.paginatedreader.data.BookCacheDatabase
 import com.aryan.reader.paginatedreader.semanticBlockModule
 import com.aryan.reader.rememberSearchState
 import com.aryan.reader.saveCustomThemes
+import com.aryan.reader.saveGlobalTextureTransparency
 import com.aryan.reader.saveReaderThemeId
 import com.aryan.reader.tts.SpeakerSamplePlayer
 import com.aryan.reader.tts.TtsPlaybackManager
 import com.aryan.reader.tts.loadTtsMode
-import com.aryan.reader.tts.rememberTtsController
 import com.aryan.reader.tts.splitTextIntoChunks
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -218,11 +231,49 @@ private const val AUTO_SCROLL_LOCAL_MAX_PREFIX = "auto_scroll_local_max_"
 private const val MUSICIAN_MODE_KEY = "musician_mode_enabled"
 private const val KEEP_SCREEN_ON_KEY = "keep_screen_on_enabled"
 private const val HIDDEN_TOOLS_KEY = "hidden_reader_tools"
+private const val TOOL_ORDER_KEY = "reader_tool_order"
+private const val BOTTOM_TOOLS_KEY = "reader_bottom_tools"
 private const val TTS_LOCATE_REASON_INITIAL_RESTORE = "initial_restore"
 private const val TTS_LOCATE_REASON_LIFECYCLE_RESUME = "lifecycle_resume"
 private const val TTS_LOCATE_REASON_OVERLAY = "overlay"
 
 private const val TAG_LINK_NAV = "LINK_NAV"
+
+private fun View.bottomRoundedCornerRadiusPx(): Int {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return 0
+
+    val insets = rootWindowInsets ?: return 0
+    return max(
+        insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius ?: 0,
+        insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius ?: 0
+    )
+}
+
+@Composable
+private fun rememberBottomRoundedCornerPadding(view: View): Dp {
+    val density = LocalDensity.current
+    val configuration = LocalConfiguration.current
+    var radiusPx by remember(view) { mutableIntStateOf(view.bottomRoundedCornerRadiusPx()) }
+
+    DisposableEffect(
+        view,
+        configuration.orientation,
+        configuration.screenWidthDp,
+        configuration.screenHeightDp
+    ) {
+        val listener = View.OnLayoutChangeListener { updatedView, _, _, _, _, _, _, _, _ ->
+            radiusPx = updatedView.bottomRoundedCornerRadiusPx()
+        }
+        view.addOnLayoutChangeListener(listener)
+        radiusPx = view.bottomRoundedCornerRadiusPx()
+
+        onDispose {
+            view.removeOnLayoutChangeListener(listener)
+        }
+    }
+
+    return with(density) { radiusPx.toDp() }
+}
 
 private fun saveHiddenTools(context: Context, hiddenTools: Set<String>) {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
@@ -232,6 +283,34 @@ private fun saveHiddenTools(context: Context, hiddenTools: Set<String>) {
 private fun loadHiddenTools(context: Context): Set<String> {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     return prefs.getStringSet(HIDDEN_TOOLS_KEY, emptySet()) ?: emptySet()
+}
+
+private fun saveToolOrder(context: Context, toolOrder: List<ReaderTool>) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putString(TOOL_ORDER_KEY, toolOrder.joinToString(",") { it.name }) }
+}
+
+private fun loadToolOrder(context: Context): List<ReaderTool> {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    val savedTools = prefs.getString(TOOL_ORDER_KEY, null)
+        ?.split(',')
+        ?.filter { it.isNotBlank() }
+        ?.mapNotNull { name -> ReaderTool.entries.firstOrNull { it.name == name } }
+        .orEmpty()
+    return (savedTools + ReaderTool.entries.filterNot { it in savedTools }).distinct()
+}
+
+private fun saveBottomTools(context: Context, bottomTools: Set<String>) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putStringSet(BOTTOM_TOOLS_KEY, bottomTools) }
+}
+
+private fun loadBottomTools(context: Context): Set<String> {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    return prefs.getStringSet(
+        BOTTOM_TOOLS_KEY,
+        ReaderTool.entries.filter { it.category == "Bottom Bar" }.map { it.name }.toSet()
+    ) ?: ReaderTool.entries.filter { it.category == "Bottom Bar" }.map { it.name }.toSet()
 }
 
 private fun saveKeepScreenOn(context: Context, isEnabled: Boolean) {
@@ -338,7 +417,7 @@ private const val PREF_EXTERNAL_TRANSLATE_PKG = "external_translate_package"
 private const val PREF_EXTERNAL_SEARCH_PKG = "external_search_package"
 
 private fun loadUseOnlineDict(context: Context): Boolean {
-    @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss") return false
+    @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss" && BuildConfig.IS_OFFLINE) return false
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     return prefs.getBoolean(PREF_USE_ONLINE_DICT, true)
 }
@@ -381,6 +460,7 @@ private fun saveExternalSearchPackage(context: Context, packageName: String) {
 const val PREF_READER_THEME = "reader_theme_id"
 const val PREF_CUSTOM_THEMES = "custom_themes_json"
 
+@UnstableApi
 @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
 @Composable
 fun EpubReaderScreen(
@@ -416,8 +496,8 @@ fun EpubReaderScreen(
         }
     } else null
 
-    val hasValidExtractionBasePath = remember(epubBook.extractionBasePath) {
-        epubBook.extractionBasePath.isNotBlank() && File(epubBook.extractionBasePath).exists()
+    val hasValidExtractionBasePath = remember(epubBook.extractionBasePath, epubBook.chapters) {
+        epubBook.hasReadableExtractedContent()
     }
     var requestedContentRecovery by remember(epubBook.extractionBasePath, uiState.selectedBookId) {
         mutableStateOf(false)
@@ -563,6 +643,7 @@ fun EpubReaderHost(
 
     var systemUiMode by remember { mutableStateOf(loadSystemUiMode(context)) }
     var pageInfoMode by remember { mutableStateOf(loadPageInfoMode(context)) }
+    var pageInfoPosition by remember { mutableStateOf(loadPageInfoPosition(context)) }
     var pullToTurnEnabled by remember { mutableStateOf(loadPullToTurn(context)) }
     var pullToTurnMultiplier by remember { mutableFloatStateOf(loadPullToTurnMultiplier(context)) }
     var showVisualOptionsSheet by remember { mutableStateOf(false) }
@@ -582,7 +663,7 @@ fun EpubReaderHost(
     var currentTtsMode by remember {
         mutableStateOf(
             loadTtsMode(context).let {
-                if (BuildConfig.FLAVOR == "oss") TtsPlaybackManager.TtsMode.BASE else it
+                if (BuildConfig.FLAVOR == "oss" && !isByokCloudTtsAvailable(context)) TtsPlaybackManager.TtsMode.BASE else it
             }
         )
     }
@@ -738,18 +819,19 @@ fun EpubReaderHost(
     }
 
     var hiddenTools by remember { mutableStateOf(loadHiddenTools(context)) }
+    var toolOrder by remember { mutableStateOf(loadToolOrder(context)) }
+    var bottomTools by remember { mutableStateOf(loadBottomTools(context)) }
     var showCustomizeToolsSheet by remember { mutableStateOf(false) }
 
     var showDictionaryUpsellDialog by remember { mutableStateOf(false) }
     var showSummarizationUpsellDialog by remember { mutableStateOf(false) }
 
     @Suppress("KotlinConstantConditions") val onDictionaryLookup = { word: String ->
-        val isOss = BuildConfig.FLAVOR == "oss"
-        val effectiveUseOnline = !isOss && useOnlineDictionary
+        val effectiveUseOnline = areReaderAiFeaturesEnabled(context) && useOnlineDictionary
 
         if (effectiveUseOnline) {
             val wordCount = countWords(word)
-            if (wordCount > 1 && !isProUser) {
+            if (BuildConfig.FLAVOR != "oss" && wordCount > 1 && !isProUser) {
                 showDictionaryUpsellDialog = true
             } else {
                 selectedTextForAi = word
@@ -815,6 +897,8 @@ fun EpubReaderHost(
     var lastKnownLocator by remember(initialLocator) { mutableStateOf(initialLocator) }
 
     val bottomPadding = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val roundedCornerBottomPadding = rememberBottomRoundedCornerPadding(view)
+    val pageInfoCornerBottomPadding = roundedCornerBottomPadding.coerceAtMost(8.dp)
 
     var bookmarks by remember(epubBook.title) {
         mutableStateOf(
@@ -991,6 +1075,7 @@ fun EpubReaderHost(
     var currentParagraphGap by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.paragraphGap) }
     var currentImageSize by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.imageSize) }
     var currentHorizontalMargin by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.horizontalMargin) }
+    var currentVerticalMargin by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.verticalMargin) }
     var currentTextAlign by remember(initialFormatSettings) { mutableStateOf(initialFormatSettings.textAlign) }
     var currentFontFamily by remember(initialFormatSettings) { mutableStateOf(initialFormatSettings.font) }
     var currentCustomFontPath by remember(initialFormatSettings) { mutableStateOf(initialFormatSettings.customPath) }
@@ -1006,14 +1091,14 @@ fun EpubReaderHost(
     var showFontSelectionSheet by remember { mutableStateOf(false) }
     val fontSheetState = rememberModalBottomSheetState()
 
-    LaunchedEffect(currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign, isFormatLocal) {
+    LaunchedEffect(currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentVerticalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign, isFormatLocal) {
         if (isFormatLocal) {
             saveLocalReaderSettings(
-                context, bookId, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign
+                context, bookId, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentVerticalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign
             )
         } else {
             saveReaderSettings(
-                context, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign
+                context, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentVerticalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign
             )
         }
     }
@@ -1130,6 +1215,7 @@ fun EpubReaderHost(
 
     var currentThemeId by remember { mutableStateOf(loadReaderThemeId(context)) }
     var customThemes by remember { mutableStateOf(loadCustomThemes(context)) }
+    var globalTextureTransparency by remember { mutableFloatStateOf(loadGlobalTextureTransparency(context)) }
 
     val activeTheme = remember(currentThemeId, customThemes) {
         BuiltInThemes.find { it.id == currentThemeId }
@@ -1151,6 +1237,19 @@ fun EpubReaderHost(
         } else activeTheme.textColor
     }
     val activeTextureId = activeTheme.textureId
+    val activeTextureAlpha = 1f - globalTextureTransparency
+    val activeTextureBitmap = remember(activeTextureId) {
+        loadReaderTextureBitmap(context, activeTextureId)
+    }
+    val activeTextureModifier = activeTextureBitmap?.let { bitmap ->
+        Modifier.drawBehind {
+            drawRect(
+                brush = ShaderBrush(ImageShader(bitmap, TileMode.Repeated, TileMode.Repeated)),
+                blendMode = BlendMode.SrcOver,
+                alpha = activeTextureAlpha.coerceIn(0f, 1f)
+            )
+        }
+    } ?: Modifier
 
     val infoBarBgColor = remember(effectiveBg, isDarkTheme) {
         val overlayAlpha = if (isDarkTheme) 0.08f else 0.06f
@@ -1401,7 +1500,7 @@ fun EpubReaderHost(
     }
 
     fun startTts() {
-        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
             showInsufficientCreditsDialog = true
             return
         }
@@ -1441,6 +1540,7 @@ fun EpubReaderHost(
                                 chapterTitle = chapterTitle,
                                 coverImageUri = coverUriString,
                                 chapterIndex = chapterIndex,
+                                totalChapters = chapters.size,
                                 ttsMode = currentTtsMode,
                                 playbackSource = "READER",
                                 authToken = token
@@ -1460,7 +1560,7 @@ fun EpubReaderHost(
     )
 
     fun startTtsFromSelectionPaginated(baseCfi: String, startOffset: Int) {
-        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
             showInsufficientCreditsDialog = true
             return
         }
@@ -1504,6 +1604,7 @@ fun EpubReaderHost(
                             chapterTitle = chapterTitle,
                             coverImageUri = coverUriString,
                             chapterIndex = chapterIndex,
+                            totalChapters = chapters.size,
                             ttsMode = currentTtsMode,
                             playbackSource = "READER",
                             authToken = token
@@ -1581,18 +1682,6 @@ fun EpubReaderHost(
         currentChapterIndex = currentChapterIndex,
         focusRequester = searchFocusRequester
     )
-
-    if (epubBook.extractionBasePath.isBlank() || !File(epubBook.extractionBasePath).exists()) {
-        Timber.e("Extraction base path is blank or does not exist: ${epubBook.extractionBasePath}"
-        )
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(
-                "Error: Book content not found. Path: ${epubBook.extractionBasePath}",
-                color = MaterialTheme.colorScheme.error
-            )
-        }
-        return
-    }
 
     val totalPagesInCurrentChapter = remember(currentScrollHeightValue, currentClientHeightValue) {
         if (currentClientHeightValue > 0) {
@@ -1989,10 +2078,7 @@ fun EpubReaderHost(
         }
     }
 
-    val pageInfoBottomPadding by animateDpAsState(
-        targetValue = if (showBars && pageInfoMode == PageInfoMode.SYNC) 45.dp else 0.dp,
-        label = "PageInfoBottomPadding"
-    )
+    val pageInfoBarHeight = PAGE_INFO_BAR_HEIGHT + pageInfoCornerBottomPadding
 
     val isPageInfoVisible = when (pageInfoMode) {
         PageInfoMode.DEFAULT -> !showBars
@@ -2631,7 +2717,7 @@ fun EpubReaderHost(
         }
 
         val handleGenerateSummary: (Boolean) -> Unit = { force ->
-            if (!isProUser && credits <= 0) {
+            if (BuildConfig.FLAVOR != "oss" && !isProUser && credits <= 0) {
                 showInsufficientCreditsDialog = true
                 showAiHubSheet = false
             } else {
@@ -2688,6 +2774,7 @@ fun EpubReaderHost(
                                     val finalSummaryBuilder = StringBuilder()
                                     summarizeBookContent(
                                         content = text,
+                                        context = context,
                                         authToken = token,
                                         onUsageReceived = { cost, freeRemaining ->
                                             currentCost = cost
@@ -2750,7 +2837,7 @@ fun EpubReaderHost(
         }
 
         val handleGenerateRecap: () -> Unit = {
-            if (credits <= 0) {
+            if (BuildConfig.FLAVOR != "oss" && credits <= 0) {
                 showInsufficientCreditsDialog = true
                 showAiHubSheet = false
             } else {
@@ -2820,6 +2907,7 @@ fun EpubReaderHost(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(effectiveBg)
+                    .then(activeTextureModifier)
                     .padding(top = effectiveTopPadding)
                     .focusRequester(containerFocusRequester)
                     .focusable()
@@ -2879,13 +2967,15 @@ fun EpubReaderHost(
             ) {
                 when (currentRenderMode) {
                     RenderMode.VERTICAL_SCROLL -> {
-                        val contentBottomPadding = if (pageInfoMode != PageInfoMode.HIDDEN) PAGE_INFO_BAR_HEIGHT else 0.dp
+                        val pageInfoReserve = if (pageInfoMode != PageInfoMode.HIDDEN) pageInfoBarHeight else 0.dp
+                        val contentTopPadding = if (pageInfoPosition == PageInfoPosition.TOP) pageInfoReserve else 0.dp
+                        val contentBottomPadding = if (pageInfoPosition == PageInfoPosition.BOTTOM) pageInfoReserve else 0.dp
 
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .padding(top = contentTopPadding)
                                 .padding(bottom = contentBottomPadding)
-                                .padding(top = 16.dp)
                                 .testTag("ReaderContainer")
                         ) {
                             if (chapters.isEmpty()) {
@@ -3292,10 +3382,12 @@ fun EpubReaderHost(
                                             currentParagraphGap = currentParagraphGap,
                                             currentImageSize = currentImageSize,
                                             currentHorizontalMargin = currentHorizontalMargin,
+                                            currentVerticalMargin = currentVerticalMargin,
                                             currentFontFamily = currentFontFamily,
                                             customFontPath = currentCustomFontPath,
                                             currentTextAlign = currentTextAlign,
                                             activeTextureId = activeTextureId,
+                                            activeTextureAlpha = activeTextureAlpha,
                                             onHighlightClicked = {
                                                 lastHighlightClickTime = System.currentTimeMillis()
                                                 showBars = false
@@ -3462,7 +3554,7 @@ fun EpubReaderHost(
 
                                                     if (ttsChunks.isNotEmpty()) {
                                                         logTtsChapterDiag("Vertical TTS extraction produced ${ttsChunks.size} chunks for chapter $targetChapterIndex")
-                                                        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+                                                        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
                                                             showInsufficientCreditsDialog = true
                                                             ttsShouldStartOnChapterLoad = false
                                                             return@launch
@@ -3483,6 +3575,7 @@ fun EpubReaderHost(
                                                             chapterTitle = chapterTitle,
                                                             coverImageUri = coverUriString,
                                                             chapterIndex = targetChapterIndex,
+                                                            totalChapters = chapters.size,
                                                             ttsMode = currentTtsMode,
                                                             playbackSource = "READER",
                                                             authToken = token
@@ -3528,6 +3621,7 @@ fun EpubReaderHost(
 
                                                     summarizeBookContent(
                                                         content = content,
+                                                        context = context,
                                                         authToken = token,
                                                         onUsageReceived = { cost: Double?, freeRemaining: Int? ->
                                                             currentCost = cost
@@ -3779,11 +3873,14 @@ fun EpubReaderHost(
                     }
 
                     RenderMode.PAGINATED -> {
-                        val contentBottomPadding = if (pageInfoMode != PageInfoMode.HIDDEN) PAGE_INFO_BAR_HEIGHT else 0.dp
+                        val pageInfoReserve = if (pageInfoMode != PageInfoMode.HIDDEN) pageInfoBarHeight else 0.dp
+                        val contentTopPadding = if (pageInfoPosition == PageInfoPosition.TOP) pageInfoReserve else 0.dp
+                        val contentBottomPadding = if (pageInfoPosition == PageInfoPosition.BOTTOM) pageInfoReserve else 0.dp
 
                         BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .padding(top = contentTopPadding)
                                 .padding(bottom = contentBottomPadding)
                                 .testTag("ReaderContainer")
                         ) {
@@ -3799,6 +3896,7 @@ fun EpubReaderHost(
                                 paragraphGapMultiplier = currentParagraphGap,
                                 imageSizeMultiplier = currentImageSize,
                                 horizontalMarginMultiplier = currentHorizontalMargin,
+                                verticalMarginMultiplier = currentVerticalMargin,
                                 fontFamily = activeFontFamily,
                                 textAlign = currentTextAlign,
                                 activeHighlightPalette = currentHighlightPalette,
@@ -3810,6 +3908,7 @@ fun EpubReaderHost(
                                     offset = ttsState.startOffsetInSource
                                 ).takeIf { ttsState.currentText != null && ttsState.sourceCfi != null && ttsState.startOffsetInSource != -1 },
                                 activeTextureId = activeTextureId,
+                                activeTextureAlpha = activeTextureAlpha,
                                 initialChapterIndexInBook = lastKnownLocator?.chapterIndex,
                                 modifier = Modifier.alpha(if (isPagerInitialized) 1f else 0f),
                                 onPaginatorReady = { newPaginator ->
@@ -4094,17 +4193,19 @@ fun EpubReaderHost(
 
                 // Page Info Bar (Vertical)
                 AnimatedVisibility(
-                    visible = renderMode == RenderMode.VERTICAL_SCROLL && isPageInfoVisible,
+                    visible = currentRenderMode == RenderMode.VERTICAL_SCROLL && isPageInfoVisible,
                     enter = fadeIn(animationSpec = tween(200)),
                     exit = fadeOut(animationSpec = tween(200)),
-                    modifier = Modifier.align(Alignment.BottomCenter)
+                    modifier = Modifier.align(
+                        if (pageInfoPosition == PageInfoPosition.TOP) Alignment.TopCenter else Alignment.BottomCenter
+                    )
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(PAGE_INFO_BAR_HEIGHT)
+                            .height(pageInfoBarHeight)
                             .background(infoBarBgColor)
-                            .padding(bottom = bottomPadding + pageInfoBottomPadding)
+                            .then(activeTextureModifier)
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
@@ -4140,17 +4241,19 @@ fun EpubReaderHost(
 
                 // Page Info Bar (Paginated)
                 AnimatedVisibility(
-                    visible = renderMode == RenderMode.PAGINATED && paginator != null && isPageInfoVisible && paginatedPagerState.pageCount > 0,
+                    visible = currentRenderMode == RenderMode.PAGINATED && paginator != null && isPageInfoVisible && paginatedPagerState.pageCount > 0,
                     enter = fadeIn(animationSpec = tween(200)),
                     exit = fadeOut(animationSpec = tween(200)),
-                    modifier = Modifier.align(Alignment.BottomCenter)
+                    modifier = Modifier.align(
+                        if (pageInfoPosition == PageInfoPosition.TOP) Alignment.TopCenter else Alignment.BottomCenter
+                    )
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(PAGE_INFO_BAR_HEIGHT)
+                            .height(pageInfoBarHeight)
                             .background(infoBarBgColor)
-                            .padding(bottom = bottomPadding + pageInfoBottomPadding)
+                            .then(activeTextureModifier)
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
@@ -4442,6 +4545,8 @@ fun EpubReaderHost(
                     volumeScrollEnabled = volumeScrollEnabled,
                     isPageTurnAnimationEnabled = isPageTurnAnimationEnabled,
                     hiddenTools = hiddenTools,
+                    toolOrder = toolOrder,
+                    bottomTools = bottomTools,
                     onCustomizeTools = { showCustomizeToolsSheet = true },
                     onNavigateBack = { triggerSaveAndExit() },
                     isKeepScreenOn = isKeepScreenOn,
@@ -4522,6 +4627,71 @@ fun EpubReaderHost(
                     onOpenDictionarySettings = { showDictionarySettingsSheet = true },
                     onOpenThemeSettings = { showThemePanel = true },
                     onOpenVisualOptions = { showVisualOptionsSheet = true },
+                    onOpenAiHub = { showAiHubSheet = true },
+                    onOpenSlider = {
+                        when (currentRenderMode) {
+                            RenderMode.VERTICAL_SCROLL -> {
+                                sliderStartPage = currentPageInChapter
+                                sliderCurrentPage = currentPageInChapter.toFloat()
+                                isPageSliderVisible = true
+                                showBars = false
+                                scope.launch {
+                                    webViewRefForTts?.let { webView ->
+                                        startPageThumbnail = captureWebViewVisibleArea(webView)
+                                    }
+                                }
+                            }
+                            RenderMode.PAGINATED -> {
+                                if (paginatedPagerState.pageCount > 0) {
+                                    sliderStartPage = paginatedPagerState.currentPage + 1
+                                    sliderCurrentPage = (paginatedPagerState.currentPage + 1).toFloat()
+                                    isPageSliderVisible = true
+                                    showBars = false
+                                    startPageThumbnail = null
+                                } else {
+                                    bannerMessage = BannerMessage("Book is not paginated yet.")
+                                }
+                            }
+                        }
+                    },
+                    onOpenDrawer = {
+                        scope.launch { drawerState.open() }
+                    },
+                    onToggleFormat = {
+                        showFormatAdjustmentBars = !showFormatAdjustmentBars
+                        if (showFormatAdjustmentBars) {
+                            searchState.showSearchResultsPanel = false
+                            isPageSliderVisible = false
+                        }
+                    },
+                    onToggleSearch = {
+                        searchState.isSearchActive = true
+                        searchState.showSearchResultsPanel = true
+                        showBars = true
+                        showFormatAdjustmentBars = false
+                    },
+                    onToggleTts = {
+                        if (isTtsSessionActive) {
+                            Timber.d("TTS button clicked: Stopping TTS")
+                            userStoppedTts = true
+                            ttsController.stop()
+                        } else {
+                            when {
+                                ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.POST_NOTIFICATIONS
+                                ) == PackageManager.PERMISSION_GRANTED -> {
+                                    startTts()
+                                }
+                                activity?.shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS) == true -> {
+                                    showPermissionRationaleDialog = true
+                                }
+                                else -> {
+                                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                }
+                            }
+                        }
+                    },
                     onToggleReflow = if (onToggleReflow != null) {
                         {
                             val activeChapter = if (currentRenderMode == RenderMode.PAGINATED) {
@@ -4687,8 +4857,12 @@ fun EpubReaderHost(
                     ttsState = ttsState,
                     isProUser = isProUser,
                     hiddenTools = hiddenTools,
+                    toolOrder = toolOrder,
+                    bottomTools = bottomTools,
                     currentTtsMode = currentTtsMode,
                     onOpenAiHub = { showAiHubSheet = true },
+                    onOpenDictionarySettings = { showDictionarySettingsSheet = true },
+                    onOpenThemeSettings = { showThemePanel = true },
                     onOpenSlider = {
                         when (currentRenderMode) {
                             RenderMode.VERTICAL_SCROLL -> {
@@ -4770,6 +4944,8 @@ fun EpubReaderHost(
                     onImageSizeChange = { currentImageSize = it },
                     currentHorizontalMargin = currentHorizontalMargin,
                     onHorizontalMarginChange = { currentHorizontalMargin = it },
+                    currentVerticalMargin = currentVerticalMargin,
+                    onVerticalMarginChange = { currentVerticalMargin = it },
                     currentFont = currentFontFamily,
                     currentCustomFontName = if(currentCustomFontPath != null) {
                         customFonts.find { it.path == currentCustomFontPath }?.displayName ?: "Custom Font"
@@ -4788,6 +4964,7 @@ fun EpubReaderHost(
                         currentParagraphGap = DEFAULT_PARAGRAPH_GAP_VAL
                         currentImageSize = DEFAULT_IMAGE_SIZE_VAL
                         currentHorizontalMargin = DEFAULT_HORIZONTAL_MARGIN_VAL
+                        currentVerticalMargin = DEFAULT_VERTICAL_MARGIN_VAL
                         currentFontFamily = ReaderFont.ORIGINAL
                         currentCustomFontPath = null
                         currentTextAlign = ReaderTextAlign.DEFAULT
@@ -5085,9 +5262,19 @@ fun EpubReaderHost(
         if (showCustomizeToolsSheet) {
             CustomizeToolsSheet(
                 hiddenTools = hiddenTools,
+                toolOrder = toolOrder,
+                bottomTools = bottomTools,
                 onUpdate = { newHiddenSet ->
                     hiddenTools = newHiddenSet
                     saveHiddenTools(context, newHiddenSet)
+                },
+                onOrderUpdate = { newOrder ->
+                    toolOrder = newOrder
+                    saveToolOrder(context, newOrder)
+                },
+                onPlacementUpdate = { newBottomTools ->
+                    bottomTools = newBottomTools
+                    saveBottomTools(context, newBottomTools)
                 },
                 onDismiss = { showCustomizeToolsSheet = false }
             )
@@ -5133,6 +5320,11 @@ fun EpubReaderHost(
                     pageInfoMode = it
                     savePageInfoMode(context, it)
                 },
+                pageInfoPosition = pageInfoPosition,
+                onPageInfoPositionChange = {
+                    pageInfoPosition = it
+                    savePageInfoPosition(context, it)
+                },
                 pullToTurnEnabled = pullToTurnEnabled,
                 onPullToTurnChange = {
                     pullToTurnEnabled = it
@@ -5173,6 +5365,11 @@ fun EpubReaderHost(
             ReaderThemePanel(
                 isVisible = true,
                 currentThemeId = currentThemeId,
+                globalTextureTransparency = globalTextureTransparency,
+                onGlobalTextureTransparencyChange = {
+                    globalTextureTransparency = it
+                    saveGlobalTextureTransparency(context, it)
+                },
                 onThemeSelected = {
                     currentThemeId = it
                     saveReaderThemeId(context, it)

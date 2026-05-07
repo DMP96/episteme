@@ -688,4 +688,6 @@
     <string name="support_project_heading">Helfen Sie Episteme, in Bewegung zu bleiben</string>
     <string name="support_project_desc">Ihre Unterstützung hilft mir, Episteme zu pflegen und zu verbessern für alle!!!</string>
     <string name="support_github_sponsor">Sponsor werden auf GitHub</string>
+    <string name="theme_my_textured_themes">Meine strukturierten Designs</string>
+    <string name="theme_textured_presets">Strukturierte Vorlagen</string>
 </resources>

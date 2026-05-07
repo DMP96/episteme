@@ -683,4 +683,9 @@
     <string name="app_contrast_high">Hoch</string>
     <string name="app_theme_mode_light">Hell</string>
     <string name="app_theme_mode_dark">Dunkel</string>
+    <string name="drawer_support_project">Unterstützen Sie das Projekt</string>
+    <string name="support_project_title">Unterstützen Sie das Projekt</string>
+    <string name="support_project_heading">Helfen Sie Episteme, in Bewegung zu bleiben</string>
+    <string name="support_project_desc">Ihre Unterstützung hilft mir, Episteme zu pflegen und zu verbessern für alle!!!</string>
+    <string name="support_github_sponsor">Sponsor werden auf GitHub</string>
 </resources>

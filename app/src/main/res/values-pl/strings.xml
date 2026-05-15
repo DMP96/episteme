@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="action_cancel">Anuluj</string>
+    <string name="action_save">Zapisz</string>
+    <string name="action_delete">Odinstaluj</string>
+    <string name="action_remove">Usuń</string>
+    <string name="action_ok">OK</string>
+    <string name="action_close">Zamknij</string>
+    <string name="action_add">Dodaj</string>
+    <string name="action_rename">Zmień Nazwę</string>
+    <string name="action_back">Powrót</string>
+    <string name="action_search">Wyszukaj</string>
+    <string name="action_clear">Wyczyść</string>
+    <string name="action_apply">Zastosuj</string>
+    <string name="action_enable">Włącz</string>
+    <string name="error_message_format">Błąd:%1$s</string>
+    <string name="action_go_back">Cofnij</string>
+    <string name="tab_free">Dostępny</string>
+    <string name="active_tabs">Aktywne Karty</string>
+    <string name="close_tab">Zamknij Kartę</string>
+    <string name="close_all_tabs">Zamknij Wszystkie Karty</string>
+    <string name="dialog_close_all_tabs">Zamknąć Wszystkie Karty?</string>
+    <string name="dialog_close_all_tabs_desc">Czy jesteś pewien że chcesz zamknąć wszystkie karty?</string>
+    <string name="legal_licenses">Licencje</string>
+    <string name="pin_unpin">Przypnij/Odepnij</string>
+    <string name="legal_privacy_policy">Polityka Prywatności</string>
+    <string name="legal_terms_of_service">Regulamin</string>
+    <string name="clear_selection">Wyczyść Wybrane</string>
+    <string name="items_selected_count">%1$d wybrane</string>
+    <string name="info">Info</string>
+</resources>

@@ -67,7 +67,7 @@
     <string name="not_available_locally">Недаступна лакальна</string>
     <string name="drawer_sign_in">Увайсці праз Google</string>
     <string name="drawer_by_signing_in">Уваходзячы,</string>
-    <string name="drawer_pro_unlocked">Episteme Pro</string>
+    <string name="drawer_pro_unlocked">Episteme Про</string>
     <string name="drawer_upgrade_pro">Перайсці на Episteme Pro</string>
     <string name="drawer_sync_library">Сінхранізаваць бібліятэку</string>
     <string name="drawer_backup_local_folders">Воблачная сінхранізацыя лакальных папак</string>
@@ -200,10 +200,10 @@
     <string name="dialog_early_access_desc">Вы атрымліваеце Episteme Pro па спецыяльнай зніжанай цане ў перыяд ранняга доступу! Гэта прапанова абмежавана па часе.</string>
     <string name="dialog_sign_in_required_desc">Увайдзіце ў свой уліковы запіс Google, каб купіць Episteme Pro і разблакіраваць усе прэміум-функцыі.</string>
     <string name="action_not_now">Не цяпер</string>
-    <string name="action_got_it">Зразумела</string>
+    <string name="action_got_it">Зразумела!</string>
     <string name="custom_fonts">Карыстальніцкія шрыфты</string>
     <string name="import_font">Імпартаваць шрыфт</string>
-    <string name="google_fonts">Google Fonts</string>
+    <string name="google_fonts">Google Шрыфты</string>
     <string name="action_browse_google_fonts">Праглядаць Google Fonts</string>
     <string name="google_fonts_search_placeholder">Шукаць сярод 1900+ шрыфтоў…</string>
     <string name="google_fonts_popular_choices">Папулярныя варыянты</string>
@@ -577,7 +577,7 @@
     <string name="visual_options_title">Візуальныя параметры</string>
     <string name="visual_options_page_layout">Макет старонкі</string>
     <string name="visual_options_remove_page_gap">Прыбраць прамежак паміж старонкамі</string>
-    <string name="visual_options_remove_page_gap_desc">Ужываецца да вертыкальнага рэжыму чытання.</string>
+    <string name="visual_options_remove_page_gap_desc">Ужываецца да вертыкальнага рэжыму чытання і двух старонак.</string>
     <string name="visual_options_hide_page_number_overlay">Схаваць накладку нумара старонкі</string>
     <string name="visual_options_hide_page_number_overlay_desc">Прыбірае малую пазнаку колькасці старонак з кожнай старонкі.</string>
     <string name="visual_options_system_ui">Сістэмны UI (панэлі стану і навігацыі)</string>
@@ -902,7 +902,7 @@
     <string name="default_document_title">Дакумент</string>
     <string name="generated_author">Згенеравана</string>
     <string name="reflow_display_name_format">%1$s (тэкставы выгляд)</string>
-    <string name="reflow_title_format">%1$s (Reflow)</string>
+    <string name="reflow_title_format">%1$s (Адаптыўны выгляд)</string>
     <string name="action_add_edit">Дадаць / Рэдагаваць</string>
     <string name="msg_no_tags_assigned">Тэгі не прызначаны.</string>
     <string name="title_apply_tags">Ужыць тэгі</string>
@@ -1086,4 +1086,22 @@
     <string name="language_dutch">Nederlands (нідэрландская)</string>
     <string name="language_ukrainian">Українська (украінская)</string>
     <string name="language_indonesian">Bahasa Indonesia (інданезійская)</string>
+    <string name="reader_brightness_percent">%1$d%%</string>
+    <string name="banner_shelf_created">Створана паліца %1$s.</string>
+    <string name="banner_smart_shelf_created">Створана разумная паліца %1$s.</string>
+    <string name="banner_shelf_renamed">Паліца перайменавана ў %1$s.</string>
+    <string name="banner_shelf_deleted">Выдалена паліца %1$s.</string>
+    <string name="banner_book_updated">%1$s абноўлена.</string>
+    <string name="banner_duplicate_files_already_in_library">Гэтыя файлы ўжо ў бібліятэцы.</string>
+    <string name="folder_subtitle_folder_book_counts">%1$s - %2$s</string>
+    <string name="action_save_annotation">Захаваць</string>
+    <string name="action_save_comment">Захаваць каментарый</string>
+    <string name="action_add_comment">Дадаць каментарый</string>
+    <string name="action_reply">Адказаць</string>
+    <string name="placeholder_add_comment">Дадайце каментарый…</string>
+    <string name="label_comments">Каментарыі</string>
+    <string name="label_editing_comment">Рэдагаванне каментарыя</string>
+    <string name="label_replying_to">У адказ %1$s</string>
+    <string name="options_use_pdf_filename_display_name">Выкарыстоўваць назвы файлаў PDF</string>
+    <string name="tool_brightness">Яркасць</string>
 </resources>

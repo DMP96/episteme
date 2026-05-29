@@ -40,7 +40,8 @@ enum class ReaderReadingMode {
 
 enum class ReaderPageSpreadMode {
     SINGLE,
-    TWO_PAGE
+    TWO_PAGE,
+    TWO_PAGE_FLIPPED
 }
 
 enum class SharedReaderTextAlign {
@@ -163,7 +164,7 @@ data class PaginatedReaderState(
         get() {
             if (pages.isEmpty()) return 0f
             val visibleEnd = ReaderSpreadLayout.visiblePageIndices(currentPageIndex, pages.size, settings)
-                .lastOrNull()
+                .maxOrNull()
                 ?: currentPageIndex
             return ((visibleEnd + 1).toFloat() / pages.size) * 100f
         }
@@ -208,12 +209,17 @@ object ReaderSpreadLayout {
         if (pageCount <= 0) return emptyList()
         val start = normalizePageIndex(pageIndex, pageCount, settings)
         if (!settings.isTwoPageSpreadEnabled()) return listOf(start)
-        return listOf(start, start + 1).filter { it in 0 until pageCount }
+        val indices = listOf(start, start + 1).filter { it in 0 until pageCount }
+        return if (settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED && indices.size == 2) {
+            indices.reversed()
+        } else {
+            indices
+        }
     }
 
     fun pageRangeLabel(pageIndex: Int, pageCount: Int, settings: ReaderSettings): String {
         val total = pageCount.coerceAtLeast(1)
-        val pages = visiblePageIndices(pageIndex, total, settings).ifEmpty { listOf(0) }
+        val pages = visiblePageIndices(pageIndex, total, settings).ifEmpty { listOf(0) }.sorted()
         val first = pages.first() + 1
         val last = pages.last() + 1
         return if (first == last) "$first" else "$first-$last"
@@ -250,5 +256,6 @@ object ReaderSpreadLayout {
 }
 
 fun ReaderSettings.isTwoPageSpreadEnabled(): Boolean {
-    return readingMode == ReaderReadingMode.PAGINATED && pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE
+    return readingMode == ReaderReadingMode.PAGINATED && 
+        (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED)
 }

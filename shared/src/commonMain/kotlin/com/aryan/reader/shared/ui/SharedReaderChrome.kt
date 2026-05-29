@@ -1451,6 +1451,15 @@ fun SharedReaderFormatControls(
                             },
                             label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
                         )
+                        FilterChip(
+                            selected = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED,
+                            onClick = {
+                                onReaderAction(
+                                    ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE_FLIPPED))
+                                )
+                            },
+                            label = { Text(readerString("visual_options_pdf_spread_two_flipped", "Two pages (flipped)")) }
+                        )
                     }
                 }
             }

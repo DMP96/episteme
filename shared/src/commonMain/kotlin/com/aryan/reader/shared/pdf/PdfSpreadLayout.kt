@@ -5,7 +5,7 @@ import com.aryan.reader.shared.reader.ReaderSettings
 
 object PdfSpreadLayout {
     fun isTwoPageSpreadEnabled(settings: ReaderSettings): Boolean {
-        return settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE
+        return settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED
     }
 
     fun normalizePageIndex(
@@ -33,7 +33,12 @@ object PdfSpreadLayout {
         val start = normalizePageIndex(pageIndex, pageCount, settings)
         if (!isTwoPageSpreadEnabled(settings)) return listOf(start)
         if (settings.pdfFirstPageStandaloneInSpread && start == 0) return listOf(0)
-        return listOf(start, start + 1).filter { it in 0 until pageCount }
+        val indices = listOf(start, start + 1).filter { it in 0 until pageCount }
+        return if (settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED && indices.size == 2) {
+            indices.reversed()
+        } else {
+            indices
+        }
     }
 
     fun spreadStartPageIndices(
@@ -112,7 +117,7 @@ object PdfSpreadLayout {
         pageCount: Int,
         settings: ReaderSettings
     ): String {
-        val pages = visiblePageIndices(pageIndex, pageCount.coerceAtLeast(1), settings).ifEmpty { listOf(0) }
+        val pages = visiblePageIndices(pageIndex, pageCount.coerceAtLeast(1), settings).ifEmpty { listOf(0) }.sorted()
         val first = pages.first() + 1
         val last = pages.last() + 1
         return if (first == last) "$first" else "$first-$last"
@@ -124,7 +129,7 @@ object PdfSpreadLayout {
         settings: ReaderSettings
     ): Float {
         if (pageCount <= 0) return 0f
-        val visibleEnd = visiblePageIndices(pageIndex, pageCount, settings).lastOrNull()
+        val visibleEnd = visiblePageIndices(pageIndex, pageCount, settings).maxOrNull()
             ?: normalizePageIndex(pageIndex, pageCount, settings)
         return ((visibleEnd + 1).toFloat() / pageCount.coerceAtLeast(1)) * 100f
     }

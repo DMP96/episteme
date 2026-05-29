@@ -5238,7 +5238,7 @@ fun PdfViewerScreen(
                                                             val targetPage = if (pageIndex in currentSpreadPageIndices) {
                                                                 pageIndex
                                                             } else {
-                                                                currentSpreadPageIndices.firstOrNull() ?: currentPaginationDisplayPage()
+                                                                currentSpreadPageIndices.minOrNull() ?: currentPaginationDisplayPage()
                                                             }
                                                             val targetVirtualPage = virtualPages.getOrNull(targetPage)
                                                             val pageAspectRatio = if (targetVirtualPage is VirtualPage.BlankPage) {

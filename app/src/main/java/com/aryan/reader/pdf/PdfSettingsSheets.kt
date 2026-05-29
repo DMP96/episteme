@@ -632,10 +632,11 @@ fun PdfVisualOptionsSheet(
                         when (it) {
                             ReaderPageSpreadMode.SINGLE -> stringResource(R.string.visual_options_pdf_spread_single)
                             ReaderPageSpreadMode.TWO_PAGE -> stringResource(R.string.visual_options_pdf_spread_two)
+                            ReaderPageSpreadMode.TWO_PAGE_FLIPPED -> stringResource(R.string.visual_options_pdf_spread_two_flipped)
                         }
                     }
                 )
-                if (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE) {
+                if (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED) {
                     Spacer(modifier = Modifier.height(8.dp))
                     PdfVisualOptionSwitchRow(
                         title = stringResource(R.string.visual_options_pdf_first_page_alone),

@@ -331,17 +331,8 @@ private fun ColumnScope.DesktopPdfInspectorContent(
                                         },
                                         label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
                                     )
-                                    FilterChip(
-                                        selected = pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED,
-                                        onClick = {
-                                            onReaderSettingsChange(
-                                                pdfReaderSettings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE_FLIPPED)
-                                            )
-                                        },
-                                        label = { Text(readerString("visual_options_pdf_spread_two_flipped", "Two pages (flipped)")) }
-                                    )
                                 }
-                                if (pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED) {
+                                if (pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE) {
                                     DesktopPdfVisualOptionSwitch(
                                         title = readerString("visual_options_pdf_first_page_alone", "First page alone"),
                                         description = readerString(
@@ -352,6 +343,18 @@ private fun ColumnScope.DesktopPdfInspectorContent(
                                         onCheckedChange = { enabled ->
                                             onReaderSettingsChange(
                                                 pdfReaderSettings.copy(pdfFirstPageStandaloneInSpread = enabled)
+                                            )
+                                    )
+                                    DesktopPdfVisualOptionSwitch(
+                                        title = readerString("visual_options_pdf_spread_flip", "Flip pages"),
+                                        description = readerString(
+                                            "visual_options_pdf_spread_flip_desc",
+                                            "Reverses the order of pages in a two-page spread."
+                                        ),
+                                        checked = pdfReaderSettings.pdfPageSpreadFlipped,
+                                        onCheckedChange = { enabled ->
+                                            onReaderSettingsChange(
+                                                pdfReaderSettings.copy(pdfPageSpreadFlipped = enabled)
                                             )
                                         }
                                     )

@@ -568,8 +568,10 @@ fun PdfVisualOptionsSheet(
     firstPageStandaloneInSpread: Boolean,
     showVerticalPageGap: Boolean,
     showPageNumberOverlay: Boolean,
+    pageSpreadFlipped: Boolean,
     onPageSpreadModeChange: (ReaderPageSpreadMode) -> Unit,
     onFirstPageStandaloneInSpreadChange: (Boolean) -> Unit,
+    onPageSpreadFlippedChange: (Boolean) -> Unit,
     onSystemUiModeChange: (SystemUiMode) -> Unit,
     onShowVerticalPageGapChange: (Boolean) -> Unit,
     onShowPageNumberOverlayChange: (Boolean) -> Unit,
@@ -632,17 +634,22 @@ fun PdfVisualOptionsSheet(
                         when (it) {
                             ReaderPageSpreadMode.SINGLE -> stringResource(R.string.visual_options_pdf_spread_single)
                             ReaderPageSpreadMode.TWO_PAGE -> stringResource(R.string.visual_options_pdf_spread_two)
-                            ReaderPageSpreadMode.TWO_PAGE_FLIPPED -> stringResource(R.string.visual_options_pdf_spread_two_flipped)
                         }
                     }
                 )
-                if (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED) {
+                if (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE) {
                     Spacer(modifier = Modifier.height(8.dp))
                     PdfVisualOptionSwitchRow(
                         title = stringResource(R.string.visual_options_pdf_first_page_alone),
                         description = stringResource(R.string.visual_options_pdf_first_page_alone_desc),
                         checked = firstPageStandaloneInSpread,
                         onCheckedChange = onFirstPageStandaloneInSpreadChange
+                    )
+                    PdfVisualOptionSwitchRow(
+                        title = stringResource(R.string.visual_options_pdf_spread_flip),
+                        description = stringResource(R.string.visual_options_pdf_spread_flip_desc),
+                        checked = pageSpreadFlipped,
+                        onCheckedChange = onPageSpreadFlippedChange
                     )
                 }
                 Spacer(modifier = Modifier.height(12.dp))

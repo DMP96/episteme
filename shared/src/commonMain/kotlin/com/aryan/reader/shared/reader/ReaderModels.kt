@@ -40,8 +40,7 @@ enum class ReaderReadingMode {
 
 enum class ReaderPageSpreadMode {
     SINGLE,
-    TWO_PAGE,
-    TWO_PAGE_FLIPPED
+    TWO_PAGE
 }
 
 enum class SharedReaderTextAlign {
@@ -77,6 +76,7 @@ data class ReaderSettings(
     val pdfVerticalPageGapVisible: Boolean = true,
     val pdfPageNumberOverlayVisible: Boolean = true,
     val pdfFirstPageStandaloneInSpread: Boolean = false,
+    val pdfPageSpreadFlipped: Boolean = false,
     val seamlessChapterNavigation: Boolean = true,
     val chapterTurnDragMultiplier: Float = 1.0f
 ) {
@@ -210,7 +210,7 @@ object ReaderSpreadLayout {
         val start = normalizePageIndex(pageIndex, pageCount, settings)
         if (!settings.isTwoPageSpreadEnabled()) return listOf(start)
         val indices = listOf(start, start + 1).filter { it in 0 until pageCount }
-        return if (settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED && indices.size == 2) {
+        return if (settings.pdfPageSpreadFlipped && indices.size == 2) {
             indices.reversed()
         } else {
             indices
@@ -257,5 +257,5 @@ object ReaderSpreadLayout {
 
 fun ReaderSettings.isTwoPageSpreadEnabled(): Boolean {
     return readingMode == ReaderReadingMode.PAGINATED && 
-        (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED)
+        pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE
 }

@@ -55,6 +55,8 @@ import com.aryan.reader.pdf.loadPdfPageSpreadMode
 import com.aryan.reader.pdf.savePdfPageSpreadMode
 import com.aryan.reader.pdf.loadPdfFirstPageStandaloneInSpread
 import com.aryan.reader.pdf.savePdfFirstPageStandaloneInSpread
+import com.aryan.reader.pdf.loadPdfPageSpreadFlipped
+import com.aryan.reader.pdf.savePdfPageSpreadFlipped
 import com.aryan.reader.shared.BuiltInPdfReaderThemes
 import com.aryan.reader.shared.CustomFontItem
 import com.aryan.reader.shared.SharedSettingsAction
@@ -460,7 +462,8 @@ private fun loadAndroidPdfReaderDefaultSettings(
         pdfVerticalPageGapVisible = loadPdfVerticalPageGapVisible(context),
         pdfPageNumberOverlayVisible = loadPdfPageNumberOverlayVisible(context),
         pageSpreadMode = loadPdfPageSpreadMode(context),
-        pdfFirstPageStandaloneInSpread = loadPdfFirstPageStandaloneInSpread(context)
+        pdfFirstPageStandaloneInSpread = loadPdfFirstPageStandaloneInSpread(context),
+        pdfPageSpreadFlipped = loadPdfPageSpreadFlipped(context)
     )
     return BuiltInPdfReaderThemes.firstOrNull { it.id == base.themeId }?.toReaderSettings(base) ?: base
 }
@@ -500,6 +503,7 @@ private fun saveAndroidPdfReaderDefaultSettings(
     savePdfPageNumberOverlayVisible(context, settings.pdfPageNumberOverlayVisible)
     savePdfPageSpreadMode(context, settings.pageSpreadMode)
     savePdfFirstPageStandaloneInSpread(context, settings.pdfFirstPageStandaloneInSpread)
+    savePdfPageSpreadFlipped(context, settings.pdfPageSpreadFlipped)
     saveGlobalTextureTransparency(context, 1f - settings.textureAlpha.coerceIn(0f, 1f))
 }
 

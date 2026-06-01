@@ -1451,15 +1451,21 @@ fun SharedReaderFormatControls(
                             },
                             label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
                         )
-                        FilterChip(
-                            selected = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED,
-                            onClick = {
-                                onReaderAction(
-                                    ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE_FLIPPED))
-                                )
-                            },
-                            label = { Text(readerString("visual_options_pdf_spread_two_flipped", "Two pages (flipped)")) }
-                        )
+                    }
+                    AnimatedVisibility(visible = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(readerString("visual_options_pdf_spread_flip", "Flip pages"), modifier = Modifier.weight(1f))
+                            Switch(
+                                checked = settings.pdfPageSpreadFlipped,
+                                onCheckedChange = { enabled ->
+                                    onReaderAction(ReaderAction.SettingsChanged(settings.copy(pdfPageSpreadFlipped = enabled)))
+                                }
+                            )
+                        }
                     }
                 }
             }

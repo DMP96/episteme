@@ -1,5 +1,5 @@
 Personal modified version of episteme with vibe coded patches:
- - Two Pages (flipped) page layout
+ - Flip pages toggle in Two Pages layout
  
 I don't recommend using this.
 

@@ -520,7 +520,8 @@ internal fun PdfReaderScreen(
         document.pageCount,
         displayMode,
         pdfReaderSettings.pageSpreadMode,
-        pdfReaderSettings.pdfFirstPageStandaloneInSpread
+        pdfReaderSettings.pdfFirstPageStandaloneInSpread,
+        pdfReaderSettings.pdfPageSpreadFlipped
     ) {
         if (displayMode == PdfDisplayMode.PAGINATION) {
             PdfSpreadLayout.visiblePageIndices(pageIndex, document.pageCount, pdfReaderSettings)
@@ -540,6 +541,7 @@ internal fun PdfReaderScreen(
         displayMode,
         pdfReaderSettings.pageSpreadMode,
         pdfReaderSettings.pdfFirstPageStandaloneInSpread,
+        pdfReaderSettings.pdfPageSpreadFlipped,
         pageIndex
     ) {
         if (displayMode != PdfDisplayMode.PAGINATION) return@LaunchedEffect

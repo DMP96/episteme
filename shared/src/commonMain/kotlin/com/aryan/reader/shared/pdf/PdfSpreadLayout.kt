@@ -5,7 +5,7 @@ import com.aryan.reader.shared.reader.ReaderSettings
 
 object PdfSpreadLayout {
     fun isTwoPageSpreadEnabled(settings: ReaderSettings): Boolean {
-        return settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED
+        return settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE
     }
 
     fun normalizePageIndex(
@@ -34,7 +34,7 @@ object PdfSpreadLayout {
         if (!isTwoPageSpreadEnabled(settings)) return listOf(start)
         if (settings.pdfFirstPageStandaloneInSpread && start == 0) return listOf(0)
         val indices = listOf(start, start + 1).filter { it in 0 until pageCount }
-        return if (settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_FLIPPED && indices.size == 2) {
+        return if (settings.pdfPageSpreadFlipped && indices.size == 2) {
             indices.reversed()
         } else {
             indices

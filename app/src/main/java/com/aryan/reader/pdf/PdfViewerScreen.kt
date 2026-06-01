@@ -365,6 +365,7 @@ fun PdfViewerScreen(
     var showVisualOptionsSheet by remember { mutableStateOf(false) }
     var pdfPageSpreadMode by remember { mutableStateOf(loadPdfPageSpreadMode(context)) }
     var pdfFirstPageStandaloneInSpread by remember { mutableStateOf(loadPdfFirstPageStandaloneInSpread(context)) }
+    var pdfPageSpreadFlipped by remember { mutableStateOf(loadPdfPageSpreadFlipped(context)) }
     var pendingPaginationSpreadRestorePage by remember { mutableStateOf<Int?>(null) }
     var screenOrientationMode by remember { mutableStateOf(loadReaderScreenOrientationMode(context)) }
     var rightToLeftPagination by remember { mutableStateOf(loadPdfRightToLeftPagination(context)) }
@@ -943,16 +944,18 @@ fun PdfViewerScreen(
     val totalDisplayPages by remember(virtualPages, totalPages) {
         derivedStateOf { if (virtualPages.isNotEmpty()) virtualPages.size else totalPages }
     }
-    val pdfSpreadSettings = remember(pdfPageSpreadMode, pdfFirstPageStandaloneInSpread) {
+    val pdfSpreadSettings = remember(pdfPageSpreadMode, pdfFirstPageStandaloneInSpread, pdfPageSpreadFlipped) {
         ReaderSettings(
             pageSpreadMode = pdfPageSpreadMode,
-            pdfFirstPageStandaloneInSpread = pdfFirstPageStandaloneInSpread
+            pdfFirstPageStandaloneInSpread = pdfFirstPageStandaloneInSpread,
+            pdfPageSpreadFlipped = pdfPageSpreadFlipped
         )
     }
     val paginationSpreadStarts = remember(
         totalDisplayPages,
         pdfSpreadSettings.pageSpreadMode,
-        pdfSpreadSettings.pdfFirstPageStandaloneInSpread
+        pdfSpreadSettings.pdfFirstPageStandaloneInSpread,
+        pdfSpreadSettings.pdfPageSpreadFlipped
     ) {
         PdfSpreadLayout.spreadStartPageIndices(totalDisplayPages, pdfSpreadSettings)
     }
@@ -1007,7 +1010,8 @@ fun PdfViewerScreen(
         paginationPagerPageCount,
         paginationSpreadStarts,
         pdfSpreadSettings.pageSpreadMode,
-        pdfSpreadSettings.pdfFirstPageStandaloneInSpread
+        pdfSpreadSettings.pdfFirstPageStandaloneInSpread,
+        pdfSpreadSettings.pdfPageSpreadFlipped
     ) {
         derivedStateOf {
             when (displayMode) {
@@ -1021,6 +1025,7 @@ fun PdfViewerScreen(
         pendingPaginationSpreadRestorePage,
         pdfSpreadSettings.pageSpreadMode,
         pdfSpreadSettings.pdfFirstPageStandaloneInSpread,
+        pdfSpreadSettings.pdfPageSpreadFlipped,
         totalDisplayPages,
         displayMode
     ) {
@@ -4453,7 +4458,8 @@ fun PdfViewerScreen(
                                                 pagerPageIndex,
                                                 totalDisplayPages,
                                                 pdfSpreadSettings.pageSpreadMode,
-                                                pdfSpreadSettings.pdfFirstPageStandaloneInSpread
+                                                pdfSpreadSettings.pdfFirstPageStandaloneInSpread,
+                                                pdfSpreadSettings.pdfPageSpreadFlipped
                                             ) {
                                                 PdfSpreadLayout.visiblePageIndices(
                                                     pageIndex = paginationDisplayPageForPagerPage(pagerPageIndex),
@@ -8099,6 +8105,12 @@ fun PdfViewerScreen(
                 pendingPaginationSpreadRestorePage = currentPage
                 pdfFirstPageStandaloneInSpread = enabled
                 savePdfFirstPageStandaloneInSpread(context, enabled)
+            },
+            pageSpreadFlipped = pdfPageSpreadFlipped,
+            onPageSpreadFlippedChange = { enabled ->
+                pendingPaginationSpreadRestorePage = currentPage
+                pdfPageSpreadFlipped = enabled
+                savePdfPageSpreadFlipped(context, enabled)
             },
             onSystemUiModeChange = { mode ->
                 systemUiMode = mode

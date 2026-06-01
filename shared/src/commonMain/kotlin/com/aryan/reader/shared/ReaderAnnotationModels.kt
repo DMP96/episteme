@@ -42,11 +42,15 @@ data class ReaderLocator(
     val pageIndex: Int? = null,
     val startOffset: Int? = null,
     val endOffset: Int? = null,
+    val blockIndex: Int? = null,
+    val charOffset: Int? = null,
     val textQuote: String? = null,
     val cfi: String? = null
 ) {
     val hasTextRange: Boolean
         get() = startOffset != null && endOffset != null && endOffset >= startOffset
+    val hasBlockPosition: Boolean
+        get() = blockIndex != null && charOffset != null
 
     fun withFallbacks(
         chapterIndex: Int? = null,
@@ -55,6 +59,8 @@ data class ReaderLocator(
         pageIndex: Int? = null,
         startOffset: Int? = null,
         endOffset: Int? = null,
+        blockIndex: Int? = null,
+        charOffset: Int? = null,
         textQuote: String? = null,
         cfi: String? = null
     ): ReaderLocator {
@@ -65,6 +71,8 @@ data class ReaderLocator(
             pageIndex = this.pageIndex ?: pageIndex,
             startOffset = this.startOffset ?: startOffset,
             endOffset = this.endOffset ?: endOffset,
+            blockIndex = this.blockIndex ?: blockIndex,
+            charOffset = this.charOffset ?: charOffset,
             textQuote = this.textQuote ?: textQuote,
             cfi = this.cfi ?: cfi
         )
@@ -73,6 +81,10 @@ data class ReaderLocator(
     fun sameLocation(other: ReaderLocator): Boolean {
         val sameChapter = chapterIndex == null || other.chapterIndex == null || chapterIndex == other.chapterIndex
         if (!sameChapter) return false
+
+        if (hasBlockPosition && other.hasBlockPosition) {
+            return blockIndex == other.blockIndex && charOffset == other.charOffset
+        }
 
         if (hasTextRange && other.hasTextRange) {
             return startOffset == other.startOffset && endOffset == other.endOffset
@@ -92,21 +104,40 @@ data class ReaderLocator(
             pageIndex: Int? = null,
             textQuote: String? = null
         ): ReaderLocator {
-            val desktopParts = cfi
+            val stableCfi = cfi?.toStableReaderPositionCfi()
+            val desktopParts = stableCfi
                 ?.takeIf { it.startsWith("desktop:") }
                 ?.split(':')
                 .orEmpty()
             val parsedChapterIndex = desktopParts.getOrNull(1)?.toIntOrNull()
             val possibleStartOffset = desktopParts.getOrNull(2)?.toIntOrNull()
             val possibleEndOffset = desktopParts.getOrNull(3)?.toIntOrNull()
+            val androidLocatorParts = stableCfi
+                ?.takeIf { it.startsWith("android-locator:") }
+                ?.split(':')
+                .orEmpty()
+            val parsedAndroidChapterIndex = androidLocatorParts.getOrNull(1)?.toIntOrNull()
+            val parsedBlockIndex = androidLocatorParts.getOrNull(2)?.toIntOrNull()
+            val parsedCharOffset = androidLocatorParts.getOrNull(3)?.toIntOrNull()
+                ?.takeIf { it >= 0 }
+            val parsedAndroidEndOffset = parsedCharOffset
+                ?.let { start -> textQuote?.takeIf { it.isNotBlank() }?.let { start + it.length } }
             val hasOffsetRange = desktopParts.size == 4 &&
                 possibleStartOffset != null &&
                 possibleEndOffset != null &&
                 possibleStartOffset >= 0 &&
                 possibleEndOffset >= possibleStartOffset &&
                 possibleEndOffset - possibleStartOffset <= 100_000
-            val parsedStartOffset = if (hasOffsetRange) possibleStartOffset else null
-            val parsedEndOffset = if (hasOffsetRange) possibleEndOffset else null
+            val parsedStartOffset = when {
+                hasOffsetRange -> possibleStartOffset
+                parsedBlockIndex != null && parsedAndroidEndOffset != null -> parsedCharOffset
+                else -> null
+            }
+            val parsedEndOffset = when {
+                hasOffsetRange -> possibleEndOffset
+                parsedBlockIndex != null -> parsedAndroidEndOffset
+                else -> null
+            }
             val parsedPageIndex = when {
                 pageIndex != null -> pageIndex
                 desktopParts.size == 3 || desktopParts.size >= 5 || (desktopParts.size == 4 && !hasOffsetRange) ->
@@ -114,14 +145,47 @@ data class ReaderLocator(
                 else -> null
             }
             return ReaderLocator(
-                chapterIndex = chapterIndex ?: parsedChapterIndex,
+                chapterIndex = chapterIndex ?: parsedChapterIndex ?: parsedAndroidChapterIndex,
                 pageIndex = parsedPageIndex,
                 startOffset = parsedStartOffset,
                 endOffset = parsedEndOffset,
+                blockIndex = parsedBlockIndex,
+                charOffset = parsedCharOffset,
                 textQuote = textQuote,
-                cfi = cfi
+                cfi = stableCfi ?: cfi
             )
         }
+    }
+}
+
+fun String.toStableReaderPositionCfi(): String {
+    val trimmed = trim()
+    if (!trimmed.startsWith("desktop-scroll:")) return trimmed
+    return trimmed
+        .split(':', limit = 4)
+        .getOrNull(3)
+        ?.takeIf { it.isNotBlank() }
+        ?: trimmed
+}
+
+fun ReaderLocator.toStablePositionCfi(): String? {
+    cfi
+        ?.toStableReaderPositionCfi()
+        ?.takeIf { it.isNotBlank() }
+        ?.takeUnless { it.startsWith("desktop-scroll:") || it.startsWith("desktop-scroll-page:") }
+        ?.let { return it }
+
+    val chapter = chapterIndex
+    val start = startOffset
+    val end = endOffset ?: start
+    return when {
+        chapter != null && blockIndex != null && charOffset != null ->
+            "android-locator:$chapter:$blockIndex:$charOffset"
+        chapter != null && start != null && end != null ->
+            "desktop:$chapter:$start:$end"
+        chapter != null && pageIndex != null ->
+            "desktop:$chapter:$pageIndex"
+        else -> null
     }
 }
 
@@ -129,8 +193,8 @@ data class ReaderHighlightPalette(
     val colors: List<HighlightColor> = defaultColors
 ) {
     fun sanitized(): ReaderHighlightPalette {
-        val distinct = colors.distinct().filter { it in HighlightColor.entries }
-        return copy(colors = distinct.ifEmpty { defaultColors })
+        val knownColors = colors.filter { it in HighlightColor.entries }
+        return copy(colors = knownColors.takeIf { it.size == PaletteSize } ?: defaultColors)
     }
 
     fun contains(color: HighlightColor): Boolean {
@@ -147,14 +211,13 @@ data class ReaderHighlightPalette(
     }
 
     companion object {
+        const val PaletteSize: Int = 4
         val defaultColors: List<HighlightColor>
             get() = listOf(
                 HighlightColor.YELLOW,
                 HighlightColor.GREEN,
                 HighlightColor.BLUE,
-                HighlightColor.RED,
-                HighlightColor.PURPLE,
-                HighlightColor.ORANGE
+                HighlightColor.RED
             )
     }
 }

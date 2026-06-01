@@ -48,6 +48,38 @@ data class SharedPdfAnnotationComment(
     val modifiedAt: Long = 0L
 )
 
+const val DEFAULT_SHARED_PDF_COMMENT_AUTHOR = "Reader"
+
+fun List<SharedPdfAnnotationComment>.visiblePdfAnnotationComments(): List<SharedPdfAnnotationComment> {
+    val visibleCommentIds = filter { it.contents.isNotBlank() }.map { it.id }.toSet()
+    return filter { it.contents.isNotBlank() }
+        .map { comment ->
+            if (comment.parentId != null && comment.parentId !in visibleCommentIds) {
+                comment.copy(parentId = null)
+            } else {
+                comment
+            }
+        }
+}
+
+fun List<SharedPdfAnnotationComment>.pdfCommentChildren(parentId: String?): List<SharedPdfAnnotationComment> {
+    return filter { it.parentId == parentId }
+        .sortedWith(compareBy({ it.createdAt.takeIf { timestamp -> timestamp > 0L } ?: Long.MAX_VALUE }, { it.id }))
+}
+
+fun List<SharedPdfAnnotationComment>.withoutPdfCommentThread(commentId: String): List<SharedPdfAnnotationComment> {
+    val childrenByParentId = groupBy { it.parentId }
+    val idsToRemove = mutableSetOf<String>()
+
+    fun collect(id: String) {
+        if (!idsToRemove.add(id)) return
+        childrenByParentId[id].orEmpty().forEach { child -> collect(child.id) }
+    }
+
+    collect(commentId)
+    return filterNot { it.id in idsToRemove }
+}
+
 @Serializable
 data class SharedPdfAnnotation(
     val id: String,
@@ -162,13 +194,7 @@ object SharedPdfAnnotationDefaults {
         0xFFFFFFFF.toInt()
     )
 
-    val highlighterPalette: List<Int> = listOf(
-        0x8CFF9800.toInt(),
-        0x8CFFEB3B.toInt(),
-        0x8C81C784.toInt(),
-        0x8C64B5F6.toInt(),
-        0x8CE1BEE7.toInt()
-    )
+    val highlighterPalette: List<Int> = SharedPdfAndroidHighlightColors.palette.take(4)
 
     fun configFor(tool: PdfInkTool): PdfToolConfig {
         return when (tool) {
@@ -176,8 +202,8 @@ object SharedPdfAnnotationDefaults {
             PdfInkTool.PEN -> PdfToolConfig(0xFFFF0000.toInt(), 0.008f)
             PdfInkTool.FOUNTAIN_PEN -> PdfToolConfig(0xFF0000FF.toInt(), 0.008f)
             PdfInkTool.PENCIL -> PdfToolConfig(0xFF444444.toInt(), 0.008f)
-            PdfInkTool.HIGHLIGHTER -> PdfToolConfig(0x8CFF9800.toInt(), 0.035f)
-            PdfInkTool.HIGHLIGHTER_ROUND -> PdfToolConfig(0x8CFFEB3B.toInt(), 0.035f)
+            PdfInkTool.HIGHLIGHTER -> PdfToolConfig(highlighterPalette[0], 0.035f)
+            PdfInkTool.HIGHLIGHTER_ROUND -> PdfToolConfig(highlighterPalette[1], 0.035f)
             PdfInkTool.ERASER -> PdfToolConfig(0x00000000, 0.03f)
             PdfInkTool.TEXT -> PdfToolConfig(0xFF000000.toInt(), 0.02f)
         }
@@ -209,9 +235,11 @@ data class SharedPdfHighlighterPalette(
 
     companion object {
         const val DefaultAlpha: Int = 0x8C
-        const val MaxColors: Int = 5
+        const val MaxColors: Int = 4
         val defaultColors: List<Int>
-            get() = SharedPdfAnnotationDefaults.highlighterPalette.map { it.withPdfHighlighterAlpha() }
+            get() = SharedPdfAnnotationDefaults.highlighterPalette
+                .take(MaxColors)
+                .map { it.withPdfHighlighterAlpha() }
     }
 }
 
@@ -219,18 +247,21 @@ object SharedPdfAndroidHighlightColors {
     const val StoredAlpha: Int = 0x8C
     const val RenderAlpha: Float = 0.4f
 
+    val orderedNames: List<String> = listOf("ORANGE", "YELLOW", "GREEN", "BLUE", "PURPLE")
+
     val colorsByName: Map<String, Int> = mapOf(
-        "YELLOW" to 0xFFFBC02D.toInt(),
-        "GREEN" to 0xFF388E3C.toInt(),
-        "BLUE" to 0xFF1976D2.toInt(),
-        "RED" to 0xFFD32F2F.toInt()
+        "ORANGE" to 0xFFFF9800.toInt(),
+        "YELLOW" to 0xFFFFEB3B.toInt(),
+        "GREEN" to 0xFF81C784.toInt(),
+        "BLUE" to 0xFF64B5F6.toInt(),
+        "PURPLE" to 0xFFE1BEE7.toInt()
     )
 
     val palette: List<Int>
-        get() = colorsByName.keys.map(::argbForName)
+        get() = orderedNames.map(::argbForName)
 
     fun argbForName(name: String): Int {
-        val opaqueArgb = colorsByName[name.uppercase()] ?: colorsByName.getValue("YELLOW")
+        val opaqueArgb = colorsByName[name.uppercase()] ?: colorsByName.getValue("ORANGE")
         return (StoredAlpha shl 24) or (opaqueArgb and 0x00FFFFFF)
     }
 
@@ -242,7 +273,7 @@ object SharedPdfAndroidHighlightColors {
             val dg = ((rgb shr 8) and 0xFF) - ((candidate shr 8) and 0xFF)
             val db = (rgb and 0xFF) - (candidate and 0xFF)
             dr * dr + dg * dg + db * db
-        }?.key ?: "YELLOW"
+        }?.key ?: "ORANGE"
     }
 
     fun nearestArgb(argb: Int): Int {

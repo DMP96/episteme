@@ -38,7 +38,6 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import com.aryan.reader.shared.AppContrastOption
 import com.aryan.reader.shared.AppThemeMode
-import com.aryan.reader.shared.ReaderFeatureSurface
 import com.aryan.reader.shared.ui.SharedAppTheme
 import com.aryan.reader.shared.ui.readerString
 import kotlinx.coroutines.Dispatchers
@@ -57,6 +56,8 @@ import java.awt.event.KeyEvent as AwtKeyEvent
 import java.util.concurrent.atomic.AtomicReference
 
 internal val DesktopDefaultAppSeedColor = Color(0xFFFFB300)
+
+private val DesktopReaderWindowFullscreenExitFocusRetryDelaysMillis = longArrayOf(160L, 200L)
 
 internal fun launchEpistemeDesktopApplication(startupSplash: DesktopStartupSplash? = null) {
     configureComposeSwingInterop()
@@ -190,34 +191,68 @@ internal const val ComposeInteropBlendingProperty = "compose.interop.blending"
 internal const val ComposeInteropBlendingEnabled = "true"
 private const val DesktopWindowStatePersistDebounceMillis = 450L
 
-internal fun configureComposeSwingInterop() {
-    // Must run before Compose creates the desktop window. Vertical EPUB embeds a Swing-backed
-    // JCEF WebView, and current Compose interop can leave a stale black native rectangle after
-    // that reader surface is removed unless interop blending is enabled.
-    if (System.getProperty(ComposeInteropBlendingProperty).isNullOrBlank()) {
-        System.setProperty(ComposeInteropBlendingProperty, ComposeInteropBlendingEnabled)
+internal fun composeInteropBlendingDefault(
+    platform: DesktopPlatform = currentDesktopPlatform()
+): String? {
+    return if (desktopEpubWebViewUsesNativeSwtBrowser(platform)) {
+        null
+    } else {
+        ComposeInteropBlendingEnabled
     }
 }
 
+internal fun configureComposeSwingInterop(
+    platform: DesktopPlatform = currentDesktopPlatform()
+) {
+    // Must run before Compose creates the desktop window. Vertical EPUB embeds native SWT/AWT
+    // browser surfaces; the blending path can prevent those native children from painting.
+    if (System.getProperty(ComposeInteropBlendingProperty).isNullOrBlank()) {
+        composeInteropBlendingDefault(platform)?.let { defaultValue ->
+            System.setProperty(ComposeInteropBlendingProperty, defaultValue)
+        }
+    }
+    logDesktopWebView2(
+        "compose_interop platform=${platform.os} blending=${System.getProperty(ComposeInteropBlendingProperty).orEmpty().ifBlank { "default" }}"
+    )
+}
+
 @Composable
-private fun DesktopWindowStatePersistenceEffect(
+internal fun DesktopWindowStatePersistenceEffect(
     windowState: WindowState,
     store: DesktopWindowStateStore,
-    enabled: Boolean
+    enabled: Boolean,
+    transformSnapshot: (DesktopWindowStateSnapshot) -> DesktopWindowStateSnapshot? = { it },
+    onSnapshotSaved: (DesktopWindowStateSnapshot) -> Unit = {}
 ) {
     val persistenceEnabled by rememberUpdatedState(enabled)
+    val latestTransformSnapshot by rememberUpdatedState(transformSnapshot)
+    val latestOnSnapshotSaved by rememberUpdatedState(onSnapshotSaved)
     LaunchedEffect(windowState, store) {
         snapshotFlow { DesktopWindowStateSnapshot.fromWindowState(windowState) }
             .distinctUntilChanged()
             .collectLatest { snapshot ->
                 if (!persistenceEnabled || snapshot == null) return@collectLatest
+                val persistableSnapshot = latestTransformSnapshot(snapshot) ?: return@collectLatest
                 delay(DesktopWindowStatePersistDebounceMillis)
                 if (persistenceEnabled) {
                     withContext(Dispatchers.IO) {
-                        store.save(snapshot)
+                        store.save(persistableSnapshot)
                     }
+                    latestOnSnapshotSaved(persistableSnapshot)
                 }
             }
+    }
+    DisposableEffect(windowState, store) {
+        onDispose {
+            if (persistenceEnabled) {
+                DesktopWindowStateSnapshot.fromWindowState(windowState)
+                    ?.let(latestTransformSnapshot)
+                    ?.let { snapshot ->
+                        runCatching { store.save(snapshot) }
+                        latestOnSnapshotSaved(snapshot)
+                    }
+            }
+        }
     }
 }
 
@@ -258,6 +293,14 @@ internal fun DesktopReaderFullscreenEffect(
                 awtWindow.restoreDesktopReaderFullscreenExitBounds(pendingExitSnapshot.getAndSet(null))
             }
             awtWindow.refreshDesktopReaderWindowFocus()
+        }
+        if (!enabled) {
+            for (delayMillis in DesktopReaderWindowFullscreenExitFocusRetryDelaysMillis) {
+                delay(delayMillis)
+                EventQueue.invokeLater {
+                    awtWindow.refreshDesktopReaderWindowFocus()
+                }
+            }
         }
     }
 
@@ -445,15 +488,42 @@ internal fun DesktopReaderFullscreenKeyEffect(
     enabled: Boolean,
     onKeyPressed: (AwtKeyEvent) -> Boolean
 ) {
+    DesktopReaderKeyDispatcherEffect(
+        enabled = enabled,
+        allowChromeModalWindows = false,
+        onKeyPressed = onKeyPressed
+    )
+}
+
+@Composable
+internal fun DesktopReaderKeyDispatcherEffect(
+    enabled: Boolean,
+    allowChromeModalWindows: Boolean = false,
+    allowPanelModalWindows: Boolean = false,
+    dispatchWhenOwnerWindowActive: Boolean = true,
+    onKeyPressed: (AwtKeyEvent) -> Boolean
+) {
     val currentOnKeyPressed by rememberUpdatedState(onKeyPressed)
-    DisposableEffect(enabled) {
+    DisposableEffect(
+        enabled,
+        allowChromeModalWindows,
+        allowPanelModalWindows,
+        dispatchWhenOwnerWindowActive
+    ) {
         if (!enabled) {
             onDispose {}
         } else {
             val focusManager = KeyboardFocusManager.getCurrentKeyboardFocusManager()
             val dispatcher = java.awt.KeyEventDispatcher { event ->
-                val modalWindowActive = focusManager.activeWindow?.isDesktopReaderModalWindow() == true
-                !modalWindowActive && event.id == AwtKeyEvent.KEY_PRESSED && currentOnKeyPressed(event)
+                val keyWindow = focusManager.focusedWindow ?: focusManager.activeWindow
+                val activeReaderModalKind = keyWindow?.desktopReaderModalWindowKind()
+                val activeWindowAllowed = desktopReaderKeyDispatchAllowedForActiveWindowKind(
+                    activeReaderModalKind = activeReaderModalKind,
+                    allowChromeModalWindows = allowChromeModalWindows,
+                    allowPanelModalWindows = allowPanelModalWindows,
+                    dispatchWhenOwnerWindowActive = dispatchWhenOwnerWindowActive
+                )
+                activeWindowAllowed && event.id == AwtKeyEvent.KEY_PRESSED && currentOnKeyPressed(event)
             }
             focusManager.addKeyEventDispatcher(dispatcher)
             onDispose {
@@ -463,18 +533,62 @@ internal fun DesktopReaderFullscreenKeyEffect(
     }
 }
 
-private fun java.awt.Window.isDesktopReaderModalWindow(): Boolean {
+internal enum class DesktopReaderModalWindowKind {
+    CHROME,
+    PANEL,
+    POPUP
+}
+
+internal fun desktopReaderKeyDispatchAllowedForActiveWindowKind(
+    activeReaderModalKind: DesktopReaderModalWindowKind?,
+    allowChromeModalWindows: Boolean,
+    allowPanelModalWindows: Boolean,
+    dispatchWhenOwnerWindowActive: Boolean
+): Boolean {
+    return when (activeReaderModalKind) {
+        null -> dispatchWhenOwnerWindowActive
+        DesktopReaderModalWindowKind.CHROME -> allowChromeModalWindows
+        DesktopReaderModalWindowKind.PANEL -> allowPanelModalWindows
+        DesktopReaderModalWindowKind.POPUP -> false
+    }
+}
+
+private fun java.awt.Window.desktopReaderModalWindowKind(): DesktopReaderModalWindowKind? {
     val windowTitle = when (this) {
         is java.awt.Dialog -> title
         is Frame -> title
         else -> ""
     }
-    return name?.startsWith(DesktopReaderModalWindowNamePrefix) == true ||
-        windowTitle.startsWith("Reader Panel") ||
-        windowTitle.startsWith("Reader Popup")
+    return desktopReaderModalWindowKind(
+        windowName = name.orEmpty(),
+        windowTitle = windowTitle
+    )
 }
 
-private const val DesktopReaderModalWindowNamePrefix = "shared-reader-modal:"
+internal fun desktopReaderModalWindowKind(
+    windowName: String,
+    windowTitle: String
+): DesktopReaderModalWindowKind? {
+    return when {
+        windowName == "${DesktopReaderModalWindowNamePrefix}ChromeTop" ||
+            windowName == "${DesktopReaderModalWindowNamePrefix}ChromeBottom" ||
+            windowTitle.startsWith("Reader Chrome") -> DesktopReaderModalWindowKind.CHROME
+
+        windowName == "${DesktopReaderModalWindowNamePrefix}Panel" ||
+            windowName == "${DesktopReaderModalWindowNamePrefix}PanelLeft" ||
+            windowName == "${DesktopReaderModalWindowNamePrefix}PanelRight" ||
+            windowTitle.startsWith("Reader Panel") ||
+            windowTitle.startsWith("Reader Navigation") ||
+            windowTitle.startsWith("Reader Tools") -> DesktopReaderModalWindowKind.PANEL
+
+        windowName.startsWith(DesktopReaderModalWindowNamePrefix) ||
+            windowTitle.startsWith("Reader Popup") -> DesktopReaderModalWindowKind.POPUP
+
+        else -> null
+    }
+}
+
+internal const val DesktopReaderModalWindowNamePrefix = "shared-reader-modal:"
 
 internal data class DesktopWebViewRuntimeState(
     val initialized: Boolean = false,
@@ -483,15 +597,43 @@ internal data class DesktopWebViewRuntimeState(
     val errorMessage: String? = null
 )
 
-internal fun shouldRequestDesktopWebViewRuntime(readerSurface: ReaderFeatureSurface?): Boolean {
-    return readerSurface == ReaderFeatureSurface.TEXT_READER
+internal enum class DesktopEpubWebViewBackend(
+    val logName: String,
+    val displayName: String
+) {
+    WINDOWS_WEBVIEW2("webview2", "Microsoft Edge WebView2"),
+    WEBKIT("webkit", "WebKit"),
+    UNSUPPORTED("unsupported", "native webview")
 }
 
-internal fun shouldStartDesktopWebViewRuntime(
-    requested: Boolean,
-    state: DesktopWebViewRuntimeState
+internal fun desktopEpubWebViewBackend(
+    platform: DesktopPlatform = currentDesktopPlatform()
+): DesktopEpubWebViewBackend {
+    return when (platform.os) {
+        DesktopOperatingSystem.WINDOWS -> DesktopEpubWebViewBackend.WINDOWS_WEBVIEW2
+        DesktopOperatingSystem.LINUX,
+        DesktopOperatingSystem.MACOS -> DesktopEpubWebViewBackend.WEBKIT
+        DesktopOperatingSystem.OTHER -> DesktopEpubWebViewBackend.UNSUPPORTED
+    }
+}
+
+internal fun desktopEpubWebViewUsesNativeSwtBrowser(
+    platform: DesktopPlatform = currentDesktopPlatform()
 ): Boolean {
-    return requested && !state.initialized && !state.restartRequired && state.errorMessage == null
+    return desktopEpubWebViewBackend(platform) != DesktopEpubWebViewBackend.UNSUPPORTED
+}
+
+internal fun desktopEpubWebViewUsesWebView2(
+    platform: DesktopPlatform = currentDesktopPlatform()
+): Boolean {
+    return desktopEpubWebViewBackend(platform) == DesktopEpubWebViewBackend.WINDOWS_WEBVIEW2
+}
+
+internal fun desktopEpubWebViewCanRender(
+    state: DesktopWebViewRuntimeState,
+    platform: DesktopPlatform = currentDesktopPlatform()
+): Boolean {
+    return desktopEpubWebViewUsesNativeSwtBrowser(platform)
 }
 
 @Composable
@@ -499,7 +641,10 @@ internal fun DesktopWebViewRuntimeIndicator(
     state: DesktopWebViewRuntimeState,
     modifier: Modifier = Modifier
 ) {
+    val platform = currentDesktopPlatform()
     val message = when {
+        !desktopEpubWebViewUsesNativeSwtBrowser(platform) ->
+            readerString("desktop_webview_unsupported", "Embedded webview is unavailable on this desktop platform.")
         state.errorMessage != null -> readerString("desktop_webview_start_error", "Embedded webview could not start: %1\$s", state.errorMessage)
         state.restartRequired -> readerString("desktop_webview_restart_required", "Embedded webview installed. Restart Episteme to finish setup.")
         state.downloadProgress >= 0f -> readerString("desktop_webview_preparing_progress", "Preparing bundled embedded webview %1\$d%%", state.downloadProgress.toInt())
@@ -515,7 +660,9 @@ internal fun DesktopWebViewRuntimeIndicator(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             if (state.errorMessage == null && !state.restartRequired) {
-                CircularProgressIndicator()
+                if (desktopEpubWebViewUsesNativeSwtBrowser(platform)) {
+                    CircularProgressIndicator()
+                }
             }
             Text(
                 text = message,

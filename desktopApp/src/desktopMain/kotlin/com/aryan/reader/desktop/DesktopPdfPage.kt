@@ -1,5 +1,7 @@
 package com.aryan.reader.desktop
 
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -67,6 +69,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
+private const val DesktopVerticalPdfPageTurnAnimationMillis = 140
+
 @Composable
 internal fun DesktopVerticalPdfPage(
     document: DesktopPdfDocument,
@@ -96,6 +100,8 @@ internal fun DesktopVerticalPdfPage(
     themeStyle: DesktopPdfThemeStyle,
     shouldRender: Boolean,
     zoomPreview: DesktopPdfZoomPreview?,
+    zoomPreviewAnchorPageRootOffset: Offset? = null,
+    zoomPreviewScrollBounds: DesktopPdfZoomScrollBounds? = null,
     zoomViewportRootOffset: Offset,
     showPageNumberOverlay: Boolean = true,
     onSelectPage: (Int) -> Unit,
@@ -116,13 +122,16 @@ internal fun DesktopVerticalPdfPage(
     onTextDraftChanged: (String, IntSize) -> Unit,
     onTextDraftBoundsChanged: (PdfPageBounds) -> Unit,
     onPan: (Offset) -> Unit,
+    onPageSizeChanged: (Int, IntSize) -> Unit = { _, _ -> },
     onPagePositioned: (Int, Offset) -> Unit
 ) {
     val documentHandleId = document.handleId
     val density = LocalDensity.current
-    var renderedPage by remember(documentHandleId, pageIndex) { mutableStateOf<DesktopPdfPageRender?>(null) }
-    var renderError by remember(documentHandleId, pageIndex) { mutableStateOf<String?>(null) }
-    var isRendering by remember(documentHandleId, pageIndex) { mutableStateOf(true) }
+    var renderedPage by remember(documentHandleId) { mutableStateOf<DesktopPdfPageRender?>(null) }
+    var renderedPageIndex by remember(documentHandleId) { mutableStateOf<Int?>(null) }
+    var renderedPageScale by remember(documentHandleId) { mutableStateOf<Float?>(null) }
+    var renderError by remember(documentHandleId) { mutableStateOf<String?>(null) }
+    var isRendering by remember(documentHandleId) { mutableStateOf(true) }
     var pageCanvasSize by remember(documentHandleId, pageIndex) { mutableStateOf(IntSize.Zero) }
     var pageRootOffset by remember(documentHandleId, pageIndex) { mutableStateOf(Offset.Zero) }
     var selectionStartIndex by remember(documentHandleId, pageIndex) { mutableStateOf<Int?>(null) }
@@ -156,34 +165,73 @@ internal fun DesktopVerticalPdfPage(
 
     LaunchedEffect(documentHandleId, pageIndex, scale, shouldRender) {
         if (!shouldRender) {
+            logPdfZoomSettle {
+                "item_render_skip page=${pageIndex + 1} reason=outside_window scale=${scale.formatLogFloat()}"
+            }
             renderedPage = null
+            renderedPageIndex = null
+            renderedPageScale = null
             renderError = null
             isRendering = false
             clearInteractionState()
             return@LaunchedEffect
         }
-        val hasPageRender = renderedPage != null
+        val hasPageRender = renderedPage != null && desktopPdfRenderBelongsToPage(renderedPageIndex, pageIndex)
+        logPdfZoomSettle {
+            "item_render_effect page=${pageIndex + 1} scale=${scale.formatLogFloat()} shouldRender=$shouldRender " +
+                "hasRender=$hasPageRender renderedPage=${renderedPageIndex?.plus(1) ?: "none"} " +
+                "renderScale=${renderedPageScale?.formatLogFloat() ?: "none"}"
+        }
         if (!hasPageRender) {
+            renderedPage = null
+            renderedPageIndex = null
+            renderedPageScale = null
             isRendering = true
         }
         renderError = null
         val pageSize = document.pageSizes.getOrNull(pageIndex)
         if (pageSize == null) {
             renderedPage = null
+            renderedPageIndex = null
+            renderedPageScale = null
             renderError = failedRenderMessage
             isRendering = false
             return@LaunchedEffect
         }
+        val safeScale = zoomSpec.safeRenderScale(pageSize.width, pageSize.height, scale)
+        if (hasPageRender && !desktopPdfRenderScaleNeedsUpgrade(renderedPageScale, safeScale)) {
+            logPdfZoomSettle {
+                "item_render_skip page=${pageIndex + 1} reason=no_scale_upgrade " +
+                    "safeScale=${safeScale.formatLogFloat()} existingScale=${renderedPageScale?.formatLogFloat() ?: "none"}"
+            }
+            isRendering = false
+            return@LaunchedEffect
+        }
+        logPdfZoomSettle {
+            "item_render_scheduled page=${pageIndex + 1} safeScale=${safeScale.formatLogFloat()} " +
+                "delayMs=${if (hasPageRender) DesktopPdfZoomRenderDebounceMillis else 45L} hasRender=$hasPageRender"
+        }
         delay(if (hasPageRender) DesktopPdfZoomRenderDebounceMillis else 45L)
         isRendering = true
-        val safeScale = zoomSpec.safeRenderScale(pageSize.width, pageSize.height, scale)
+        val renderStartedAt = System.currentTimeMillis()
         val result = withContext(Dispatchers.IO) {
             runCatching { DesktopPdfium.renderPage(document, pageIndex, safeScale) }
         }
-        result.getOrNull()?.let { renderedPage = it }
+        val renderElapsedMs = System.currentTimeMillis() - renderStartedAt
+        result.getOrNull()?.let {
+            renderedPage = it
+            renderedPageIndex = pageIndex
+            renderedPageScale = safeScale
+        }
+        val renderedCurrentPage = renderedPage != null && desktopPdfRenderBelongsToPage(renderedPageIndex, pageIndex)
         renderError = result.exceptionOrNull()?.message
-            ?: if (renderedPage == null) failedRenderMessage else null
+            ?: if (!renderedCurrentPage && renderedPage == null) failedRenderMessage else null
         isRendering = false
+        logPdfZoomSettle {
+            "item_render_end page=${pageIndex + 1} safeScale=${safeScale.formatLogFloat()} " +
+                "elapsedMs=$renderElapsedMs success=${result.isSuccess} bitmap=${renderedPage?.width ?: 0}x${renderedPage?.height ?: 0} " +
+                "canvas=${pageCanvasSize.formatLogSize()} root=${pageRootOffset.formatLogOffset()}"
+        }
     }
 
     LaunchedEffect(isTextSelectionMode) {
@@ -205,6 +253,8 @@ internal fun DesktopVerticalPdfPage(
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         val pageSize = document.pageSizes.getOrNull(pageIndex)
+        val displayPageIndex = renderedPageIndex ?: pageIndex
+        val displayPageIsCurrent = displayPageIndex == pageIndex
         val placeholderScale = zoomSpec.clamp(scale)
         val placeholderWidthDp = with(density) { ((pageSize?.width ?: 612f) * placeholderScale).toDp() }
         val placeholderHeightDp = with(density) { ((pageSize?.height ?: 792f) * placeholderScale).toDp() }
@@ -224,24 +274,60 @@ internal fun DesktopVerticalPdfPage(
                 .size(placeholderWidthDp, placeholderHeightDp)
                 .onGloballyPositioned { coordinates ->
                     val rootOffset = coordinates.positionInRoot()
+                    if (rootOffset != pageRootOffset) {
+                        logPdfZoomSettle {
+                            "item_layout page=${pageIndex + 1} prevRoot=${pageRootOffset.formatLogOffset()} " +
+                                "nextRoot=${rootOffset.formatLogOffset()} scale=${scale.formatLogFloat()} " +
+                                "preview=${zoomPreview != null} canvas=${pageCanvasSize.formatLogSize()}"
+                        }
+                    }
                     pageRootOffset = rootOffset
                     onPagePositioned(pageIndex, rootOffset)
                 }
-                .onSizeChanged { pageCanvasSize = it }
+                .onSizeChanged { size ->
+                    if (pageCanvasSize != size) {
+                        logPdfZoomSettle {
+                            "item_size page=${pageIndex + 1} prev=${pageCanvasSize.formatLogSize()} " +
+                                "next=${size.formatLogSize()} scale=${scale.formatLogFloat()} " +
+                                "preview=${zoomPreview != null} renderScale=${pageRenderScale.formatLogFloat()}"
+                        }
+                    }
+                    pageCanvasSize = size
+                    onPageSizeChanged(pageIndex, size)
+                }
                 .desktopPdfDocumentZoomPreviewLayer(
                     preview = zoomPreview,
                     currentZoom = scale,
                     viewportRootOffset = zoomViewportRootOffset,
-                    pageRootOffset = pageRootOffset
+                    pageRootOffset = pageRootOffset,
+                    anchorPageRootOffset = zoomPreviewAnchorPageRootOffset,
+                    scrollBounds = zoomPreviewScrollBounds
                 )
                 .background(themeStyle.pageBackgroundColor, RoundedCornerShape(2.dp))
-                .pointerInput(pageIndex, pageCanvasSize, isTextSelectionMode, selectedTool, isRichTextMode) {
-                    if (isRichTextMode) return@pointerInput
+                .pointerInput(
+                    pageIndex,
+                    displayPageIsCurrent,
+                    pageCanvasSize,
+                    isTextSelectionMode,
+                    selectedTool,
+                    isRichTextMode
+                ) {
+                    if (!displayPageIsCurrent || isRichTextMode) return@pointerInput
                     awaitPointerEventScope {
                         while (true) {
                             val event = awaitPointerEvent()
                             val point = event.changes.firstOrNull()?.position ?: continue
                             if (event.type == PointerEventType.Press && event.buttons.isPrimaryPressed) {
+                                if (isTextSelectionMode) {
+                                    logPdfChromeTap {
+                                        "page_press source=vertical_page page=${pageIndex + 1} " +
+                                            "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
+                                            "consumedBefore=${event.changes.any { it.isConsumed }} " +
+                                            "selectionActive=${currentTextSelection != null} " +
+                                            "selectionMenuOpen=${selectionMenuOffset != null} " +
+                                            "selectedTool=$selectedTool richText=$isRichTextMode"
+                                    }
+                                }
                                 val highlightHit = if (selectedTool != PdfInkTool.TEXT && selectedTool != PdfInkTool.ERASER) {
                                     currentAnnotations.asReversed().firstOrNull {
                                         it.isDesktopTextSelectionHighlight &&
@@ -252,6 +338,10 @@ internal fun DesktopVerticalPdfPage(
                                     null
                                 }
                                 if (highlightHit != null) {
+                                    logPdfChromeTap {
+                                        "page_press_consume source=vertical_page page=${pageIndex + 1} " +
+                                            "reason=text_selection_highlight annotation=${highlightHit.id}"
+                                    }
                                     onSelectPage(pageIndex)
                                     onAnnotationSelected(highlightHit)
                                     clearInteractionState()
@@ -261,6 +351,10 @@ internal fun DesktopVerticalPdfPage(
                                 if (selectedTool != PdfInkTool.TEXT) {
                                     val linkTarget = document.linkAt(pageIndex, point, pageCanvasSize)
                                     if (linkTarget != null) {
+                                        logPdfChromeTap {
+                                            "page_press_consume source=vertical_page page=${pageIndex + 1} " +
+                                                "reason=link target=${linkTarget.formatLogTarget()}"
+                                        }
                                         logPdfLink(
                                             "tap_hit mode=vertical page=${pageIndex + 1} " +
                                                 "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
@@ -277,6 +371,10 @@ internal fun DesktopVerticalPdfPage(
                                     it.sharedPdfEmbeddedHitTest(point, pageCanvasSize)
                                 }
                                 if (embeddedHit != null) {
+                                    logPdfChromeTap {
+                                        "page_press_consume source=vertical_page page=${pageIndex + 1} " +
+                                            "reason=embedded_annotation annotation=${embeddedHit.id}"
+                                    }
                                     onSelectPage(pageIndex)
                                     onEmbeddedAnnotationSelected(embeddedHit)
                                     clearInteractionState()
@@ -285,7 +383,16 @@ internal fun DesktopVerticalPdfPage(
                                     currentTextSelection != null &&
                                     selectionMenuOffset == null
                                 ) {
+                                    logPdfChromeTap {
+                                        "page_press_passthrough source=vertical_page page=${pageIndex + 1} " +
+                                            "action=clear_selection consumed=false"
+                                    }
                                     clearSelection()
+                                } else if (isTextSelectionMode) {
+                                    logPdfChromeTap {
+                                        "page_press_passthrough source=vertical_page page=${pageIndex + 1} " +
+                                            "action=none consumed=false"
+                                    }
                                 }
                             } else if (event.type == PointerEventType.Press && event.buttons.isSecondaryPressed) {
                                 val selection = currentTextSelection
@@ -304,33 +411,41 @@ internal fun DesktopVerticalPdfPage(
                         }
                     }
                 }
-                .pointerInput(pageIndex, pageCanvasSize, isTextSelectionMode, isRichTextMode) {
-                    if (isRichTextMode || !isTextSelectionMode) return@pointerInput
-                    detectTapGestures(
-                        onLongPress = { point ->
-                            val selection = document.wordSelectionAt(pageIndex, point, pageCanvasSize)
-                            if (selection != null) {
-                                onSelectPage(pageIndex)
-                                selectionStartIndex = null
-                                selectionEndIndex = null
-                                selectionStartHit = null
-                                selectionEndHit = null
-                                activeSelectionHandle = null
-                                textSelection = selection
-                                selectionMenuOffset = selection.menuAnchor(pageCanvasSize, point)
-                                logPdfSelection(
-                                    "long_press page=${pageIndex + 1} " +
-                                        "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
-                                        "range=${selection.startIndex}..${selection.endIndex} " +
-                                        "chars=${selection.text.length} " +
-                                        "text=\"${selection.text.logPreview()}\""
-                                )
-                            }
+                .pointerInput(pageIndex, displayPageIsCurrent, pageCanvasSize, isTextSelectionMode, isRichTextMode) {
+                    if (!displayPageIsCurrent || isRichTextMode || !isTextSelectionMode) return@pointerInput
+                    detectDesktopPdfTextSelectionLongPress(
+                        source = "vertical_page",
+                        pageIndex = pageIndex
+                    ) { point ->
+                        val selection = document.wordSelectionAt(pageIndex, point, pageCanvasSize)
+                        logPdfChromeTap {
+                            "long_press_selection source=vertical_page page=${pageIndex + 1} " +
+                                "selectionFound=${selection != null} " +
+                                "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()}"
                         }
-                    )
+                        if (selection != null) {
+                            onSelectPage(pageIndex)
+                            selectionStartIndex = null
+                            selectionEndIndex = null
+                            selectionStartHit = null
+                            selectionEndHit = null
+                            activeSelectionHandle = null
+                            textSelection = selection
+                            selectionMenuOffset = selection.menuAnchor(pageCanvasSize, point)
+                            logPdfSelection(
+                                "long_press page=${pageIndex + 1} " +
+                                    "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
+                                    "range=${selection.startIndex}..${selection.endIndex} " +
+                                    "chars=${selection.text.length} " +
+                                    "text=\"${selection.text.logPreview()}\""
+                            )
+                        }
+                    }
                 }
-                .pointerInput(pageIndex, selectedTool, isTextSelectionMode, isRichTextMode) {
-                    if (isRichTextMode || isTextSelectionMode || selectedTool != PdfInkTool.NONE) return@pointerInput
+                .pointerInput(pageIndex, displayPageIsCurrent, selectedTool, isTextSelectionMode, isRichTextMode) {
+                    if (!displayPageIsCurrent || isRichTextMode || isTextSelectionMode || selectedTool != PdfInkTool.NONE) {
+                        return@pointerInput
+                    }
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         if (!currentEvent.buttons.isPrimaryPressed) return@awaitEachGesture
@@ -371,9 +486,10 @@ internal fun DesktopVerticalPdfPage(
                     isRichTextMode,
                     pageCanvasSize,
                     renderedPageWidth,
-                    renderedPageHeight
+                    renderedPageHeight,
+                    displayPageIsCurrent
                 ) {
-                    if (renderedPageWidth > 0 && renderedPageHeight > 0) {
+                    if (displayPageIsCurrent && renderedPageWidth > 0 && renderedPageHeight > 0) {
                         if (isRichTextMode) return@pointerInput
                         if (isTextSelectionMode) {
                             var latestSelectionDragPoint: Offset? = null
@@ -638,8 +754,21 @@ internal fun DesktopVerticalPdfPage(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                renderedPage != null -> {
+                renderError != null && renderedPageIndex != pageIndex -> Text(
+                    renderError ?: readerString("desktop_failed_render_page", "Failed to render page."),
+                    color = MaterialTheme.colorScheme.error
+                )
+                renderedPage != null && desktopPdfRenderBelongsToPage(renderedPageIndex, pageIndex) -> {
+                    val currentRenderedPageIndex = renderedPageIndex!!
+                    Crossfade(
+                        targetState = currentRenderedPageIndex,
+                        animationSpec = tween(DesktopVerticalPdfPageTurnAnimationMillis),
+                        label = "DesktopVerticalPdfPage"
+                    ) { pageIndex ->
                     val pageRender = renderedPage!!
+                    val pageEmbeddedAnnotations = remember(document.embeddedAnnotations, pageIndex) {
+                        document.embeddedAnnotations.filter { it.pageIndex == pageIndex }
+                    }
                     val pageAnnotations = remember(annotations, pageIndex, pageCanvasSize) {
                         annotations
                             .filter { it.pageIndex == pageIndex }
@@ -806,6 +935,10 @@ internal fun DesktopVerticalPdfPage(
                                 .matchParentSize()
                                 .pointerInput(pageIndex, selectionMenuOffset) {
                                     detectTapGestures {
+                                        logPdfChromeTap {
+                                            "selection_menu_scrim_tap source=vertical_page page=${pageIndex + 1} " +
+                                                "consumedByScrim=true"
+                                        }
                                         clearSelection()
                                     }
                                 }
@@ -842,6 +975,7 @@ internal fun DesktopVerticalPdfPage(
                         showSearch = externalLookupAvailable,
                         onClear = ::clearSelection
                     )
+                    }
                 }
                 isRendering -> CircularProgressIndicator()
                 renderError != null -> Text(

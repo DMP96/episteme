@@ -271,6 +271,36 @@ class LocalFolderSyncEngineTest {
     }
 
     @Test
+    fun `disabled synced folder does not import files or metadata`() {
+        val existing = book(
+            id = "local_Book.pdf",
+            timestamp = 100L,
+            progress = 10f
+        )
+        val result = LocalFolderSyncEngine.syncFolder(
+            state = SharedReaderScreenState(
+                rawLibraryBooks = listOf(existing),
+                syncedFolders = listOf(syncedFolder().copy(localSyncEnabled = false))
+            ),
+            folder = syncedFolder().copy(localSyncEnabled = false),
+            files = listOf(scannedFile("New.pdf", "New.pdf")),
+            remoteMetadata = mapOf(
+                "local_Book.pdf" to metadata(
+                    id = "local_Book.pdf",
+                    progress = 80f,
+                    modified = 500L
+                )
+            ),
+            nowMillis = 1_000L
+        )
+
+        assertEquals(listOf(existing), result.state.rawLibraryBooks)
+        assertEquals(0, result.stats.newBooks)
+        assertEquals(0, result.stats.remoteMetadataUpdates)
+        assertTrue(result.removedBookIds.isEmpty())
+    }
+
+    @Test
     fun `metadata sidecar is skipped for clean unread folder books`() {
         assertNull(book(id = "local_Book.pdf", isRecent = false, progress = null).toSharedFolderBookMetadata())
         assertNotNull(book(id = "local_Book.pdf", isRecent = true).toSharedFolderBookMetadata())
@@ -302,6 +332,36 @@ class LocalFolderSyncEngineTest {
         assertEquals("desktop:2:320:320", metadata.lastPositionCfi)
         assertNull(metadata.locatorBlockIndex)
         assertNull(metadata.locatorCharOffset)
+        assertEquals(locator, restored.readerPosition)
+    }
+
+    @Test
+    fun `metadata sidecar preserves android block reader position`() {
+        val locator = ReaderLocator(
+            chapterIndex = 1,
+            pageIndex = 5,
+            blockIndex = 44,
+            charOffset = 120,
+            cfi = "android-locator:1:44:120"
+        )
+
+        val metadata = book(
+            id = "local_Book.epub",
+            type = FileType.EPUB,
+            progress = 37f,
+            readerPosition = locator
+        ).toSharedFolderBookMetadata() ?: error("Expected sidecar")
+        val restored = metadata.toBookItem(
+            file = scannedFile("Book.epub", "Book.epub"),
+            existing = null,
+            nowMillis = 2_000L
+        )
+
+        assertEquals(1, metadata.lastChapterIndex)
+        assertEquals(5, metadata.lastPage)
+        assertEquals("android-locator:1:44:120", metadata.lastPositionCfi)
+        assertEquals(44, metadata.locatorBlockIndex)
+        assertEquals(120, metadata.locatorCharOffset)
         assertEquals(locator, restored.readerPosition)
     }
 
@@ -451,6 +511,7 @@ class LocalFolderSyncEngineTest {
         sourceFolder: String = "C:/Library",
         timestamp: Long = 100L,
         title: String = "Book",
+        type: FileType = FileType.PDF,
         progress: Float? = null,
         isRecent: Boolean = false,
         fileSize: Long = 0L,
@@ -461,7 +522,7 @@ class LocalFolderSyncEngineTest {
         return BookItem(
             id = id,
             path = path,
-            type = FileType.PDF,
+            type = type,
             displayName = displayName,
             timestamp = timestamp,
             coverImagePath = coverImagePath,

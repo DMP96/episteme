@@ -1,6 +1,7 @@
 package com.aryan.reader.desktop
 
 import com.aryan.reader.shared.ReaderLocator
+import com.aryan.reader.shared.toStableReaderPositionCfi
 import com.aryan.reader.shared.ui.SharedNativeReaderLinkClick
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -46,7 +47,8 @@ internal data class DesktopEpubHandledLink(
 internal enum class DesktopReaderSelectionAction {
     DEFINE,
     SPEAK,
-    SEARCH
+    SEARCH,
+    PALETTE
 }
 
 internal enum class DesktopReaderKeyNavigation {
@@ -59,7 +61,10 @@ internal enum class DesktopReaderKeyNavigation {
     EXIT_FULLSCREEN
 }
 
-internal fun AwtKeyEvent.desktopReaderKeyNavigationOrNull(fullscreen: Boolean): DesktopReaderKeyNavigation? {
+internal fun AwtKeyEvent.desktopReaderKeyNavigationOrNull(
+    fullscreen: Boolean,
+    rightToLeftPagination: Boolean = false
+): DesktopReaderKeyNavigation? {
     if (id != AwtKeyEvent.KEY_PRESSED) return null
     if (fullscreen && keyCode == AwtKeyEvent.VK_ESCAPE) {
         return DesktopReaderKeyNavigation.EXIT_FULLSCREEN
@@ -71,9 +76,17 @@ internal fun AwtKeyEvent.desktopReaderKeyNavigationOrNull(fullscreen: Boolean): 
         return DesktopReaderKeyNavigation.NEXT_SEARCH
     }
     return when (keyCode) {
-        AwtKeyEvent.VK_RIGHT,
+        AwtKeyEvent.VK_RIGHT -> if (rightToLeftPagination) {
+            DesktopReaderKeyNavigation.PREVIOUS
+        } else {
+            DesktopReaderKeyNavigation.NEXT
+        }
+        AwtKeyEvent.VK_LEFT -> if (rightToLeftPagination) {
+            DesktopReaderKeyNavigation.NEXT
+        } else {
+            DesktopReaderKeyNavigation.PREVIOUS
+        }
         AwtKeyEvent.VK_PAGE_DOWN -> DesktopReaderKeyNavigation.NEXT
-        AwtKeyEvent.VK_LEFT,
         AwtKeyEvent.VK_PAGE_UP -> DesktopReaderKeyNavigation.PREVIOUS
         AwtKeyEvent.VK_HOME -> DesktopReaderKeyNavigation.FIRST
         AwtKeyEvent.VK_END -> DesktopReaderKeyNavigation.LAST
@@ -83,7 +96,8 @@ internal fun AwtKeyEvent.desktopReaderKeyNavigationOrNull(fullscreen: Boolean): 
 
 internal data class DesktopReaderSelectionActionPayload(
     val action: DesktopReaderSelectionAction,
-    val text: String
+    val text: String,
+    val locator: ReaderLocator? = null
 )
 
 internal fun String.readerHighlightClickOrNull(): DesktopReaderHighlightClick? {
@@ -128,9 +142,27 @@ internal fun String.readerSelectionActionOrNull(): DesktopReaderSelectionActionP
             "define" -> DesktopReaderSelectionAction.DEFINE
             "speak" -> DesktopReaderSelectionAction.SPEAK
             "web-search", "search" -> DesktopReaderSelectionAction.SEARCH
+            "palette" -> DesktopReaderSelectionAction.PALETTE
             else -> return@runCatching null
         }
-        DesktopReaderSelectionActionPayload(action, text)
+        val locator = obj["locator"]
+            ?.takeUnless { it is JsonNull }
+            ?.jsonObject
+            ?.let { locatorObj ->
+                ReaderLocator(
+                    chapterIndex = locatorObj["chapterIndex"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+                    chapterId = locatorObj["chapterId"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull,
+                    href = locatorObj["href"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull,
+                    pageIndex = locatorObj["pageIndex"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+                    startOffset = locatorObj["startOffset"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+                    endOffset = locatorObj["endOffset"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+                    blockIndex = locatorObj["blockIndex"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+                    charOffset = locatorObj["charOffset"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+                    textQuote = locatorObj["textQuote"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull,
+                    cfi = locatorObj["cfi"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull?.toStableReaderPositionCfi()
+                )
+            }
+        DesktopReaderSelectionActionPayload(action, text, locator)
     }.getOrNull()
 
     parse(this)?.let { return it }
@@ -181,11 +213,15 @@ internal fun String.readerPositionOrNull(): DesktopReaderPosition? {
             ?: return@runCatching null
         val locator = ReaderLocator(
             chapterIndex = obj["chapterIndex"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+            chapterId = obj["chapterId"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull,
+            href = obj["href"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull,
             pageIndex = pageIndex,
             startOffset = obj["startOffset"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
             endOffset = obj["endOffset"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+            blockIndex = obj["blockIndex"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
+            charOffset = obj["charOffset"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.intOrNull,
             textQuote = obj["textQuote"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull,
-            cfi = obj["cfi"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull
+            cfi = obj["cfi"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull?.toStableReaderPositionCfi()
         )
         DesktopReaderPosition(pageIndex, locator)
     }.getOrNull()
@@ -284,9 +320,7 @@ private fun String.readerHrefFromIntercept(): String? {
     val trimmed = trim()
     if (trimmed.isBlank()) return null
     if (trimmed.equals("about:blank", ignoreCase = true)) return null
-    if (trimmed.startsWith("file:///kcefbrowser/", ignoreCase = true)) return null
-    if (trimmed.startsWith("file:/kcefbrowser/", ignoreCase = true)) return null
-    if (trimmed.startsWith("file://", ignoreCase = true)) return null
+    if (trimmed.startsWith("file:/", ignoreCase = true)) return null
     if (trimmed.startsWith("about:blank#", ignoreCase = true)) return "#${trimmed.substringAfter('#')}"
     if (trimmed.startsWith("data:", ignoreCase = true)) return null
     if (trimmed.startsWith("blob:", ignoreCase = true)) return null
@@ -298,9 +332,13 @@ internal fun ReaderLocator.toReaderLocatorJson(): String {
         append("{")
         val values = buildList {
             chapterIndex?.let { add("\"chapterIndex\":$it") }
+            chapterId?.let { add("\"chapterId\":${it.toJsonStringLiteral()}") }
+            href?.let { add("\"href\":${it.toJsonStringLiteral()}") }
             pageIndex?.let { add("\"pageIndex\":$it") }
             startOffset?.let { add("\"startOffset\":$it") }
             endOffset?.let { add("\"endOffset\":$it") }
+            blockIndex?.let { add("\"blockIndex\":$it") }
+            charOffset?.let { add("\"charOffset\":$it") }
             cfi?.let { add("\"cfi\":${it.toJsonStringLiteral()}") }
             textQuote?.let { add("\"textQuote\":${it.toJsonStringLiteral()}") }
         }

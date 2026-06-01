@@ -165,6 +165,8 @@ class EpubAnnotationSerializerTest {
         val oldDesktopLocator = ReaderLocator.fromLegacy(cfi = "desktop:2:7:123456:abc")
         val timestampFallbackLocator = ReaderLocator.fromLegacy(cfi = "desktop:2:7:1780000000000")
         val rangedDesktopLocator = ReaderLocator.fromLegacy(cfi = "desktop:2:40:55")
+        val scrollWrappedDesktopLocator = ReaderLocator.fromLegacy(cfi = "desktop-scroll:5238:5238:desktop:2:40:55")
+        val androidLocator = ReaderLocator.fromLegacy(cfi = "android-locator:3:42:128")
 
         assertEquals(2, oldDesktopLocator.chapterIndex)
         assertEquals(7, oldDesktopLocator.pageIndex)
@@ -174,5 +176,26 @@ class EpubAnnotationSerializerTest {
         assertEquals(2, rangedDesktopLocator.chapterIndex)
         assertEquals(40, rangedDesktopLocator.startOffset)
         assertEquals(55, rangedDesktopLocator.endOffset)
+        assertEquals(2, scrollWrappedDesktopLocator.chapterIndex)
+        assertEquals(40, scrollWrappedDesktopLocator.startOffset)
+        assertEquals(55, scrollWrappedDesktopLocator.endOffset)
+        assertEquals("desktop:2:40:55", scrollWrappedDesktopLocator.cfi)
+        assertEquals(3, androidLocator.chapterIndex)
+        assertEquals(42, androidLocator.blockIndex)
+        assertEquals(128, androidLocator.charOffset)
+    }
+
+    @Test
+    fun `android locator with quote hydrates absolute text range for synced highlights`() {
+        val locator = ReaderLocator.fromLegacy(
+            cfi = "android-locator:3:42:128",
+            textQuote = "marked"
+        )
+
+        assertEquals(3, locator.chapterIndex)
+        assertEquals(42, locator.blockIndex)
+        assertEquals(128, locator.charOffset)
+        assertEquals(128, locator.startOffset)
+        assertEquals(134, locator.endOffset)
     }
 }

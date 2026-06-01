@@ -95,6 +95,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.NavigateBefore
+import androidx.compose.material.icons.automirrored.filled.NavigateNext
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
@@ -114,7 +116,6 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -213,6 +214,7 @@ import com.aryan.reader.AiDefinitionResult
 import com.aryan.reader.AiFeature
 import com.aryan.reader.AiHubBottomSheet
 import com.aryan.reader.BuildConfig
+import com.aryan.reader.COMIC_ARCHIVE_FILE_TYPES
 import com.aryan.reader.FileType
 import com.aryan.reader.HighlightColorPickerDialog
 import com.aryan.reader.MainViewModel
@@ -246,6 +248,7 @@ import com.aryan.reader.loadReaderBrightnessSettings
 import com.aryan.reader.loadReaderScreenOrientationMode
 import com.aryan.reader.loadReaderSliderToggled
 import com.aryan.reader.loadTtsReplacementPreferences
+import com.aryan.reader.logCloudAnnotationSyncTrace
 import com.aryan.reader.ml.SpeechBubble
 import com.aryan.reader.paginatedreader.TtsChunk
 import com.aryan.reader.pdf.data.AnnotationSettingsRepository
@@ -260,6 +263,7 @@ import com.aryan.reader.pdf.data.TextStyleConfig
 import com.aryan.reader.pdf.data.VirtualPage
 import com.aryan.reader.readerSliderBookmarkPosition
 import com.aryan.reader.readerSliderChromeColors
+import com.aryan.reader.readerSliderStepPage
 import com.aryan.reader.readerSliderToggleState
 import com.aryan.reader.rememberSearchState
 import com.aryan.reader.saveCustomThemes
@@ -273,11 +277,16 @@ import com.aryan.reader.scaledToCanvasLimit
 import com.aryan.reader.shared.ReaderTtsReplacementPreferences
 import com.aryan.reader.shared.pdf.PdfSpreadLayout
 import com.aryan.reader.shared.reader.ReaderSettings
+import com.aryan.reader.shared.ui.ReaderMinimalSlider
 import com.aryan.reader.shouldRenderReaderSlider
 import com.aryan.reader.summarizationUrl
+import com.aryan.reader.tts.ReaderTtsOverlaySize
 import com.aryan.reader.tts.SpeakerSamplePlayer
 import com.aryan.reader.tts.TtsPlaybackManager
+import com.aryan.reader.tts.loadReaderTtsOverlaySize
+import com.aryan.reader.tts.readerTtsOverlayAlignmentBias
 import com.aryan.reader.tts.rememberTtsController
+import com.aryan.reader.tts.saveReaderTtsOverlaySize
 import com.aryan.reader.tts.splitTextIntoChunks
 import com.aryan.reader.withTtsReplacements
 import io.legere.pdfiumandroid.suspend.PdfDocumentKt
@@ -387,23 +396,41 @@ fun PdfViewerScreen(
     var pendingActionAfterOcrSelection by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     var showCustomizeToolsSheet by remember { mutableStateOf(false) }
-    var hiddenTools by remember { mutableStateOf(loadPdfHiddenTools(context)) }
-    var toolOrder by remember { mutableStateOf(loadPdfToolOrder(context)) }
-    var bottomTools by remember { mutableStateOf(loadPdfBottomTools(context)) }
+    var hiddenToolNames by rememberSaveable {
+        mutableStateOf(loadPdfHiddenTools(context).toList())
+    }
+    var toolOrderNames by rememberSaveable {
+        mutableStateOf(loadPdfToolOrder(context).map { it.name })
+    }
+    var bottomToolNames by rememberSaveable {
+        mutableStateOf(loadPdfBottomTools(context).toList())
+    }
+    val hiddenTools = remember(hiddenToolNames) {
+        sanitizePdfHiddenToolNames(hiddenToolNames)
+    }
+    val toolOrder = remember(toolOrderNames) {
+        restorePdfToolOrderNames(toolOrderNames)
+    }
+    val bottomTools = remember(bottomToolNames) {
+        sanitizePdfBottomToolNames(bottomToolNames)
+    }
 
     val onUpdateHiddenTools = { newSet: Set<String> ->
-        hiddenTools = newSet
-        savePdfHiddenTools(context, newSet)
+        val sanitized = sanitizePdfHiddenToolNames(newSet)
+        hiddenToolNames = sanitized.toList()
+        savePdfHiddenTools(context, sanitized)
     }
 
     val onUpdateToolOrder = { newOrder: List<PdfReaderTool> ->
-        toolOrder = newOrder
-        savePdfToolOrder(context, newOrder)
+        val sanitized = restorePdfToolOrderNames(newOrder.map { it.name })
+        toolOrderNames = sanitized.map { it.name }
+        savePdfToolOrder(context, sanitized)
     }
 
     val onUpdateBottomTools = { newBottomTools: Set<String> ->
-        bottomTools = newBottomTools
-        savePdfBottomTools(context, newBottomTools)
+        val sanitized = sanitizePdfBottomToolNames(newBottomTools)
+        bottomToolNames = sanitized.toList()
+        savePdfBottomTools(context, sanitized)
     }
 
     val isOss = BuildConfig.FLAVOR == "oss"
@@ -427,7 +454,7 @@ fun PdfViewerScreen(
     val uiState by viewModel.uiState.collectAsState()
     val effectivePdfUri = uiState.selectedPdfUri ?: pdfUri
     val effectiveFileType = uiState.selectedFileType ?: FileType.PDF
-    val isComicFile = effectiveFileType == FileType.CBZ || effectiveFileType == FileType.CBR || effectiveFileType == FileType.CB7
+    val isComicFile = effectiveFileType in COMIC_ARCHIVE_FILE_TYPES
 
     var showNewTabSheet by remember { mutableStateOf(false) }
     var showFileInfoDialog by remember { mutableStateOf(false) }
@@ -477,7 +504,7 @@ fun PdfViewerScreen(
     var isAutoScrollTempPaused by remember { mutableStateOf(false) }
     val autoScrollResumeJob = remember { mutableStateOf<Job?>(null) }
     var isAutoScrollCollapsed by remember { mutableStateOf(false) }
-    var isTtsCollapsed by remember { mutableStateOf(false) }
+    var ttsOverlaySize by remember(context) { mutableStateOf(loadReaderTtsOverlaySize(context)) }
 
     var isMusicianMode by remember { mutableStateOf(loadPdfMusicianMode(context)) }
     var autoScrollUseSlider by remember { mutableStateOf(loadPdfAutoScrollUseSlider(context)) }
@@ -1339,22 +1366,50 @@ fun PdfViewerScreen(
                     saveMutex.withLock {
                         withContext(Dispatchers.IO) {
                             @Suppress("VariableNeverRead") var didSave = false
+                            var sidecarsSaved = false
 
                             if (canSaveSidecarsSnapshot) {
-                                if (force || annotsHash != lastSavedHashes[0]) {
+                                if (annotsHash != lastSavedHashes[0]) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.reader.save_ink book=$bookId force=$force oldHash=${lastSavedHashes[0]} " +
+                                            "newHash=$annotsHash pages=${annots.keys.sorted()} count=${annots.values.sumOf { it.size }}"
+                                    }
                                     annotationRepository.saveAnnotations(bookId, annots)
                                     lastSavedHashes[0] = annotsHash
                                     didSave = true
+                                    sidecarsSaved = true
+                                } else if (force) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.reader.save_ink_noop book=$bookId force=true hash=$annotsHash"
+                                    }
                                 }
-                                if (force || boxesHash != lastSavedHashes[1]) {
+                                if (boxesHash != lastSavedHashes[1]) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.reader.save_textboxes book=$bookId force=$force oldHash=${lastSavedHashes[1]} " +
+                                            "newHash=$boxesHash count=${boxes.size}"
+                                    }
                                     textBoxRepository.saveTextBoxes(bookId, boxes)
                                     lastSavedHashes[1] = boxesHash
                                     didSave = true
+                                    sidecarsSaved = true
+                                } else if (force) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.reader.save_textboxes_noop book=$bookId force=true hash=$boxesHash"
+                                    }
                                 }
-                                if (force || highlightsHash != lastSavedHashes[2]) {
+                                if (highlightsHash != lastSavedHashes[2]) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.reader.save_highlights book=$bookId force=$force oldHash=${lastSavedHashes[2]} " +
+                                            "newHash=$highlightsHash count=${highlights.size}"
+                                    }
                                     highlightRepository.saveHighlights(bookId, highlights)
                                     lastSavedHashes[2] = highlightsHash
                                     didSave = true
+                                    sidecarsSaved = true
+                                } else if (force) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.reader.save_highlights_noop book=$bookId force=true hash=$highlightsHash"
+                                    }
                                 }
                             } else {
                                 Timber.tag("PdfTabSync").d(
@@ -1384,9 +1439,53 @@ fun PdfViewerScreen(
                                 }
                                 lastSavedHashes[4] = page
                             }
+                            if (sidecarsSaved) {
+                                logCloudAnnotationSyncTrace {
+                                    "android.reader.sidecar_upload_queue book=$bookId force=$force"
+                                }
+                                viewModel.queuePdfSidecarCloudUpload(bookId)
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    val persistInkAnnotationsNow = remember(currentBookId, annotationRepository) {
+        { annotationsSnapshot: Map<Int, List<PdfAnnotation>>, deletedAnnotations: Collection<PdfAnnotation>, reason: String ->
+            val bookIdSnapshot = currentBookId
+            val loadedSidecarBookIdSnapshot = currentLoadedSidecarBookId
+            val canSaveSidecarsSnapshot = canUsePdfSidecarsForBook(
+                bookIdSnapshot,
+                loadedSidecarBookIdSnapshot,
+                currentAreAnnotationsLoaded
+            )
+            viewModel.viewModelScope.launch {
+                val bookId = bookIdSnapshot ?: return@launch
+                if (!canSaveSidecarsSnapshot) {
+                    logCloudAnnotationSyncTrace {
+                        "android.reader.persist_ink_skip book=$bookId reason=$reason loadedSidecarBook=$loadedSidecarBookIdSnapshot"
+                    }
+                    return@launch
+                }
+                val deletedIds = deletedAnnotations.mapNotNull { it.id.takeIf(String::isNotBlank) }.toSet()
+                withContext(NonCancellable) {
+                    saveMutex.withLock {
+                        withContext(Dispatchers.IO) {
+                            if (deletedIds.isNotEmpty()) {
+                                annotationRepository.markAnnotationsDeleted(bookId, deletedIds)
+                            }
+                            annotationRepository.saveAnnotations(bookId, annotationsSnapshot)
+                            lastSavedHashes[0] = annotationsSnapshot.hashCode()
+                        }
+                    }
+                }
+                logCloudAnnotationSyncTrace {
+                    "android.reader.persist_ink book=$bookId reason=$reason count=${annotationsSnapshot.values.sumOf { it.size }} " +
+                        "deletedIds=${deletedIds.sorted()}"
+                }
+                viewModel.queuePdfSidecarCloudUpload(bookId)
             }
         }
     }
@@ -2477,8 +2576,16 @@ fun PdfViewerScreen(
         allAnnotations = loaded
         textBoxes.addAll(loadedBoxes)
         userHighlights.addAll(loadedHighlights)
+        lastSavedHashes[0] = loaded.hashCode()
+        lastSavedHashes[1] = loadedBoxes.hashCode()
+        lastSavedHashes[2] = loadedHighlights.hashCode()
         loadedSidecarBookId = loadingBookId
         areAnnotationsLoaded = true
+        logCloudAnnotationSyncTrace {
+            "android.reader.sidecar_load book=$loadingBookId inkPages=${loaded.keys.sorted()} " +
+                "inkCount=${loaded.values.sumOf { it.size }} textBoxes=${loadedBoxes.size} " +
+                "highlights=${loadedHighlights.size} hashes=${lastSavedHashes.copyOfRange(0, 3).joinToString()}"
+        }
         Timber.tag(PDF_BLANK_PAGE_PERSISTENCE_TAG).i(
             "ui.sidecarLoad.done bookId=$loadingBookId annotationPages=${loaded.keys.sorted()} " +
                 "textBoxes=${loadedBoxes.size} highlights=${loadedHighlights.size}"
@@ -2646,7 +2753,6 @@ fun PdfViewerScreen(
     var sliderCurrentPage by remember { mutableFloatStateOf(0f) }
     var isFastScrubbing by remember { mutableStateOf(false) }
     val scrubDebounceJob = remember { mutableStateOf<Job?>(null) }
-    var startPageThumbnail by remember { mutableStateOf<Bitmap?>(null) }
     val pdfSliderChromeVisible = shouldRenderReaderSlider(
         isToggledOn = isPageSliderVisible,
         isBottomChromeVisible = showStandardBars,
@@ -3339,23 +3445,6 @@ fun PdfViewerScreen(
             val position = readerSliderBookmarkPosition(currentPage)
             sliderStartPage = position.startPage
             sliderCurrentPage = position.currentPage
-        }
-    }
-
-    LaunchedEffect(pdfSliderChromeVisible, sliderStartPage, pdfDocument, totalPages) {
-        startPageThumbnail?.recycle()
-        startPageThumbnail = null
-        if (pdfSliderChromeVisible) {
-            val doc = pdfDocument
-            if (doc != null && totalPages > 0) {
-                Timber.d("Slider visible. Rendering thumbnail for page $sliderStartPage")
-                startPageThumbnail = renderPageToBitmap(doc, sliderStartPage)
-                Timber.d(
-                    "Thumbnail rendering complete. Is bitmap null: ${startPageThumbnail == null}"
-                )
-            }
-        } else {
-            Timber.d("Slider hidden. Clearing thumbnail.")
         }
     }
 
@@ -5084,8 +5173,14 @@ fun PdfViewerScreen(
                                                         val pageIdx = finalAnnotation.pageIndex
                                                         val existing =
                                                             allAnnotations[pageIdx] ?: emptyList()
-                                                        allAnnotations =
+                                                        val nextAnnotations =
                                                             allAnnotations + (pageIdx to (existing + finalAnnotation))
+                                                        allAnnotations = nextAnnotations
+                                                        persistInkAnnotationsNow(
+                                                            nextAnnotations,
+                                                            emptyList(),
+                                                            "draw_end"
+                                                        )
                                                         undoStack.add(
                                                             HistoryAction.Add(
                                                                 pageIdx, finalAnnotation
@@ -5099,6 +5194,11 @@ fun PdfViewerScreen(
                                                             erasedAnnotationsFromStroke.mapValues {
                                                                 it.value.toList()
                                                             }
+                                                        persistInkAnnotationsNow(
+                                                            allAnnotations,
+                                                            removalMap.values.flatten(),
+                                                            "erase_end"
+                                                        )
                                                         undoStack.add(
                                                             HistoryAction.Remove(removalMap)
                                                         )
@@ -5559,8 +5659,14 @@ fun PdfViewerScreen(
                                                     val pageIdx = finalAnnotation.pageIndex
                                                     val existing =
                                                         allAnnotations[pageIdx] ?: emptyList()
-                                                    allAnnotations =
+                                                    val nextAnnotations =
                                                         allAnnotations + (pageIdx to (existing + finalAnnotation))
+                                                    allAnnotations = nextAnnotations
+                                                    persistInkAnnotationsNow(
+                                                        nextAnnotations,
+                                                        emptyList(),
+                                                        "draw_end"
+                                                    )
                                                     undoStack.add(
                                                         HistoryAction.Add(
                                                             pageIdx, finalAnnotation
@@ -5574,6 +5680,11 @@ fun PdfViewerScreen(
                                                         erasedAnnotationsFromStroke.mapValues {
                                                             it.value.toList()
                                                         }
+                                                    persistInkAnnotationsNow(
+                                                        allAnnotations,
+                                                        removalMap.values.flatten(),
+                                                        "erase_end"
+                                                    )
                                                     undoStack.add(
                                                         HistoryAction.Remove(removalMap)
                                                     )
@@ -5916,6 +6027,42 @@ fun PdfViewerScreen(
                     pageText = pdfSliderPageText,
                     themePrimary = MaterialTheme.colorScheme.primary
                 )
+                val pdfSliderMaxPage = (totalDisplayPages - 1).coerceAtLeast(0)
+                val pdfSliderCurrentPage = sliderCurrentPage.roundToInt().coerceIn(0, pdfSliderMaxPage)
+
+                suspend fun scrollPdfSliderToPage(pageIndex: Int) {
+                    val targetPage = pageIndex.coerceIn(0, pdfSliderMaxPage)
+                    if (displayMode == DisplayMode.PAGINATION) {
+                        scrollPaginationToDisplayPage(targetPage)
+                    } else {
+                        verticalReaderState.scrollToPage(targetPage)
+                    }
+                }
+
+                fun jumpPdfSliderToPage(pageIndex: Int) {
+                    val targetPage = pageIndex.coerceIn(0, pdfSliderMaxPage)
+                    scrubDebounceJob.value?.cancel()
+                    sliderCurrentPage = targetPage.toFloat()
+                    isFastScrubbing = false
+                    coroutineScope.launch {
+                        scrollPdfSliderToPage(targetPage)
+                    }
+                }
+
+                fun scrubPdfSliderToPage(newValue: Float) {
+                    sliderCurrentPage = newValue.coerceIn(0f, pdfSliderMaxPage.toFloat())
+                    isFastScrubbing = true
+                    scrubDebounceJob.value?.cancel()
+                    scrubDebounceJob.value = coroutineScope.launch {
+                        delay(200)
+                        if (isActive) {
+                            val targetPage = newValue.roundToInt().coerceIn(0, pdfSliderMaxPage)
+                            scrollPdfSliderToPage(targetPage)
+                            sliderCurrentPage = targetPage.toFloat()
+                            isFastScrubbing = false
+                        }
+                    }
+                }
 
                 // --- Slider UI attached to the bottom chrome ---
                 AnimatedVisibility(
@@ -5926,144 +6073,79 @@ fun PdfViewerScreen(
                         .align(Alignment.BottomCenter)
                         .padding(bottom = pdfSliderBottomPadding)
                 ) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Spacer(Modifier.height(72.dp))
-                        Box(
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() }
+                            ) {}
+                    ) {
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable(
-                                    indication = null,
-                                    interactionSource = remember { MutableInteractionSource() }
-                                ) {}
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 32.dp, vertical = 14.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(16.dp)
-                            ) {
-                                BoxWithConstraints(
-                                    modifier = Modifier.weight(1f),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Slider(
-                                        value = sliderCurrentPage,
-                                        onValueChange = { newValue ->
-                                            sliderCurrentPage = newValue
-                                            isFastScrubbing = true
-                                            scrubDebounceJob.value?.cancel()
-                                            scrubDebounceJob.value = coroutineScope.launch {
-                                                delay(200)
-                                                if (isActive) {
-                                                    val targetPage = newValue.roundToInt()
-                                                    if (displayMode == DisplayMode.PAGINATION) {
-                                                        scrollPaginationToDisplayPage(targetPage)
-                                                    } else {
-                                                        verticalReaderState.scrollToPage(targetPage)
-                                                    }
-                                                    isFastScrubbing = false
-                                                }
-                                            }
-                                        },
-                                        valueRange = 0f..(totalDisplayPages - 1).toFloat().coerceAtLeast(0f),
-                                        steps = if (totalDisplayPages > 2) totalDisplayPages - 2 else 0,
-                                        modifier = Modifier.fillMaxWidth(),
-                                        thumb = {
-                                            Surface(
-                                                modifier = Modifier.size(20.dp),
-                                                shape = CircleShape,
-                                                color = pdfReaderSliderColors.thumbColor,
-                                                tonalElevation = 0.dp,
-                                                shadowElevation = 0.dp
-                                            ) {}
-                                        },
-                                        track = { sliderState ->
-                                            val trackHeight = 2.dp
-                                            val trackShape = RoundedCornerShape(trackHeight)
-                                            val range = sliderState.valueRange.endInclusive - sliderState.valueRange.start
-                                            val fraction = if (range == 0f) 0f else {
-                                                ((sliderState.value - sliderState.valueRange.start) / range).coerceIn(0f, 1f)
-                                            }
-
-                                            Box(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .height(trackHeight)
-                                                    .background(
-                                                        color = pdfReaderSliderColors.inactiveTrackColor,
-                                                        shape = trackShape
-                                                    )
-                                            ) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth(fraction)
-                                                        .fillMaxHeight()
-                                                        .background(
-                                                            color = pdfReaderSliderColors.activeTrackColor,
-                                                            shape = trackShape
-                                                        )
-                                                )
-                                            }
-                                        }
-                                    )
-
-                                    val startPageOffsetFraction = if (totalDisplayPages > 1) {
-                                        sliderStartPage.toFloat() / (totalDisplayPages - 1)
-                                    } else {
-                                        0f
-                                    }
-                                    val thumbWidth = 20.dp
-                                    val trackWidth = maxWidth - thumbWidth
-                                    val startPagePixelPosition =
-                                        (trackWidth * startPageOffsetFraction) + (thumbWidth / 2)
-
-                                    val indicatorSize = 8.dp
-                                    val indicatorOffset = startPagePixelPosition - (indicatorSize / 2)
-                                    Surface(
-                                        modifier = Modifier
-                                            .align(Alignment.CenterStart)
-                                            .offset(x = indicatorOffset)
-                                            .size(indicatorSize),
-                                        shape = CircleShape,
-                                        color = pdfReaderSliderColors.bookmarkColor
-                                    ) {}
-
-                                    startPageThumbnail?.let { thumbnail ->
-                                        ThumbnailWithIndicator(
-                                            thumbnail = thumbnail,
-                                            borderColor = pdfReaderSliderColors.bookmarkColor,
-                                            modifier = Modifier
-                                                .graphicsLayer { clip = false }
-                                                .align(Alignment.TopStart)
-                                                .offset(
-                                                    x = startPagePixelPosition - (45.dp / 2),
-                                                    y = (-72).dp
-                                                ),
-                                            onClick = {
-                                                sliderCurrentPage = sliderStartPage.toFloat()
-                                                coroutineScope.launch {
-                                                    if (displayMode == DisplayMode.PAGINATION) {
-                                                        scrollPaginationToDisplayPage(sliderStartPage)
-                                                    } else {
-                                                        verticalReaderState.scrollToPage(sliderStartPage)
-                                                    }
-                                                }
-                                            }
+                            IconButton(
+                                onClick = {
+                                    jumpPdfSliderToPage(
+                                        readerSliderStepPage(
+                                            currentPage = pdfSliderCurrentPage,
+                                            delta = -1,
+                                            minPage = 0,
+                                            maxPage = pdfSliderMaxPage
                                         )
-                                    }
-                                }
+                                    )
+                                },
+                                enabled = pdfSliderCurrentPage > 0,
+                                modifier = Modifier.size(40.dp)
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.NavigateBefore,
+                                    contentDescription = stringResource(R.string.desktop_previous_page),
+                                    tint = pdfReaderSliderColors.contentColor.copy(
+                                        alpha = if (pdfSliderCurrentPage > 0) 0.9f else 0.32f
+                                    )
+                                )
+                            }
 
-                                Text(
-                                    text = pdfPageRangeText(
-                                        pageIndex = sliderCurrentPage.roundToInt(),
-                                        pageCount = totalDisplayPages,
-                                        displayMode = displayMode,
-                                        settings = pdfSpreadSettings
-                                    ),
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = pdfReaderSliderColors.contentColor,
-                                    fontSize = 18.sp
+                            ReaderMinimalSlider(
+                                value = sliderCurrentPage.coerceIn(0f, pdfSliderMaxPage.toFloat()),
+                                onValueChange = ::scrubPdfSliderToPage,
+                                valueRange = 0f..pdfSliderMaxPage.toFloat(),
+                                enabled = pdfSliderMaxPage > 0,
+                                activeColor = pdfReaderSliderColors.activeTrackColor,
+                                inactiveColor = pdfReaderSliderColors.inactiveTrackColor,
+                                thumbColor = pdfReaderSliderColors.thumbColor,
+                                markerValue = sliderStartPage.toFloat(),
+                                markerColor = pdfReaderSliderColors.bookmarkColor,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(32.dp)
+                            )
+
+                            IconButton(
+                                onClick = {
+                                    jumpPdfSliderToPage(
+                                        readerSliderStepPage(
+                                            currentPage = pdfSliderCurrentPage,
+                                            delta = 1,
+                                            minPage = 0,
+                                            maxPage = pdfSliderMaxPage
+                                        )
+                                    )
+                                },
+                                enabled = pdfSliderCurrentPage < pdfSliderMaxPage,
+                                modifier = Modifier.size(40.dp)
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.NavigateNext,
+                                    contentDescription = stringResource(R.string.desktop_next_page),
+                                    tint = pdfReaderSliderColors.contentColor.copy(
+                                        alpha = if (pdfSliderCurrentPage < pdfSliderMaxPage) 0.9f else 0.32f
+                                    )
                                 )
                             }
                         }
@@ -7199,7 +7281,7 @@ fun PdfViewerScreen(
                 )
 
                 val ttsAlignmentBias by animateFloatAsState(
-                    targetValue = if (isTtsCollapsed) 1f else 0f,
+                    targetValue = readerTtsOverlayAlignmentBias(ttsOverlaySize),
                     label = "TtsAlignAnimation"
                 )
 
@@ -7216,8 +7298,11 @@ fun PdfViewerScreen(
                         ttsController = ttsController,
                         ttsState = ttsState,
                         currentTtsMode = currentTtsMode,
-                        isCollapsed = isTtsCollapsed,
-                        onCollapseChange = { isTtsCollapsed = it },
+                        overlaySize = ttsOverlaySize,
+                        onOverlaySizeChange = { newSize ->
+                            ttsOverlaySize = newSize
+                            saveReaderTtsOverlaySize(context, newSize)
+                        },
                         onLocateCurrentChunk = {
                             ttsDisplayPageIndex?.let { targetPage ->
                                 coroutineScope.launch {

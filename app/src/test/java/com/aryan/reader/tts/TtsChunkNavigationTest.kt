@@ -60,6 +60,13 @@ class TtsChunkNavigationTest {
         assertEquals(true, shouldStartTtsTransitionPrefetch(currentGeneration = 6, deferredGeneration = -1))
     }
 
+    @Test
+    fun `prefetch stops only when generated chunk is neither loaded nor queued`() {
+        assertEquals(true, shouldStopTtsPrefetchAfterMissingChunk(isLoaded = false, playlistIndex = null))
+        assertEquals(false, shouldStopTtsPrefetchAfterMissingChunk(isLoaded = true, playlistIndex = null))
+        assertEquals(false, shouldStopTtsPrefetchAfterMissingChunk(isLoaded = false, playlistIndex = 2))
+    }
+
     @androidx.annotation.OptIn(UnstableApi::class)
     @Test
     fun `reader tts mini bar is visible only for active reader playback outside reader routes`() {
@@ -88,6 +95,45 @@ class TtsChunkNavigationTest {
     fun `reader tts mini bar clears main bottom navigation`() {
         assertEquals(96, readerTtsMiniBarBottomPaddingDp(isOnMainRoute = true))
         assertEquals(16, readerTtsMiniBarBottomPaddingDp(isOnMainRoute = false))
+    }
+
+    @Test
+    fun `reader tts overlay size exposes the other two sizes as choices`() {
+        assertEquals(
+            listOf(ReaderTtsOverlaySize.MEDIUM, ReaderTtsOverlaySize.SMALL),
+            readerTtsOverlayAlternativeSizes(ReaderTtsOverlaySize.LARGE)
+        )
+        assertEquals(
+            listOf(ReaderTtsOverlaySize.LARGE, ReaderTtsOverlaySize.SMALL),
+            readerTtsOverlayAlternativeSizes(ReaderTtsOverlaySize.MEDIUM)
+        )
+        assertEquals(
+            listOf(ReaderTtsOverlaySize.LARGE, ReaderTtsOverlaySize.MEDIUM),
+            readerTtsOverlayAlternativeSizes(ReaderTtsOverlaySize.SMALL)
+        )
+    }
+
+    @Test
+    fun `reader tts overlay stored size defaults to large for missing or invalid values`() {
+        assertEquals(ReaderTtsOverlaySize.MEDIUM, resolveReaderTtsOverlaySize("MEDIUM"))
+        assertEquals(ReaderTtsOverlaySize.LARGE, resolveReaderTtsOverlaySize(null))
+        assertEquals(ReaderTtsOverlaySize.LARGE, resolveReaderTtsOverlaySize("FULL"))
+    }
+
+    @Test
+    fun `reader tts overlay only aligns small state to the trailing edge`() {
+        assertEquals(0f, readerTtsOverlayAlignmentBias(ReaderTtsOverlaySize.LARGE), 0f)
+        assertEquals(0f, readerTtsOverlayAlignmentBias(ReaderTtsOverlaySize.MEDIUM), 0f)
+        assertEquals(1f, readerTtsOverlayAlignmentBias(ReaderTtsOverlaySize.SMALL), 0f)
+    }
+
+    @Test
+    fun `reader tts chunk label uses one based progress`() {
+        assertEquals("Chunk 1/4", formatReaderTtsChunkLabel(currentChunkIndex = 0, totalChunks = 4))
+        assertEquals("Chunk 4/4", formatReaderTtsChunkLabel(currentChunkIndex = 3, totalChunks = 4))
+        assertNull(formatReaderTtsChunkLabel(currentChunkIndex = -1, totalChunks = 4))
+        assertNull(formatReaderTtsChunkLabel(currentChunkIndex = 4, totalChunks = 4))
+        assertNull(formatReaderTtsChunkLabel(currentChunkIndex = 0, totalChunks = 0))
     }
 
     @Test

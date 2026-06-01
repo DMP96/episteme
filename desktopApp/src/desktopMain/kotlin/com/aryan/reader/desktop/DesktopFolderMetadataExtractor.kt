@@ -59,6 +59,16 @@ object DesktopFolderMetadataExtractor {
         return enrichBooks(books) { book -> book.sourceFolder == sourceFolder }
     }
 
+    fun enrichFolderBooks(
+        books: List<BookItem>,
+        sourceFolders: Set<String>
+    ): DesktopFolderMetadataExtractionResult {
+        if (sourceFolders.isEmpty()) {
+            return DesktopFolderMetadataExtractionResult(books)
+        }
+        return enrichBooks(books) { book -> book.sourceFolder in sourceFolders }
+    }
+
     fun enrichImportedBooks(
         books: List<BookItem>,
         importedBookIds: Set<String>
@@ -465,7 +475,7 @@ object DesktopFolderMetadataExtractor {
         return when (type) {
             FileType.PDF -> Color(156, 65, 70)
             FileType.EPUB -> Color(0, 108, 76)
-            FileType.CBZ, FileType.CBR, FileType.CB7 -> Color(112, 93, 73)
+            FileType.CBZ, FileType.CBR, FileType.CB7, FileType.CBT -> Color(112, 93, 73)
             FileType.MD -> Color(83, 101, 120)
             FileType.HTML -> Color(122, 87, 42)
             FileType.TXT -> Color(74, 92, 112)

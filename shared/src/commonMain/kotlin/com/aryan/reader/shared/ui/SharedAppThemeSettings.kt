@@ -6,7 +6,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -49,6 +48,7 @@ import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,6 +64,9 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.TextRange
@@ -267,112 +270,29 @@ fun SharedAppThemeSettingsDialog(
     onCustomThemeDeleted: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var showCreateDialog by remember { mutableStateOf(false) }
-    val defaultCustomThemeName = readerString("desktop_custom_theme_default", "Custom")
-
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(readerString("app_theme_title", "App theme"), fontWeight = FontWeight.Bold) },
         text = {
-            Column(
+            SharedAppThemeControls(
+                appThemeMode = appThemeMode,
+                appContrastOption = appContrastOption,
+                appTextDimFactorLight = appTextDimFactorLight,
+                appTextDimFactorDark = appTextDimFactorDark,
+                appSeedColor = appSeedColor,
+                customAppThemes = customAppThemes,
+                onThemeModeChanged = onThemeModeChanged,
+                onContrastOptionChanged = onContrastOptionChanged,
+                onTextDimFactorLightChanged = onTextDimFactorLightChanged,
+                onTextDimFactorDarkChanged = onTextDimFactorDarkChanged,
+                onSeedColorChanged = onSeedColorChanged,
+                onCustomThemeAdded = onCustomThemeAdded,
+                onCustomThemeDeleted = onCustomThemeDeleted,
                 modifier = Modifier
                     .widthIn(max = 620.dp)
                     .heightIn(max = 620.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                SettingsLabel(readerString("app_theme_appearance", "Appearance"))
-                SegmentedControl(
-                    values = AppThemeMode.entries,
-                    selectedValue = appThemeMode,
-                    label = { it.localizedLabel() },
-                    onValueSelected = onThemeModeChanged
-                )
-
-                SettingsLabel(readerString("app_theme_contrast", "Contrast"))
-                SegmentedControl(
-                    values = AppContrastOption.entries,
-                    selectedValue = appContrastOption,
-                    label = { it.localizedLabel() },
-                    onValueSelected = onContrastOptionChanged
-                )
-
-                if (appThemeMode == AppThemeMode.SYSTEM) {
-                    TextBrightnessSlider(
-                        label = readerString("app_theme_text_brightness_light", "Text brightness (Light)"),
-                        value = appTextDimFactorLight,
-                        onValueChange = onTextDimFactorLightChanged
-                    )
-                    TextBrightnessSlider(
-                        label = readerString("app_theme_text_brightness_dark", "Text brightness (Dark)"),
-                        value = appTextDimFactorDark,
-                        onValueChange = onTextDimFactorDarkChanged
-                    )
-                } else {
-                    TextBrightnessSlider(
-                        label = readerString("app_theme_text_brightness", "Text brightness"),
-                        value = if (appThemeMode == AppThemeMode.DARK) appTextDimFactorDark else appTextDimFactorLight,
-                        onValueChange = if (appThemeMode == AppThemeMode.DARK) onTextDimFactorDarkChanged else onTextDimFactorLightChanged
-                    )
-                }
-
-                SettingsLabel(readerString("app_theme_color_scheme", "Color scheme"))
-                Row(
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    ThemeSwatch(
-                        color = MaterialTheme.colorScheme.primary,
-                        selected = appSeedColor == null,
-                        label = readerString("app_theme_dynamic", "Dynamic"),
-                        onClick = { onSeedColorChanged(null) }
-                    )
-                    AppThemePresets.forEach { preset ->
-                        ThemeSwatch(
-                            color = preset.color,
-                            selected = appSeedColor == preset.color,
-                            label = readerString(preset.nameKey, preset.nameFallback),
-                            onClick = { onSeedColorChanged(preset.color) }
-                        )
-                    }
-                }
-
-                HorizontalDivider()
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    SettingsLabel(readerString("theme_my_themes", "My themes"))
-                    IconButton(onClick = { showCreateDialog = true }, modifier = Modifier.size(32.dp)) {
-                        Icon(Icons.Default.Add, contentDescription = readerString("content_desc_add_custom_theme", "Add custom theme"))
-                    }
-                }
-
-                if (customAppThemes.isEmpty()) {
-                    Text(
-                        readerString("desktop_no_custom_themes_yet", "No custom themes yet"),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        customAppThemes.forEach { theme ->
-                            ThemeSwatch(
-                                color = theme.seedColor,
-                                selected = appSeedColor == theme.seedColor,
-                                label = theme.name,
-                                onClick = { onSeedColorChanged(theme.seedColor) },
-                                onDelete = { onCustomThemeDeleted(theme.id) }
-                            )
-                        }
-                    }
-                }
-            }
+                    .verticalScroll(rememberScrollState())
+            )
         },
         confirmButton = {
             TextButton(onClick = onDismiss) {
@@ -380,6 +300,124 @@ fun SharedAppThemeSettingsDialog(
             }
         }
     )
+}
+
+@Composable
+fun SharedAppThemeControls(
+    appThemeMode: AppThemeMode,
+    appContrastOption: AppContrastOption,
+    appTextDimFactorLight: Float,
+    appTextDimFactorDark: Float,
+    appSeedColor: Color?,
+    customAppThemes: List<CustomAppTheme>,
+    onThemeModeChanged: (AppThemeMode) -> Unit,
+    onContrastOptionChanged: (AppContrastOption) -> Unit,
+    onTextDimFactorLightChanged: (Float) -> Unit,
+    onTextDimFactorDarkChanged: (Float) -> Unit,
+    onSeedColorChanged: (Color?) -> Unit,
+    onCustomThemeAdded: (CustomAppTheme) -> Unit,
+    onCustomThemeDeleted: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var showCreateDialog by remember { mutableStateOf(false) }
+    val defaultCustomThemeName = readerString("desktop_custom_theme_default", "Custom")
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        SettingsLabel(readerString("app_theme_appearance", "Appearance"))
+        SegmentedControl(
+            values = AppThemeMode.entries,
+            selectedValue = appThemeMode,
+            label = { it.localizedLabel() },
+            onValueSelected = onThemeModeChanged
+        )
+
+        SettingsLabel(readerString("app_theme_contrast", "Contrast"))
+        SegmentedControl(
+            values = AppContrastOption.entries,
+            selectedValue = appContrastOption,
+            label = { it.localizedLabel() },
+            onValueSelected = onContrastOptionChanged
+        )
+
+        if (appThemeMode == AppThemeMode.SYSTEM) {
+            TextBrightnessSlider(
+                label = readerString("app_theme_text_brightness_light", "Text brightness (Light)"),
+                value = appTextDimFactorLight,
+                onValueChange = onTextDimFactorLightChanged
+            )
+            TextBrightnessSlider(
+                label = readerString("app_theme_text_brightness_dark", "Text brightness (Dark)"),
+                value = appTextDimFactorDark,
+                onValueChange = onTextDimFactorDarkChanged
+            )
+        } else {
+            TextBrightnessSlider(
+                label = readerString("app_theme_text_brightness", "Text brightness"),
+                value = if (appThemeMode == AppThemeMode.DARK) appTextDimFactorDark else appTextDimFactorLight,
+                onValueChange = if (appThemeMode == AppThemeMode.DARK) onTextDimFactorDarkChanged else onTextDimFactorLightChanged
+            )
+        }
+
+        SettingsLabel(readerString("app_theme_color_scheme", "Color scheme"))
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            ThemeSwatch(
+                color = MaterialTheme.colorScheme.primary,
+                selected = appSeedColor == null,
+                label = readerString("app_theme_dynamic", "Dynamic"),
+                onClick = { onSeedColorChanged(null) }
+            )
+            AppThemePresets.forEach { preset ->
+                ThemeSwatch(
+                    color = preset.color,
+                    selected = appSeedColor == preset.color,
+                    label = readerString(preset.nameKey, preset.nameFallback),
+                    onClick = { onSeedColorChanged(preset.color) }
+                )
+            }
+        }
+
+        HorizontalDivider()
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SettingsLabel(readerString("theme_my_themes", "My themes"))
+            IconButton(onClick = { showCreateDialog = true }, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.Add, contentDescription = readerString("content_desc_add_custom_theme", "Add custom theme"))
+            }
+        }
+
+        if (customAppThemes.isEmpty()) {
+            Text(
+                readerString("desktop_no_custom_themes_yet", "No custom themes yet"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                customAppThemes.forEach { theme ->
+                    ThemeSwatch(
+                        color = theme.seedColor,
+                        selected = appSeedColor == theme.seedColor,
+                        label = theme.name,
+                        onClick = { onSeedColorChanged(theme.seedColor) },
+                        onDelete = { onCustomThemeDeleted(theme.id) }
+                    )
+                }
+            }
+        }
+    }
 
     if (showCreateDialog) {
         SharedCreateAppThemeDialog(
@@ -656,10 +694,18 @@ fun SharedHsvColorPickerDialog(
     onDismiss: () -> Unit,
     onSave: (Color) -> Unit,
     modifier: Modifier = Modifier,
+    resetColor: Color? = null,
+    stateKey: Any? = null,
+    onLiveColorChange: (Color) -> Unit = {},
     preview: @Composable (Color) -> Unit = {}
 ) {
-    var hsv by remember(initialColor) { mutableStateOf(initialColor.toSharedHsvColor()) }
+    val effectiveStateKey = stateKey ?: initialColor
+    var hsv by remember(effectiveStateKey) { mutableStateOf(initialColor.toSharedHsvColor()) }
     val color = hsv.toComposeColor()
+
+    LaunchedEffect(effectiveStateKey, color) {
+        onLiveColorChange(color)
+    }
 
     fun updateFromColor(nextColor: Color) {
         hsv = nextColor.toSharedHsvColor()
@@ -709,7 +755,8 @@ fun SharedHsvColorPickerDialog(
                         onHueSatChanged = { hue, saturation ->
                             hsv = hsv.copy(hue = hue, saturation = saturation)
                         },
-                        modifier = Modifier.size(240.dp)
+                        modifier = Modifier.size(240.dp),
+                        gestureKey = effectiveStateKey
                     )
 
                     SharedBrightnessSlider(
@@ -717,7 +764,8 @@ fun SharedHsvColorPickerDialog(
                         saturation = hsv.saturation,
                         value = hsv.value,
                         onValueChanged = { hsv = hsv.copy(value = it) },
-                        modifier = Modifier.fillMaxWidth().height(24.dp).clip(RoundedCornerShape(12.dp))
+                        modifier = Modifier.fillMaxWidth().height(24.dp).clip(RoundedCornerShape(12.dp)),
+                        gestureKey = effectiveStateKey
                     )
 
                     Row(
@@ -767,9 +815,14 @@ fun SharedHsvColorPickerDialog(
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    if (resetColor != null) {
+                        TextButton(onClick = { updateFromColor(resetColor) }) {
+                            Text(readerString("action_reset", "Reset"), color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    Spacer(Modifier.weight(1f))
                     TextButton(onClick = onDismiss) {
                         Text(readerString("action_cancel", "Cancel"))
                     }
@@ -795,32 +848,23 @@ fun SharedHsvWheel(
     saturation: Float,
     currentColor: Color,
     onHueSatChanged: (Float, Float) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    gestureKey: Any? = Unit
 ) {
     val touchPadding = 12.dp
 
     Box(
-        modifier = modifier.pointerInput(Unit) {
-            awaitEachGesture {
-                val down = awaitFirstDown()
-                val paddingPx = touchPadding.toPx()
-
-                fun update(offset: Offset) {
-                    val selection = sharedHsvWheelSelection(
-                        offsetX = offset.x,
-                        offsetY = offset.y,
-                        width = size.width.toFloat(),
-                        height = size.height.toFloat(),
-                        paddingPx = paddingPx
-                    )
-                    onHueSatChanged(selection.hue, selection.saturation)
-                }
-
-                update(down.position)
-                drag(down.id) { change ->
-                    change.consume()
-                    update(change.position)
-                }
+        modifier = modifier.pointerInput(gestureKey) {
+            val paddingPx = touchPadding.toPx()
+            awaitSharedColorPickerDrag { offset ->
+                val selection = sharedHsvWheelSelection(
+                    offsetX = offset.x,
+                    offsetY = offset.y,
+                    width = size.width.toFloat(),
+                    height = size.height.toFloat(),
+                    paddingPx = paddingPx
+                )
+                onHueSatChanged(selection.hue, selection.saturation)
             }
         }
     ) {
@@ -896,7 +940,8 @@ fun SharedSpectrumBox(
     saturation: Float,
     currentColor: Color,
     onHueSatChanged: (Float, Float) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    gestureKey: Any? = Unit
 ) {
     val rainbowColors = listOf(
         Color.Red,
@@ -910,26 +955,16 @@ fun SharedSpectrumBox(
     val touchPadding = 12.dp
 
     Box(
-        modifier = modifier.pointerInput(Unit) {
-            awaitEachGesture {
-                val down = awaitFirstDown()
-                val paddingPx = touchPadding.toPx()
+        modifier = modifier.pointerInput(gestureKey) {
+            val paddingPx = touchPadding.toPx()
+            awaitSharedColorPickerDrag { offset ->
                 val activeWidth = size.width.toFloat() - (paddingPx * 2)
                 val activeHeight = size.height.toFloat() - (paddingPx * 2)
-
-                fun update(offset: Offset) {
-                    val relativeX = offset.x - paddingPx
-                    val relativeY = offset.y - paddingPx
-                    val nextHue = (relativeX / activeWidth).coerceIn(0f, 1f) * 360f
-                    val nextSaturation = (relativeY / activeHeight).coerceIn(0f, 1f)
-                    onHueSatChanged(nextHue, nextSaturation)
-                }
-
-                update(down.position)
-                drag(down.id) { change ->
-                    change.consume()
-                    update(change.position)
-                }
+                val relativeX = offset.x - paddingPx
+                val relativeY = offset.y - paddingPx
+                val nextHue = (relativeX / activeWidth).coerceIn(0f, 1f) * 360f
+                val nextSaturation = (relativeY / activeHeight).coerceIn(0f, 1f)
+                onHueSatChanged(nextHue, nextSaturation)
             }
         }
     ) {
@@ -982,27 +1017,18 @@ fun SharedBrightnessSlider(
     saturation: Float,
     value: Float,
     onValueChanged: (Float) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    gestureKey: Any? = Unit
 ) {
     val baseColor = remember(hue, saturation) {
         Color.hsv(hue, saturation, 1f)
     }
 
     Box(
-        modifier = modifier.pointerInput(Unit) {
-            awaitEachGesture {
-                val down = awaitFirstDown()
-
-                fun update(offset: Offset) {
-                    val nextValue = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                    onValueChanged(nextValue)
-                }
-
-                update(down.position)
-                drag(down.id) { change ->
-                    change.consume()
-                    update(change.position)
-                }
+        modifier = modifier.pointerInput(gestureKey) {
+            awaitSharedColorPickerDrag { offset ->
+                val nextValue = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
+                onValueChanged(nextValue)
             }
         }
     ) {
@@ -1017,6 +1043,27 @@ fun SharedBrightnessSlider(
                 radius = 8.dp.toPx(),
                 center = Offset(value.coerceIn(0f, 1f) * size.width, size.height / 2)
             )
+        }
+    }
+}
+
+private suspend fun PointerInputScope.awaitSharedColorPickerDrag(
+    onPosition: (Offset) -> Unit
+) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+        down.consume()
+        onPosition(down.position)
+        val pointerId = down.id
+
+        while (true) {
+            val event = awaitPointerEvent(PointerEventPass.Initial)
+            val change = event.changes.firstOrNull { it.id == pointerId } ?: return@awaitEachGesture
+            onPosition(change.position)
+            change.consume()
+            if (change.changedToUp() || !change.pressed) {
+                return@awaitEachGesture
+            }
         }
     }
 }

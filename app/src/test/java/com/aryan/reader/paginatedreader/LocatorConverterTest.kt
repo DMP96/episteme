@@ -22,6 +22,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.file.Files
 
 @OptIn(ExperimentalSerializationApi::class)
 class LocatorConverterTest {
@@ -39,6 +41,31 @@ class LocatorConverterTest {
         val locator = converter.getLocatorFromCfi(book, chapterIndex = 0, cfi = "/4/2/6:13")
 
         assertEquals(Locator(chapterIndex = 0, blockIndex = 2, charOffset = 13), locator)
+    }
+
+    @Test
+    fun `cfi local offsets become absolute locators and serialize back locally`() = runTest {
+        val converter = converterFor(
+            listOf(paragraph("Offset paragraph", blockIndex = 2, cfi = "/4/2/6", offset = 100))
+        )
+        val book = book()
+
+        val locator = converter.getLocatorFromCfi(book, chapterIndex = 0, cfi = "/4/2/6:7")
+        val cfi = locator?.let { converter.getCfiFromLocator(book, it) }
+
+        assertEquals(Locator(chapterIndex = 0, blockIndex = 2, charOffset = 107), locator)
+        assertEquals("/4/2/6:7", cfi)
+    }
+
+    @Test
+    fun `multipart cfi uses first point local offset when resolving locator`() = runTest {
+        val converter = converterFor(
+            listOf(paragraph("Offset paragraph", blockIndex = 2, cfi = "/4/2/6", offset = 100))
+        )
+
+        val locator = converter.getLocatorFromCfi(book(), chapterIndex = 0, cfi = "/4/2/6:7|/4/2/6:12")
+
+        assertEquals(Locator(chapterIndex = 0, blockIndex = 2, charOffset = 107), locator)
     }
 
     @Test
@@ -170,6 +197,27 @@ class LocatorConverterTest {
         assertNull(converter.getLocatorFromCfi(book(), chapterIndex = 0, cfi = "/4/2"))
     }
 
+    @Test
+    fun `large uncached chapter file is skipped instead of parsed on demand`() = runTest {
+        val tempDir = Files.createTempDirectory("large-locator-chapter").toFile()
+        try {
+            File(tempDir, "c1.xhtml").writeText("<html><body>${"x".repeat(2_200_000)}</body></html>")
+            val dao = FakeBookCacheDao(null)
+            val converter = LocatorConverter(dao, proto, mockk<Context>(relaxed = true))
+
+            val locator = converter.getLocatorFromCfi(
+                book = book(extractionBasePath = tempDir.absolutePath),
+                chapterIndex = 0,
+                cfi = "/4/2"
+            )
+
+            assertNull(locator)
+            assertTrue(dao.insertedChapters.isEmpty())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
     private fun converterFor(blocks: List<SemanticBlock>, estimatedPageCount: Int = 1): LocatorConverter {
         val chapter = ProcessedChapter(
             bookId = "Book",
@@ -211,7 +259,7 @@ class LocatorConverterTest {
         )
     }
 
-    private fun book(): EpubBook {
+    private fun book(extractionBasePath: String = ""): EpubBook {
         return EpubBook(
             fileName = "book.epub",
             title = "Book",
@@ -228,7 +276,7 @@ class LocatorConverterTest {
                     htmlContent = ""
                 )
             ),
-            extractionBasePath = ""
+            extractionBasePath = extractionBasePath
         )
     }
 
@@ -236,12 +284,15 @@ class LocatorConverterTest {
         private val chapter: ProcessedChapter?
     ) : BookCacheDao() {
         val requestedBookIds = mutableListOf<String>()
+        val insertedChapters = mutableListOf<ProcessedChapter>()
 
-        override suspend fun getProcessedChapter(bookId: String, chapterIndex: Int): ProcessedChapter? {
+        override suspend fun getProcessedChapter(bookId: String, chapterIndex: Int, styleConfigHash: Int?): ProcessedChapter? {
             requestedBookIds += bookId
             return chapter
         }
-        override suspend fun insertProcessedChapters(chapters: List<ProcessedChapter>) = Unit
+        override suspend fun insertProcessedChapters(chapters: List<ProcessedChapter>) {
+            insertedChapters += chapters
+        }
 
         override suspend fun getProcessedBook(bookId: String): ProcessedBook? = null
         override suspend fun insertProcessedBook(book: ProcessedBook) = Unit
@@ -260,11 +311,13 @@ class LocatorConverterTest {
         override suspend fun getPageIndexEntries(bookId: String, configHash: Int, chapterIndex: Int): List<PageIndexEntry> = emptyList()
         override suspend fun cleanupOldPageCaches(bookId: String) = Unit
 
-        protected override suspend fun getChapterMetadata(bookId: String, chapterIndex: Int): ProcessedChapterMetadata? = null
-        protected override suspend fun getChapterChunks(bookId: String, chapterIndex: Int): List<ByteArray> = emptyList()
+        protected override suspend fun getChapterMetadata(bookId: String, chapterIndex: Int, styleConfigHash: Int): ProcessedChapterMetadata? = null
+        protected override suspend fun getAnyChapterMetadata(bookId: String, chapterIndex: Int): ProcessedChapterMetadata? = null
+        protected override suspend fun getChapterChunks(bookId: String, chapterIndex: Int, styleConfigHash: Int): List<ByteArray> = emptyList()
         protected override suspend fun insertChapterMetadata(metadata: ProcessedChapterMetadata) = Unit
         protected override suspend fun insertChapterChunks(chunks: List<ProcessedChapterChunk>) = Unit
         protected override suspend fun deleteChapterMetadataForBook(bookId: String) = Unit
+        protected override suspend fun deleteChapterChunksForChapter(bookId: String, chapterIndex: Int, styleConfigHash: Int) = Unit
         protected override suspend fun deleteAllChapterMetadata() = Unit
         protected override suspend fun deletePageCacheMetadataForBook(bookId: String) = Unit
         protected override suspend fun deletePageCacheMetadataForChapter(bookId: String, configHash: Int, chapterIndex: Int) = Unit

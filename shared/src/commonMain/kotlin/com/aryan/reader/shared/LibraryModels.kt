@@ -5,7 +5,7 @@ import com.aryan.reader.shared.reader.ReaderBookmark
 import com.aryan.reader.shared.reader.ReaderSettings
 
 enum class FileType {
-    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, DOCX, ODT, FODT, PPTX, UNKNOWN
+    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, CBT, DOCX, ODT, FODT, PPTX, UNKNOWN
 }
 
 val PDF_VIEWER_FILE_TYPES: Set<FileType>
@@ -67,7 +67,8 @@ data class SyncedFolder(
     val uriString: String,
     val name: String,
     val lastScanTime: Long,
-    val allowedFileTypes: Set<FileType> = SharedFileCapabilities.knownFileTypes
+    val allowedFileTypes: Set<FileType> = SharedFileCapabilities.knownFileTypes,
+    val localSyncEnabled: Boolean = true
 )
 
 data class BookItem(
@@ -99,7 +100,8 @@ data class BookItem(
     val readerSettings: ReaderSettings? = null,
     val readerBookmarks: List<ReaderBookmark> = emptyList(),
     val readerHighlights: List<UserHighlight> = emptyList(),
-    val pdfReaderViewport: SharedPdfReaderViewport? = null
+    val pdfReaderViewport: SharedPdfReaderViewport? = null,
+    val readingPositionModifiedTimestamp: Long = 0L
 )
 
 data class Shelf(

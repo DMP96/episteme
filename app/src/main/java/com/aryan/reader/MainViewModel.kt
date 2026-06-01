@@ -62,12 +62,15 @@ import com.aryan.reader.data.FirestoreRepository
 import com.aryan.reader.data.FontMetadata
 import com.aryan.reader.data.FontsRepository
 import com.aryan.reader.data.GoogleDriveRepository
+import com.aryan.reader.data.LocalSyncUtils
 import com.aryan.reader.data.PurchaseEntity
 import com.aryan.reader.data.RecentFileItem
 import com.aryan.reader.data.RecentFilesRepository
 import com.aryan.reader.data.RemoteConfigRepository
 import com.aryan.reader.data.ShelfMetadata
 import com.aryan.reader.data.TagEntity
+import com.aryan.reader.data.effectiveAnnotationModifiedTimestamp
+import com.aryan.reader.data.effectiveReadingPositionModifiedTimestamp
 import com.aryan.reader.data.getUri
 import com.aryan.reader.data.toBookMetadata
 import com.aryan.reader.data.toRecentFileItem
@@ -109,6 +112,11 @@ import com.aryan.reader.shared.SharedLibraryEditor
 import com.aryan.reader.shared.SharedImportOutcomeCounts
 import com.aryan.reader.shared.SharedImportPlanner
 import com.aryan.reader.shared.pdf.SharedPdfAnnotationSidecarCodec
+import com.aryan.reader.shared.shouldApplyRemoteCloudBookMetadataUpdate
+import com.aryan.reader.shared.shouldDownloadRemoteCloudBookContent
+import com.aryan.reader.shared.shouldUploadLocalCloudBookContent
+import com.aryan.reader.shared.shouldUploadLocalCloudBookMetadataUpdate
+import com.aryan.reader.shared.sharedCloudBookContentFileName
 import com.aryan.reader.shared.AppAction as SharedAppAction
 import com.aryan.reader.shared.LibraryAction as SharedLibraryAction
 import kotlinx.coroutines.CompletableDeferred
@@ -132,7 +140,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -163,7 +170,14 @@ private data class CachedSpeechBubble(
     val maskBitmap: Bitmap?
 )
 
+private data class PendingExternalFileRemoval(
+    val bookId: String,
+    val uriString: String?
+)
+
 private const val BANNER_AUTO_DISMISS_MILLIS = 3_000L
+private const val CLOUD_CONTENT_RETRY_DELAY_MILLIS = 10_000L
+private const val CLOUD_METADATA_UPLOAD_DEBOUNCE_MILLIS = 1_500L
 
 @kotlin.OptIn(ExperimentalSerializationApi::class)
 @UnstableApi
@@ -212,6 +226,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private var bannerDismissGeneration = 0L
     private var pendingSwitchDeferred: CompletableDeferred<Boolean>? = null
     private var externalOpenedBookId: String? = null
+    private var cloudContentRetryJob: Job? = null
+    private val cloudMetadataUploadJobs = ConcurrentHashMap<String, Job>()
 
     private var panelDetector: com.aryan.reader.ml.IPanelDetector? = null
     private var speechBubbleDetector: ISpeechBubbleDetector? = null
@@ -595,8 +611,16 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         val existingItem = recentFilesRepository.getFileByBookId(hash)
         if (existingItem != null) {
-            Timber.i("Book with ID: $hash already exists. Skipping import.")
-            return null
+            val pendingRemoval = pendingExternalFileRemovals()
+                .firstOrNull { it.bookId == hash }
+            if (pendingRemoval != null) {
+                deletePendingExternalFileRemoval(
+                    pendingRemoval.copy(uriString = pendingRemoval.uriString ?: existingItem.uriString)
+                )
+            } else {
+                Timber.i("Book with ID: $hash already exists. Skipping import.")
+                return null
+            }
         }
 
         val fileName = displayName ?: ""
@@ -1191,11 +1215,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
         }
 
-        if (_internalState.value.syncedFolders.isNotEmpty()) {
+        if (_internalState.value.syncedFolders.any { it.localSyncEnabled }) {
             triggerFolderSyncWorker(metadataOnly = false, showFeedback = false)
         }
 
         sweepOrphanedCache()
+        cleanupPendingExternalFileRemovals()
         restoreReaderSessionIfNeeded()
 
         viewModelScope.launch { billingClientWrapper.initializeConnection() }
@@ -1225,6 +1250,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                                 if (_internalState.value.isSyncEnabled) {
                                     viewModelScope.launch {
+                                        logCloudSyncTrace {
+                                            "android.startup.sync_check user=${newUserData.uid} isSyncEnabled=${_internalState.value.isSyncEnabled}"
+                                        }
                                         Timber.tag("AnnotationSync").d(
                                             "Startup: Pro user & Sync enabled. Initiating cloud sync."
                                         )
@@ -1232,6 +1260,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                         if (googleDriveRepository.hasDrivePermissions(appContext)) {
                                             syncWithCloud(showBanner = false)
                                         } else {
+                                            logCloudSyncTrace { "android.startup.sync_skip reason=missing_drive_permissions user=${newUserData.uid}" }
                                             Timber.tag("AnnotationSync").d(
                                                 "Startup: Sync skipped. Missing Drive permissions."
                                             )
@@ -1276,6 +1305,119 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private fun pendingExternalFileRemovals(): List<PendingExternalFileRemoval> {
+        return prefs.getStringSet(KEY_PENDING_EXTERNAL_FILE_REMOVALS, emptySet())
+            .orEmpty()
+            .mapNotNull(::decodePendingExternalFileRemoval)
+            .distinctBy { it.bookId }
+    }
+
+    private fun markPendingExternalFileRemoval(bookId: String, uriString: String?) {
+        if (bookId.isBlank()) return
+        val removalsByBookId = pendingExternalFileRemovals()
+            .associateBy { it.bookId }
+            .toMutableMap()
+        removalsByBookId[bookId] = PendingExternalFileRemoval(bookId, uriString)
+        writePendingExternalFileRemovals(removalsByBookId.values)
+    }
+
+    private fun clearPendingExternalFileRemovals(bookIds: Set<String>) {
+        if (bookIds.isEmpty()) return
+        val remaining = pendingExternalFileRemovals().filterNot { it.bookId in bookIds }
+        writePendingExternalFileRemovals(remaining)
+    }
+
+    private fun writePendingExternalFileRemovals(removals: Collection<PendingExternalFileRemoval>) {
+        val encoded = removals
+            .filter { it.bookId.isNotBlank() }
+            .mapTo(mutableSetOf(), ::encodePendingExternalFileRemoval)
+        prefs.edit(commit = true) {
+            if (encoded.isEmpty()) {
+                remove(KEY_PENDING_EXTERNAL_FILE_REMOVALS)
+            } else {
+                putStringSet(KEY_PENDING_EXTERNAL_FILE_REMOVALS, encoded)
+            }
+        }
+    }
+
+    private fun cleanupPendingExternalFileRemovals() {
+        val removals = pendingExternalFileRemovals()
+        if (removals.isEmpty()) return
+
+        val pendingBookIds = removals.mapTo(mutableSetOf()) { it.bookId }
+        if (prefs.getString(KEY_LAST_OPEN_BOOK_ID, null) in pendingBookIds) {
+            clearPersistedReaderSession()
+        }
+
+        viewModelScope.launch {
+            removals.forEach { removal ->
+                deletePendingExternalFileRemoval(removal)
+            }
+        }
+    }
+
+    private fun deletePendingExternalFileRemoval(bookId: String, uriString: String?) {
+        markPendingExternalFileRemoval(bookId, uriString)
+        viewModelScope.launch {
+            deletePendingExternalFileRemoval(PendingExternalFileRemoval(bookId, uriString))
+        }
+    }
+
+    private suspend fun deletePendingExternalFileRemoval(removal: PendingExternalFileRemoval) {
+        var shouldRetry = false
+        runCatching {
+            cleanupBookDataLocally(removal.bookId)
+        }.onFailure { error ->
+            Timber.w(error, "Failed to clear local caches for pending external file ${removal.bookId}")
+        }
+
+        runCatching {
+            recentFilesRepository.deleteFilePermanently(listOf(removal.bookId))
+        }.onFailure { error ->
+            shouldRetry = true
+            Timber.w(error, "Failed to remove pending external file ${removal.bookId} from library")
+        }
+
+        removal.uriString?.let { uriString ->
+            runCatching {
+                bookImporter.deleteBookByUriString(uriString)
+            }.onFailure { error ->
+                shouldRetry = true
+                Timber.w(error, "Failed to delete pending external file copy for ${removal.bookId}")
+            }
+        }
+
+        if (!shouldRetry) {
+            clearPendingExternalFileRemovals(setOf(removal.bookId))
+        }
+    }
+
+    private fun encodePendingExternalFileRemoval(removal: PendingExternalFileRemoval): String {
+        return JSONObject()
+            .put("bookId", removal.bookId)
+            .apply {
+                if (!removal.uriString.isNullOrBlank()) {
+                    put("uriString", removal.uriString)
+                }
+            }
+            .toString()
+    }
+
+    private fun decodePendingExternalFileRemoval(value: String): PendingExternalFileRemoval? {
+        val trimmed = value.trim()
+        if (trimmed.isBlank()) return null
+        return if (trimmed.startsWith("{")) {
+            runCatching {
+                val json = JSONObject(trimmed)
+                val bookId = json.optString("bookId").takeIf { it.isNotBlank() }
+                val uriString = json.optString("uriString").takeIf { it.isNotBlank() }
+                bookId?.let { PendingExternalFileRemoval(it, uriString) }
+            }.getOrNull()
+        } else {
+            PendingExternalFileRemoval(trimmed, null)
+        }
+    }
+
     private fun restoreReaderSessionIfNeeded() {
         val currentState = _internalState.value
         if (currentState.selectedBookId != null || currentState.selectedPdfUri != null || currentState.selectedEpubUri != null) {
@@ -1286,6 +1428,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             runCatching { FileType.valueOf(typeName) }.getOrNull()
         }
         val restoreBookId = prefs.getString(KEY_LAST_OPEN_BOOK_ID, null) ?: return
+        if (restoreBookId in pendingExternalFileRemovals().map { it.bookId }) {
+            clearPersistedReaderSession()
+            return
+        }
         if (persistedType == null) {
             clearPersistedReaderSession()
             return
@@ -1614,17 +1760,27 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun importFont(uri: Uri) {
+        importFonts(listOf(uri))
+    }
+
+    fun importFonts(uris: List<Uri>) {
+        if (uris.isEmpty()) return
         viewModelScope.launch {
             _internalState.update { it.copy(isLoading = true) }
-            val result = fontsRepository.importFont(uri)
-            result.onSuccess { font ->
-                if (uiState.value.isSyncEnabled) {
-                    uploadNewFont(font)
+            try {
+                uris.forEach { uri ->
+                    val result = fontsRepository.importFont(uri)
+                    result.onSuccess { font ->
+                        if (uiState.value.isSyncEnabled) {
+                            uploadNewFont(font)
+                        }
+                    }.onFailure {
+                        showBanner(appContext.getString(R.string.error_import_font, it.message), isError = true)
+                    }
                 }
-            }.onFailure {
-                showBanner(appContext.getString(R.string.error_import_font, it.message), isError = true)
+            } finally {
+                _internalState.update { it.copy(isLoading = false) }
             }
-            _internalState.update { it.copy(isLoading = false) }
         }
     }
 
@@ -1650,9 +1806,17 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun deleteFont(fontId: String) {
+        deleteFonts(listOf(fontId))
+    }
+
+    fun deleteFonts(fontIds: Collection<String>) {
+        val uniqueFontIds = fontIds.filter { it.isNotBlank() }.toSet()
+        if (uniqueFontIds.isEmpty()) return
         viewModelScope.launch {
-            fontsRepository.deleteFont(fontId)
-            if (_internalState.value.appFontPreference.referencesCustomFont(fontId)) {
+            uniqueFontIds.forEach { fontId ->
+                fontsRepository.deleteFont(fontId)
+            }
+            if (uniqueFontIds.any { _internalState.value.appFontPreference.referencesCustomFont(it) }) {
                 setAppFontPreference(AppFontPreference.System)
             }
         }
@@ -2042,48 +2206,217 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun uploadSingleBookMetadata(book: RecentFileItem) {
+    private fun queueCloudMetadataUpload(bookId: String, reason: String, debounce: Boolean = true) {
         if (!uiState.value.isSyncEnabled) return
+        cloudMetadataUploadJobs.remove(bookId)?.cancel()
+        val job = viewModelScope.launch {
+            if (debounce) delay(CLOUD_METADATA_UPLOAD_DEBOUNCE_MILLIS)
+            val latest = recentFilesRepository.getFileByBookId(bookId) ?: run {
+                logCloudSyncTrace { "android.upload.queue_skip reason=missing_local book=$bookId trigger=$reason" }
+                return@launch
+            }
+            logCloudSyncTrace {
+                "android.upload.queue_fire trigger=$reason debounce=$debounce ${latest.cloudSyncTraceSummary()}"
+            }
+            uploadSingleBookMetadata(latest)
+        }
+        cloudMetadataUploadJobs[bookId] = job
+        job.invokeOnCompletion {
+            if (cloudMetadataUploadJobs[bookId] == job) {
+                cloudMetadataUploadJobs.remove(bookId)
+            }
+        }
+    }
+
+    fun queuePdfSidecarCloudUpload(bookId: String) {
+        queueCloudMetadataUpload(bookId, reason = "pdf_sidecar")
+    }
+
+    private fun uploadSingleBookMetadata(book: RecentFileItem) {
+        if (!uiState.value.isSyncEnabled) {
+            logCloudSyncTrace { "android.upload.skip reason=sync_disabled ${book.cloudSyncTraceSummary()}" }
+            return
+        }
 
         if (book.uriString?.startsWith("opds-pse") == true) {
+            logCloudSyncTrace { "android.upload.skip reason=opds_stream ${book.cloudSyncTraceSummary()}" }
             Timber.d("Skipping metadata sync for OPDS stream book: ${book.displayName}")
             return
         }
 
         if (book.sourceFolderUri != null) {
+            logCloudSyncTrace { "android.upload.skip reason=folder_book ${book.cloudSyncTraceSummary()}" }
             Timber.d("Skipping metadata sync for local folder book: ${book.displayName}")
             return
         }
 
         if (book.isManualOnlyReaderFile()) {
+            logCloudSyncTrace { "android.upload.skip reason=manual_only ${book.cloudSyncTraceSummary()}" }
             Timber.d("Skipping metadata sync for manual-only reader file: ${book.displayName}")
             return
         }
-        val currentUser = uiState.value.currentUser ?: return
+        val currentUser = uiState.value.currentUser ?: run {
+            logCloudSyncTrace { "android.upload.skip reason=no_user ${book.cloudSyncTraceSummary()}" }
+            return
+        }
 
         viewModelScope.launch {
             try {
                 val deviceId = getInstallationId()
+                var bookForMetadata = book
+                var uploadedAnnotationPayload = false
+                var uploadedAnnotationModifiedTimestamp = 0L
+                var remoteBookLoaded = false
+                var remoteBookForUpload: BookMetadata? = null
+                var remoteAnnotationDriveTimestampLoaded = false
+                var remoteAnnotationDriveTimestamp = 0L
+                suspend fun loadRemoteBookForUpload(): BookMetadata? {
+                    if (!remoteBookLoaded) {
+                        remoteBookForUpload = firestoreRepository.getBookMetadata(currentUser.uid, book.bookId)
+                        remoteBookLoaded = true
+                    }
+                    return remoteBookForUpload
+                }
+                suspend fun loadRemoteAnnotationDriveTimestamp(): Long {
+                    if (!remoteAnnotationDriveTimestampLoaded) {
+                        val remote = loadRemoteBookForUpload()
+                        remoteAnnotationDriveTimestamp = if (remote?.hasAnnotations == true) {
+                            googleDriveRepository.getAccessToken(appContext)?.let { accessToken ->
+                                googleDriveRepository.getFiles(accessToken)
+                                    ?.files
+                                    .orEmpty()
+                                    .firstOrNull { it.name == cloudPdfAnnotationDriveFileName(book.bookId) }
+                                    ?.modifiedTimeMillis
+                            } ?: 0L
+                        } else {
+                            0L
+                        }
+                        remoteAnnotationDriveTimestampLoaded = true
+                    }
+                    return remoteAnnotationDriveTimestamp
+                }
+                if (book.needsRemoteEpubAnnotationMetadataGuard()) {
+                    val remote = loadRemoteBookForUpload()
+                    val merged = bookForMetadata.mergeRemoteEpubAnnotationMetadata(remote)
+                    if (merged != bookForMetadata) {
+                        logCloudSyncTrace {
+                            "android.upload.epub_annotation_preserve book=${book.bookId} " +
+                                "local=${bookForMetadata.cloudSyncTraceSummary()} " +
+                                "remote=${remote?.cloudSyncTraceSummary() ?: "null"} " +
+                                "merged=${merged.cloudSyncTraceSummary()}"
+                        }
+                        recentFilesRepository.addRecentFile(merged)
+                        bookForMetadata = merged
+                    }
+                }
+                val remoteForContent = loadRemoteBookForUpload()?.toRecentFileItem()
+                if (shouldUploadLocalBookContent(bookForMetadata, remoteForContent)) {
+                    val accessToken = googleDriveRepository.getAccessToken(appContext) ?: run {
+                        logCloudSyncTrace { "android.upload.content_guard_skip reason=no_access_token ${bookForMetadata.cloudSyncTraceSummary()}" }
+                        return@launch
+                    }
+                    val source = bookForMetadata.getUri()?.path?.let(::File)
+                    if (source?.exists() != true) {
+                        logCloudSyncTrace {
+                            "android.upload.content_guard_skip reason=file_missing book=${bookForMetadata.bookId} " +
+                                "path=${(source?.absolutePath).cloudSyncPreview()}"
+                        }
+                        return@launch
+                    }
+                    logCloudSyncTrace {
+                        "android.upload.content_guard_start book=${bookForMetadata.bookId} " +
+                            "localContentTs=${bookForMetadata.fileContentModifiedTimestamp} " +
+                            "remoteContentTs=${remoteForContent?.fileContentModifiedTimestamp ?: 0L}"
+                    }
+                    val uploadedFile = googleDriveRepository.uploadFile(
+                        accessToken,
+                        bookForMetadata.bookId,
+                        source,
+                        bookForMetadata.type
+                    )
+                    if (uploadedFile == null) {
+                        logCloudSyncTrace { "android.upload.content_guard_failed book=${bookForMetadata.bookId}" }
+                        return@launch
+                    }
+                    val contentTimestamp = bookForMetadata.fileContentModifiedTimestamp.takeIf { it > 0L }
+                        ?: source.lastModified()
+                    bookForMetadata = bookForMetadata.copy(
+                        fileSize = source.length(),
+                        fileContentModifiedTimestamp = contentTimestamp
+                    )
+                    logCloudSyncTrace {
+                        "android.upload.content_guard_success book=${bookForMetadata.bookId} " +
+                            "driveId=${uploadedFile.id} contentTs=$contentTimestamp"
+                    }
+                }
+                logCloudSyncTrace { "android.upload.start device=$deviceId ${bookForMetadata.cloudSyncTraceSummary()}" }
                 Timber.tag("AnnotationSync").d("Preparing to sync book: ${book.bookId}")
 
                 val inkFile = pdfAnnotationRepository.getAnnotationFileForSync(book.bookId)
+                val deletedInkFile = pdfAnnotationRepository.getDeletedAnnotationsFileForSync(book.bookId)
                 val richTextFile = pdfRichTextRepository.getFileForSync(book.bookId)
                 val layoutFile = pageLayoutRepository.getLayoutFile(book.bookId)
                 val textBoxFile = pdfTextBoxRepository.getFileForSync(book.bookId)
                 val highlightFile = pdfHighlightRepository.getFileForSync(book.bookId)
 
-                val hasInk = inkFile?.exists() == true
-                val hasRichText = richTextFile.exists()
+                val hasInk = inkFile.hasSyncableCloudAnnotationPayload()
+                val hasDeletedInk = deletedInkFile.hasSyncableCloudAnnotationPayload()
+                val hasRichText = richTextFile.hasSyncableCloudAnnotationPayload()
                 val hasLayout = layoutFile.exists()
-                val hasTextBoxes = textBoxFile.exists()
-                val hasHighlights = highlightFile.exists()
-                val hasAnyData = hasInk || hasRichText || hasLayout || hasTextBoxes || hasHighlights
+                val hasTextBoxes = textBoxFile.hasSyncableCloudAnnotationPayload()
+                val hasHighlights = highlightFile.hasSyncableCloudAnnotationPayload()
+                val sidecars = AndroidPdfCloudSidecarState(
+                    hasInk = hasInk,
+                    inkTimestamp = inkFile?.lastModified() ?: 0L,
+                    hasDeletedInk = hasDeletedInk,
+                    deletedInkTimestamp = deletedInkFile?.lastModified() ?: 0L,
+                    hasRichText = hasRichText,
+                    richTextTimestamp = richTextFile.lastModified(),
+                    hasLayout = hasLayout,
+                    layoutTimestamp = layoutFile.lastModified(),
+                    hasTextBoxes = hasTextBoxes,
+                    textBoxesTimestamp = textBoxFile.lastModified(),
+                    hasHighlights = hasHighlights,
+                    highlightsTimestamp = highlightFile.lastModified()
+                )
+                logCloudSyncTrace {
+                    "android.upload.sidecars book=${book.bookId} hasInk=$hasInk hasDeletedInk=$hasDeletedInk hasText=$hasRichText " +
+                        "hasLayout=$hasLayout hasTextBoxes=$hasTextBoxes hasHighlights=$hasHighlights " +
+                        "payloadTs=${sidecars.annotationPayloadTimestamp} bundleTs=${sidecars.bundleTimestamp}"
+                }
+                logCloudAnnotationSyncTrace {
+                    "android.upload.inspect book=${book.bookId} remoteHas=${remoteBookForUpload?.hasAnnotations} " +
+                        "remoteTs=${remoteBookForUpload?.lastModifiedTimestamp ?: 0L} " +
+                        "ink{exists=$hasInk bytes=${inkFile?.length() ?: 0L} ts=${sidecars.inkTimestamp}} " +
+                        "deletedInk{exists=$hasDeletedInk bytes=${deletedInkFile?.length() ?: 0L} ts=${sidecars.deletedInkTimestamp}} " +
+                        "text{exists=$hasRichText bytes=${richTextFile.length()} ts=${sidecars.richTextTimestamp}} " +
+                        "layout{exists=$hasLayout bytes=${layoutFile.length()} ts=${sidecars.layoutTimestamp}} " +
+                        "textBoxes{exists=$hasTextBoxes bytes=${textBoxFile.length()} ts=${sidecars.textBoxesTimestamp}} " +
+                        "highlights{exists=$hasHighlights bytes=${highlightFile.length()} ts=${sidecars.highlightsTimestamp}} " +
+                        "payloadTs=${sidecars.annotationPayloadTimestamp} bundleTs=${sidecars.bundleTimestamp} " +
+                        "hasPayload=${sidecars.hasAnnotationPayload}"
+                }
+                val remoteAnnotationDriveTimestampForUpload = loadRemoteAnnotationDriveTimestamp()
+                val remoteAnnotationTimestampForUpload =
+                    remoteBookForUpload?.effectiveAnnotationModifiedTimestamp(remoteAnnotationDriveTimestampForUpload) ?: 0L
+                val localAnnotationsShouldUpload = shouldUploadLocalPdfCloudAnnotations(
+                    localSidecars = sidecars,
+                    remoteHasAnnotations = remoteBookForUpload?.hasAnnotations == true,
+                    remoteAnnotationModifiedTimestamp = remoteAnnotationTimestampForUpload
+                )
+                logCloudAnnotationSyncTrace {
+                    "android.upload.annotation_decision book=${book.bookId} " +
+                        "localShouldUpload=$localAnnotationsShouldUpload remoteHas=${remoteBookForUpload?.hasAnnotations} " +
+                        "remoteAnnTs=$remoteAnnotationTimestampForUpload " +
+                        "remoteDriveAnnTs=$remoteAnnotationDriveTimestampForUpload payloadTs=${sidecars.annotationPayloadTimestamp}"
+                }
                 Timber.d(
                     "android.cloud.export candidates book=${book.bookId} hasRichText=$hasRichText " +
-                        "richBytes=${if (hasRichText) richTextFile.length() else 0L} hasAnyData=$hasAnyData"
+                        "richBytes=${if (hasRichText) richTextFile.length() else 0L} " +
+                        "hasAnnotationPayload=${sidecars.hasAnnotationPayload}"
                 )
 
-                if (hasAnyData) {
+                if (localAnnotationsShouldUpload) {
                     if (googleDriveRepository.hasDrivePermissions(appContext)) {
                         val accessToken = googleDriveRepository.getAccessToken(appContext)
 
@@ -2115,6 +2448,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             }
 
                             if (hasInk) putJsonSafe("ink", inkFile)
+                            if (hasDeletedInk) putJsonSafe(SharedPdfAnnotationSidecarCodec.KEY_PDF_ANNOTATION_DELETIONS, deletedInkFile)
                             if (hasRichText) putJsonSafe("text", richTextFile)
                             if (hasLayout) putJsonSafe("layout", layoutFile)
                             if (hasTextBoxes) putJsonSafe("textBoxes", textBoxFile)
@@ -2123,7 +2457,54 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             val bundleFile =
                                 File(appContext.cacheDir, "sync_bundle_${book.bookId}.json")
                             val canonicalBundle = SharedPdfAnnotationSidecarCodec.canonicalizeDataJson(bundleJson.toString())
-                            bundleFile.writeText(canonicalBundle)
+                            var uploadBundle = canonicalBundle
+                            var mergedRemoteIntoUpload = false
+                            if (remoteBookForUpload?.hasAnnotations == true) {
+                                val remoteBundleFile = File(appContext.cacheDir, "remote_sync_bundle_${book.bookId}.json")
+                                try {
+                                    val didDownloadRemote = googleDriveRepository.downloadAnnotationFile(
+                                        accessToken,
+                                        book.bookId,
+                                        remoteBundleFile
+                                    )
+                                    if (didDownloadRemote && remoteBundleFile.isFile) {
+                                        val remoteBundle = remoteBundleFile.readText()
+                                        val mergedBundle = SharedPdfAnnotationSidecarCodec.mergeAnnotationDataJson(
+                                            localDataJson = canonicalBundle,
+                                            remoteDataJson = remoteBundle,
+                                            preferRemoteOnConflict = false
+                                        )
+                                        val localCount = SharedPdfAnnotationSidecarCodec.annotationCountFromDataJson(canonicalBundle)
+                                        val remoteCount = SharedPdfAnnotationSidecarCodec.annotationCountFromDataJson(remoteBundle)
+                                        val mergedCount = SharedPdfAnnotationSidecarCodec.annotationCountFromDataJson(mergedBundle)
+                                        uploadBundle = mergedBundle
+                                        mergedRemoteIntoUpload = mergedBundle != canonicalBundle
+                                        logCloudAnnotationSyncTrace {
+                                            "android.upload.merge_remote book=${book.bookId} didDownload=true " +
+                                                "localCount=$localCount remoteCount=$remoteCount mergedCount=$mergedCount " +
+                                                "changed=$mergedRemoteIntoUpload"
+                                        }
+                                    } else {
+                                        logCloudAnnotationSyncTrace {
+                                            "android.upload.merge_remote_missing book=${book.bookId} " +
+                                                "didDownload=$didDownloadRemote tempExists=${remoteBundleFile.exists()}"
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    logCloudAnnotationSyncError(e) {
+                                        "android.upload.merge_remote_failed book=${book.bookId}"
+                                    }
+                                } finally {
+                                    remoteBundleFile.delete()
+                                }
+                            }
+                            bundleFile.writeText(uploadBundle)
+                            logCloudAnnotationSyncTrace {
+                                "android.upload.bundle_ready book=${book.bookId} " +
+                                    "rawKeys=${bundleJson.keys().asSequence().toList()} " +
+                                    "canonicalBytes=${canonicalBundle.length} uploadBytes=${uploadBundle.length} " +
+                                    "fileBytes=${bundleFile.length()}"
+                            }
                             if (hasRichText) {
                                 Timber.d(
                                     "android.cloud.export.bundleReady book=${book.bookId} canonicalLen=${canonicalBundle.length} " +
@@ -2137,6 +2518,36 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             bundleFile.delete()
 
                             if (uploaded != null) {
+                                uploadedAnnotationPayload = true
+                                uploadedAnnotationModifiedTimestamp = uploaded.modifiedTimeMillis
+                                if (mergedRemoteIntoUpload) {
+                                    recentFilesRepository.importAnnotationBundle(
+                                        book.bookId,
+                                        uploadBundle,
+                                        uploadedAnnotationModifiedTimestamp
+                                    )
+                                    logCloudAnnotationSyncTrace {
+                                        "android.upload.local_apply_merged book=${book.bookId} " +
+                                            "driveTs=$uploadedAnnotationModifiedTimestamp bytes=${uploadBundle.length}"
+                                    }
+                                }
+                                markPdfCloudAnnotationSidecarsSynced(
+                                    uploadedAnnotationModifiedTimestamp,
+                                    inkFile,
+                                    richTextFile,
+                                    layoutFile,
+                                    textBoxFile,
+                                    highlightFile,
+                                    deletedInkFile
+                                )
+                                logCloudAnnotationSyncTrace {
+                                    "android.upload.sidecar_success book=${book.bookId} driveId=${uploaded.id} " +
+                                        "driveTs=$uploadedAnnotationModifiedTimestamp bytes=${uploadBundle.length}"
+                                }
+                                logCloudSyncTrace {
+                                    "android.upload.sidecar_success book=${book.bookId} driveId=${uploaded.id} " +
+                                        "driveTs=$uploadedAnnotationModifiedTimestamp bytes=${uploadBundle.length}"
+                                }
                                 if (hasRichText) {
                                     Timber
                                         .d("android.cloud.export.uploadSuccess book=${book.bookId} driveId=${uploaded.id}")
@@ -2144,6 +2555,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 Timber.tag("AnnotationSync")
                                     .d("Bundle upload SUCCESS. ID: ${uploaded.id}")
                             } else {
+                                logCloudAnnotationSyncTrace {
+                                    "android.upload.sidecar_failed book=${book.bookId} bytes=${uploadBundle.length}"
+                                }
+                                logCloudSyncTrace { "android.upload.sidecar_failed book=${book.bookId}; aborting_metadata_upload" }
                                 if (hasRichText) {
                                     Timber
                                         .e("android.cloud.export.uploadFailed book=${book.bookId}")
@@ -2152,23 +2567,127 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                     .e("Bundle upload FAILED. Skipping Firestore sync to prevent data loss.")
                                 return@launch
                             }
+                        } else {
+                            logCloudAnnotationSyncTrace { "android.upload.skip_sidecar reason=no_access_token book=${book.bookId}" }
+                            logCloudSyncTrace { "android.upload.sidecar_failed book=${book.bookId}; reason=no_access_token; aborting_metadata_upload" }
+                            return@launch
                         }
+                    } else {
+                        logCloudAnnotationSyncTrace { "android.upload.skip_sidecar reason=missing_drive_permission book=${book.bookId}" }
+                        logCloudSyncTrace { "android.upload.sidecar_failed book=${book.bookId}; reason=missing_drive_permission; aborting_metadata_upload" }
+                        return@launch
                     }
                 } else {
-                    Timber.tag("AnnotationSync")
-                        .d("No local data (ink/text/layout) to upload for ${book.bookId}")
+                    logCloudAnnotationSyncTrace {
+                        "android.upload.skip_sidecar reason=${if (sidecars.hasAnnotationPayload) "remote_annotation_not_older" else "no_annotation_payload"} " +
+                            "book=${book.bookId} layoutOnly=$hasLayout layoutTs=${sidecars.layoutTimestamp} " +
+                            "remoteAnnTs=$remoteAnnotationTimestampForUpload payloadTs=${sidecars.annotationPayloadTimestamp}"
+                    }
+                    logCloudSyncTrace {
+                        "android.upload.sidecars_skipped book=${book.bookId} " +
+                            "reason=${if (sidecars.hasAnnotationPayload) "remote_annotation_not_older" else "no_annotation_payload"}"
+                    }
+                    Timber.tag("AnnotationSync").d(
+                        if (sidecars.hasAnnotationPayload) {
+                            "Local annotation payload is not newer than remote for ${book.bookId}"
+                        } else {
+                            "No local annotation payload (ink/text/text boxes/highlights) to upload for ${book.bookId}"
+                        }
+                    )
+                }
+
+                val latestLocalForMetadata = recentFilesRepository.getFileByBookId(bookForMetadata.bookId)
+                val refreshedBookForMetadata = bookForMetadata.withFreshLocalReadingPositionForCloudUpload(
+                    latestLocalForMetadata
+                )
+                if (refreshedBookForMetadata != bookForMetadata) {
+                    logCloudSyncTrace {
+                        "android.upload.refresh_latest book=${bookForMetadata.bookId} " +
+                            "before=${bookForMetadata.cloudSyncTraceSummary()} " +
+                            "latest=${latestLocalForMetadata?.cloudSyncTraceSummary() ?: "null"} " +
+                            "after=${refreshedBookForMetadata.cloudSyncTraceSummary()}"
+                    }
+                    bookForMetadata = refreshedBookForMetadata
+                }
+                val remoteMetadata = loadRemoteBookForUpload()
+                val localReadingTimestamp = bookForMetadata.effectiveReadingPositionModifiedTimestamp()
+                val remoteReadingTimestamp = remoteMetadata?.effectiveReadingPositionModifiedTimestamp() ?: 0L
+                val remoteAnnotationTimestamp = remoteMetadata?.effectiveAnnotationModifiedTimestamp(
+                    remoteAnnotationDriveTimestampForUpload
+                ) ?: 0L
+                val remoteReadingPositionWins = remoteMetadata != null && remoteReadingTimestamp > localReadingTimestamp
+                val remoteMetadataWins = remoteMetadata != null &&
+                    remoteMetadata.lastModifiedTimestamp > bookForMetadata.lastModifiedTimestamp
+                val metadataBase = if (remoteMetadataWins && remoteMetadata != null) {
+                    remoteMetadata.toRecentFileItem().withLocalStorageForCloudMetadata(bookForMetadata)
+                } else {
+                    bookForMetadata
+                }
+                val metadataBook = when {
+                    remoteReadingPositionWins && remoteMetadata != null -> metadataBase.withCloudReadingPosition(remoteMetadata)
+                    metadataBase != bookForMetadata -> metadataBase.withLocalReadingPosition(bookForMetadata)
+                    else -> bookForMetadata
+                }
+                val readingPositionTimestamp = if (remoteReadingPositionWins) {
+                    remoteReadingTimestamp
+                } else {
+                    localReadingTimestamp
+                }
+                if (remoteReadingPositionWins) {
+                    logCloudSyncTrace {
+                        "android.upload.preserve_remote_position book=${bookForMetadata.bookId} " +
+                            "remoteReadTs=$remoteReadingTimestamp localReadTs=$localReadingTimestamp " +
+                            "remote=${remoteMetadata?.cloudSyncTraceSummary() ?: "null"}"
+                    }
+                }
+                if (remoteMetadataWins) {
+                    logCloudSyncTrace {
+                        "android.upload.preserve_remote_metadata book=${bookForMetadata.bookId} " +
+                            "remoteTs=${remoteMetadata?.lastModifiedTimestamp ?: 0L} localTs=${bookForMetadata.lastModifiedTimestamp} " +
+                            "remoteReadTs=$remoteReadingTimestamp localReadTs=$localReadingTimestamp " +
+                            metadataBook.cloudSyncTraceSummary("metadata")
+                    }
                 }
 
                 val newTimestamp = System.currentTimeMillis()
-                val metadataToSync = book.toBookMetadata().copy(
-                    lastModifiedTimestamp = newTimestamp, hasAnnotations = hasAnyData
+                val syncedAnnotationTimestamp = if (uploadedAnnotationPayload) {
+                    uploadedAnnotationModifiedTimestamp.takeIf { it > 0L }
+                        ?: maxOf(sidecars.annotationPayloadTimestamp, newTimestamp)
+                } else if (remoteMetadata?.hasAnnotations == true) {
+                    remoteAnnotationTimestamp
+                } else {
+                    0L
+                }
+                val syncedHasAnnotations = uploadedAnnotationPayload || remoteMetadata?.hasAnnotations == true
+                val metadataToSync = metadataBook.toBookMetadata().copy(
+                    lastModifiedTimestamp = newTimestamp,
+                    readingPositionModifiedTimestamp = readingPositionTimestamp,
+                    annotationModifiedTimestamp = syncedAnnotationTimestamp,
+                    hasAnnotations = syncedHasAnnotations
                 )
 
                 firestoreRepository.syncBookMetadata(currentUser.uid, metadataToSync, deviceId)
-                recentFilesRepository.addRecentFile(book.copy(lastModifiedTimestamp = newTimestamp))
+                recentFilesRepository.addRecentFile(
+                    metadataBook.copy(
+                        lastModifiedTimestamp = newTimestamp,
+                        readingPositionModifiedTimestamp = readingPositionTimestamp
+                    )
+                )
+                logCloudAnnotationSyncTrace {
+                    "android.upload.metadata_success book=${bookForMetadata.bookId} newTs=$newTimestamp " +
+                        "readTs=$readingPositionTimestamp hasAnnotations=$syncedHasAnnotations " +
+                        "annTs=$syncedAnnotationTimestamp payloadTs=${sidecars.annotationPayloadTimestamp}"
+                }
+                logCloudSyncTrace {
+                    "android.upload.metadata_success user=${currentUser.uid} oldTs=${bookForMetadata.lastModifiedTimestamp} " +
+                        "newTs=$newTimestamp readTs=$readingPositionTimestamp annTs=$syncedAnnotationTimestamp " +
+                        "remoteReadTs=$remoteReadingTimestamp localReadTs=$localReadingTimestamp " +
+                        "hasAnnotations=$syncedHasAnnotations ${metadataBook.cloudSyncTraceSummary()}"
+                }
                 Timber.tag("AnnotationSync")
-                    .d("Firestore metadata updated for ${book.bookId} (hasData=$hasAnyData)")
+                    .d("Firestore metadata updated for ${book.bookId} (hasAnnotationPayload=${sidecars.hasAnnotationPayload}, syncedHasAnnotations=$syncedHasAnnotations)")
             } catch (e: Exception) {
+                logCloudSyncError(e) { "android.upload.failed ${book.cloudSyncTraceSummary()}" }
                 Timber.tag("AnnotationSync").e(e, "Failed to sync book data: ${book.bookId}")
             }
         }
@@ -2242,6 +2761,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         val closingBookId = _internalState.value.selectedBookId
         val uriString = _internalState.value.selectedPdfUri?.toString()
             ?: _internalState.value.selectedEpubUri?.toString()
+        logCloudSyncTrace {
+            "android.reader.close_request book=$closingBookId uri=${uriString.cloudSyncPreview()} sync=${uiState.value.isSyncEnabled}"
+        }
 
         val ttsState = ttsController.ttsState.value
         val isTtsActive = ttsState.playbackSource == "READER" &&
@@ -2274,26 +2796,34 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
         clearPersistedReaderSession()
 
+        var removesExternalFileOnClose = false
         if (closingBookId != null && closingBookId == externalOpenedBookId) {
             val behavior = prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") ?: "ASK"
             if (behavior == "ASK") {
                 _internalState.update { it.copy(showExternalFileSavePromptFor = closingBookId) }
             } else if (behavior == "DELETE") {
-                deleteBookPermanently(closingBookId)
+                removesExternalFileOnClose = true
+                deletePendingExternalFileRemoval(closingBookId, uriString)
+            } else {
+                clearPendingExternalFileRemovals(setOf(closingBookId))
             }
             externalOpenedBookId = null
         }
 
-        if (uriString != null) {
+        if (uriString != null && !removesExternalFileOnClose) {
             viewModelScope.launch {
                 val freshBook = recentFilesRepository.getFileByUri(uriString)
                 freshBook?.let {
                     if (uiState.value.uploadingBookIds.contains(it.bookId)) {
+                        logCloudSyncTrace { "android.reader.close_upload_skip reason=already_uploading ${it.cloudSyncTraceSummary()}" }
                         return@launch
                     }
                     if (uiState.value.isSyncEnabled) {
+                        logCloudSyncTrace { "android.reader.close_upload_start ${it.cloudSyncTraceSummary()}" }
                         Timber.d("Book closed, triggering metadata sync for ${it.bookId}")
                         uploadSingleBookMetadata(it)
+                    } else {
+                        logCloudSyncTrace { "android.reader.close_upload_skip reason=sync_disabled ${it.cloudSyncTraceSummary()}" }
                     }
 
                     if (it.sourceFolderUri != null) {
@@ -2393,72 +2923,32 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun loadSyncedFoldersFromPrefs(): List<SyncedFolder> {
-        val jsonString = prefs.getString(KEY_SYNCED_FOLDERS_JSON, null)
-        val folders = mutableListOf<SyncedFolder>()
+        val jsonString = prefs.getString(SyncedFolderPrefs.KEY_SYNCED_FOLDERS_JSON, null)
+        val oldUri = prefs.getString(SyncedFolderPrefs.KEY_LEGACY_SYNCED_FOLDER_URI, null)
+        val folders = SyncedFolderPrefs.decodeSyncedFolders(
+            jsonString = jsonString,
+            legacyUri = oldUri,
+            legacyLastScanTime = prefs.getLong(SyncedFolderPrefs.KEY_LEGACY_LAST_FOLDER_SCAN_TIME, 0L),
+            legacyNameResolver = { uri -> getDisplayPathFromUri(appContext, uri) }
+        )
 
-        if (jsonString == null && prefs.contains(KEY_SYNCED_FOLDER_URI)) {
-            val oldUri = prefs.getString(KEY_SYNCED_FOLDER_URI, null)
-            val oldTime = prefs.getLong(KEY_LAST_FOLDER_SCAN_TIME, 0L)
-            if (oldUri != null) {
-                val name = getDisplayPathFromUri(appContext, oldUri)
-                val migrated = SyncedFolder(oldUri, name, oldTime, ANDROID_SYNCABLE_FILE_TYPES)
-                folders.add(migrated)
-                saveSyncedFoldersToPrefs(folders)
-
-                prefs.edit {
-                    remove(KEY_SYNCED_FOLDER_URI)
-                    remove(KEY_LAST_FOLDER_SCAN_TIME)
-                }
-            }
-        } else if (jsonString != null) {
-            try {
-                val jsonArray = JSONArray(jsonString)
-                for (i in 0 until jsonArray.length()) {
-                    val obj = jsonArray.getJSONObject(i)
-
-                    val allowedFileTypes = mutableSetOf<FileType>()
-                    if (obj.has("allowedFileTypes")) {
-                        val typesArray = obj.getJSONArray("allowedFileTypes")
-                        for (j in 0 until typesArray.length()) {
-                            try {
-                                allowedFileTypes.add(FileType.valueOf(typesArray.getString(j)))
-                            } catch (_: Exception) {}
-                        }
-                    } else {
-                        allowedFileTypes.addAll(ANDROID_SYNCABLE_FILE_TYPES)
-                    }
-
-                    folders.add(
-                        SyncedFolder(
-                            uriString = obj.getString("uri"),
-                            name = obj.getString("name"),
-                            lastScanTime = obj.optLong("lastScanTime", 0L),
-                            allowedFileTypes = allowedFileTypes.filterTo(mutableSetOf()) { it in ANDROID_SYNCABLE_FILE_TYPES }
-                        )
-                    )
-                }
-            } catch (e: Exception) {
-                Timber.e(e, "Failed to parse synced folders JSON")
+        if (jsonString == null && prefs.contains(SyncedFolderPrefs.KEY_LEGACY_SYNCED_FOLDER_URI) && oldUri != null) {
+            saveSyncedFoldersToPrefs(folders)
+            prefs.edit {
+                remove(SyncedFolderPrefs.KEY_LEGACY_SYNCED_FOLDER_URI)
+                remove(SyncedFolderPrefs.KEY_LEGACY_LAST_FOLDER_SCAN_TIME)
             }
         }
         return folders
     }
 
     private fun saveSyncedFoldersToPrefs(folders: List<SyncedFolder>) {
-        val jsonArray = JSONArray()
-        folders.forEach { folder ->
-            val obj = JSONObject()
-            obj.put("uri", folder.uriString)
-            obj.put("name", folder.name)
-            obj.put("lastScanTime", folder.lastScanTime)
-            val typesArray = JSONArray()
-            folder.allowedFileTypes
-                .filter { it in ANDROID_SYNCABLE_FILE_TYPES }
-                .forEach { typesArray.put(it.name) }
-            obj.put("allowedFileTypes", typesArray)
-            jsonArray.put(obj)
+        prefs.edit {
+            putString(
+                SyncedFolderPrefs.KEY_SYNCED_FOLDERS_JSON,
+                SyncedFolderPrefs.encodeSyncedFolders(folders)
+            )
         }
-        prefs.edit { putString(KEY_SYNCED_FOLDERS_JSON, jsonArray.toString()) }
     }
 
     fun addSyncedFolder(folderUri: Uri) {
@@ -2482,7 +2972,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 )
 
                 val name = getDisplayPathFromUri(appContext, folderUri.toString())
-                val newFolder = SyncedFolder(folderUri.toString(), name, 0L, ANDROID_SYNCABLE_FILE_TYPES)
+                val newFolder = SyncedFolder(
+                    uriString = folderUri.toString(),
+                    name = name,
+                    lastScanTime = 0L,
+                    allowedFileTypes = ANDROID_SYNCABLE_FILE_TYPES,
+                    localSyncEnabled = true
+                )
                 val newStats = currentFolders + newFolder
 
                 saveSyncedFoldersToPrefs(newStats)
@@ -2541,6 +3037,50 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun setFolderLocalSyncEnabled(
+        folder: SyncedFolder,
+        enabled: Boolean,
+        removeSyncDataFolder: Boolean = false
+    ) {
+        viewModelScope.launch {
+            val currentFolders = _internalState.value.syncedFolders.toMutableList()
+            val index = currentFolders.indexOfFirst { it.uriString == folder.uriString }
+            if (index == -1) return@launch
+
+            val updatedFolder = currentFolders[index].copy(localSyncEnabled = enabled)
+            currentFolders[index] = updatedFolder
+            saveSyncedFoldersToPrefs(currentFolders)
+            _internalState.update { it.copy(syncedFolders = currentFolders) }
+
+            if (enabled) {
+                showBanner(appContext.getString(R.string.banner_folder_local_sync_enabled))
+                triggerFolderSyncWorker(
+                    metadataOnly = false,
+                    showFeedback = true,
+                    targetFolderUriString = updatedFolder.uriString
+                )
+            } else {
+                val workManager = WorkManager.getInstance(appContext)
+                workManager.cancelUniqueWork(FolderSyncWorker.WORK_NAME_ONETIME)
+                workManager.cancelUniqueWork(MetadataExtractionWorker.WORK_NAME)
+
+                if (removeSyncDataFolder) {
+                    val removed = withContext(Dispatchers.IO) {
+                        LocalSyncUtils.deleteSyncDataFolder(appContext, updatedFolder.uriString.toUri())
+                    }
+                    val message = if (removed) {
+                        appContext.getString(R.string.banner_folder_local_sync_disabled_removed_data)
+                    } else {
+                        appContext.getString(R.string.banner_folder_sync_data_remove_failed)
+                    }
+                    showBanner(message, isError = !removed)
+                } else {
+                    showBanner(appContext.getString(R.string.banner_folder_local_sync_disabled))
+                }
+            }
+        }
+    }
+
     fun syncFolderMetadata(showFeedback: Boolean = false) {
         triggerFolderSyncWorker(metadataOnly = true, showFeedback = showFeedback)
     }
@@ -2554,11 +3094,21 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         showFeedback: Boolean,
         targetFolderUriString: String? = null
     ) {
-        val folders = _internalState.value.syncedFolders
-        if (folders.isEmpty()) return
+        val allFolders = _internalState.value.syncedFolders
+        val folders = if (targetFolderUriString.isNullOrBlank()) {
+            allFolders.filter { it.localSyncEnabled }
+        } else {
+            allFolders.filter { it.uriString == targetFolderUriString && it.localSyncEnabled }
+        }
+        if (folders.isEmpty()) {
+            if (showFeedback) {
+                showBanner(appContext.getString(R.string.error_no_enabled_folder_sync), isError = true)
+            }
+            return
+        }
 
         val targetFolderName = targetFolderUriString
-            ?.let { target -> folders.firstOrNull { it.uriString == target }?.name ?: target }
+            ?.let { target -> allFolders.firstOrNull { it.uriString == target }?.name ?: target }
         ReaderPerfLog.d(
             "FolderSync request folders=${folders.size} target=${targetFolderName ?: "ALL"} " +
                 "metadataOnly=$metadataOnly feedback=$showFeedback"
@@ -2690,8 +3240,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             prefs.edit {
-                remove(KEY_SYNCED_FOLDERS_JSON)
-                remove(KEY_SYNCED_FOLDER_URI)
+                remove(SyncedFolderPrefs.KEY_SYNCED_FOLDERS_JSON)
+                remove(SyncedFolderPrefs.KEY_LEGACY_SYNCED_FOLDER_URI)
             }
             _internalState.update { it.copy(syncedFolders = emptyList()) }
         }
@@ -2718,8 +3268,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         it.name
                     }
 
-                val fileExtension = item.type.name.lowercase()
-                val fileName = "${item.bookId}.$fileExtension"
+                val fileName = sharedCloudBookContentFileName(item.bookId, item.type)
+                    ?: throw Exception("Unsupported cloud file type: ${item.type}")
                 val driveFileId = remoteFiles[fileName]?.id
 
                 if (driveFileId != null) {
@@ -2729,6 +3279,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             accessToken, driveFileId, destinationFile
                         )
                     ) {
+                        if (item.fileContentModifiedTimestamp > 0L) {
+                            destinationFile.setLastModified(item.fileContentModifiedTimestamp)
+                        }
                         addFileToRecent(
                             destinationFile.toUri(),
                             item.type,
@@ -2987,25 +3540,38 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun shouldDownloadRemoteBookContent(local: RecentFileItem, remote: RecentFileItem): Boolean {
+        val localFile = local.getUri()?.path?.let(::File)
+        val localContentTimestamp = local.fileContentModifiedTimestamp.takeIf { it > 0L }
+            ?: localFile?.takeIf { it.isFile }?.lastModified()
+            ?: 0L
         return local.sourceFolderUri == null &&
             !local.isDeleted &&
-            local.type == FileType.EPUB &&
-            remote.type == FileType.EPUB &&
-            !remote.isDeleted &&
-            remote.fileContentModifiedTimestamp > 0L &&
-            remote.fileContentModifiedTimestamp > local.fileContentModifiedTimestamp
+            local.type == remote.type &&
+            sharedCloudBookContentFileName(local.bookId, local.type) != null &&
+            shouldDownloadRemoteCloudBookContent(
+                localFileAvailable = local.isAvailable && localFile?.isFile != false,
+                localContentModifiedTimestamp = localContentTimestamp,
+                remoteContentModifiedTimestamp = remote.fileContentModifiedTimestamp,
+                remoteDeleted = remote.isDeleted
+            )
     }
 
     private fun shouldUploadLocalBookContent(local: RecentFileItem, remote: RecentFileItem?): Boolean {
+        val localFile = local.getUri()?.path?.let(::File)
+        val localContentTimestamp = local.fileContentModifiedTimestamp.takeIf { it > 0L }
+            ?: localFile?.takeIf { it.isFile }?.lastModified()
+            ?: 0L
         return local.sourceFolderUri == null &&
-            local.type == FileType.EPUB &&
-            local.fileContentModifiedTimestamp > 0L &&
-            local.fileContentModifiedTimestamp > (remote?.fileContentModifiedTimestamp ?: 0L)
+            sharedCloudBookContentFileName(local.bookId, local.type) != null &&
+            shouldUploadLocalCloudBookContent(
+                localFileAvailable = local.isAvailable && localFile?.isFile == true,
+                localContentModifiedTimestamp = localContentTimestamp,
+                remoteContentModifiedTimestamp = remote?.fileContentModifiedTimestamp
+            )
     }
 
     private suspend fun downloadCloudBookFile(accessToken: String, remote: RecentFileItem): Boolean {
-        val fileExtension = remote.type.name.lowercase()
-        val fileName = "${remote.bookId}.$fileExtension"
+        val fileName = sharedCloudBookContentFileName(remote.bookId, remote.type) ?: return false
         val driveFileId = googleDriveRepository.getFiles(accessToken)
             ?.files
             .orEmpty()
@@ -3034,6 +3600,17 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         return true
     }
 
+    private fun scheduleCloudContentRetry(bookIds: Set<String>) {
+        if (bookIds.isEmpty() || cloudContentRetryJob?.isActive == true) return
+        cloudContentRetryJob = viewModelScope.launch {
+            delay(CLOUD_CONTENT_RETRY_DELAY_MILLIS)
+            if (uiState.value.isSyncEnabled) {
+                logCloudSyncTrace { "android.full_sync.content_retry books=${bookIds.joinToString()}" }
+                syncWithCloud(showBanner = false).join()
+            }
+        }
+    }
+
     fun setFolderSyncEnabled(enabled: Boolean) {
         prefs.edit { putBoolean(KEY_FOLDER_SYNC_ENABLED, enabled) }
         _internalState.update { it.copy(isFolderSyncEnabled = enabled) }
@@ -3048,12 +3625,20 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         val currentUser = _internalState.value.currentUser
 
         if (!hasPermissions || currentUser == null) {
+            logCloudSyncTrace {
+                "android.full_sync.skip reason=${if (!hasPermissions) "missing_drive_permissions" else "no_user"} " +
+                    "showBanner=$showBanner"
+            }
             if (showBanner) _internalState.update {
                 it.copy(errorMessage = appContext.getString(R.string.error_not_signed_in_sync))
             }
             return@launch
         }
 
+        logCloudSyncTrace {
+            "android.full_sync.start user=${currentUser.uid} showBanner=$showBanner " +
+                "folderSync=${_internalState.value.isFolderSyncEnabled}"
+        }
         if (showBanner) {
             _internalState.update {
                 it.copy(bannerMessage = BannerMessage(appContext.getString(R.string.banner_cloud_sync_checking)))
@@ -3061,7 +3646,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         try {
-            val accessToken = googleDriveRepository.getAccessToken(appContext) ?: return@launch
+            val accessToken = googleDriveRepository.getAccessToken(appContext) ?: run {
+                logCloudSyncTrace { "android.full_sync.skip reason=no_access_token user=${currentUser.uid}" }
+                return@launch
+            }
 
             val deviceId = getInstallationId()
             val remoteBooksDeferred = async(Dispatchers.IO) {
@@ -3086,6 +3674,14 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val remoteBooks = remoteBooksDeferred.await()
                 .filterNot { it.isManualOnlyReaderFile() }
             val remoteShelves = remoteShelvesDeferred.await()
+            val initialDriveFiles = withContext(Dispatchers.IO) {
+                googleDriveRepository.getFiles(accessToken)?.files.orEmpty().associateBy { it.name }
+            }
+            logCloudSyncTrace {
+                "android.full_sync.loaded user=${currentUser.uid} device=$deviceId " +
+                    "localBooks=${localBooks.size} remoteBooks=${remoteBooks.size} " +
+                    "remoteShelves=${remoteShelves.size} driveFiles=${initialDriveFiles.size}"
+            }
             val syncableBookIds = (localBooks.map { it.bookId } + remoteBooks.map { it.bookId }).toSet()
             val allKnownShelfNames =
                 (localShelfNames + remoteShelves.map { it.name }).toSet()
@@ -3103,17 +3699,23 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val localBooksMap = localBooks.associateBy { it.bookId }
             val remoteBooksMap = remoteBooks.associateBy { it.bookId }
             val allBookIds = (localBooksMap.keys + remoteBooksMap.keys).distinct()
+            val pendingContentDownloads = mutableSetOf<String>()
 
             allBookIds.forEach { bookId ->
                 val local = localBooksMap[bookId]
                 val remote = remoteBooksMap[bookId]
 
                 if (local?.sourceFolderUri != null) {
+                    logCloudSyncTrace { "android.full_sync.book_skip reason=folder_book ${local.cloudSyncTraceSummary()}" }
                     Timber.d("Skipping cloud book metadata merge for local folder book: ${local.displayName}")
                     return@forEach
                 }
 
                 if (local != null && remote != null) {
+                    logCloudSyncTrace {
+                        "android.full_sync.compare book=$bookId ${local.cloudSyncTraceSummary()} " +
+                            "${remote.cloudSyncTraceSummary()} "
+                    }
                     Timber.tag("AnnotationSync").d(
                         "Checking $bookId. LocalTS: ${local.lastModifiedTimestamp}, RemoteTS: ${remote.lastModifiedTimestamp}, RemoteHasAnn: ${remote.hasAnnotations}"
                     )
@@ -3122,42 +3724,182 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 when {
                     local != null && remote == null -> {
                         if (local.isDeleted) {
+                            logCloudSyncTrace { "android.full_sync.decision action=upload_deleted_metadata ${local.cloudSyncTraceSummary()}" }
                             uploadSingleBookMetadata(local)
                         } else {
+                            logCloudSyncTrace { "android.full_sync.decision action=upload_new_book ${local.cloudSyncTraceSummary()}" }
                             uploadNewBookAndMetadata(local)
                         }
                     }
 
                     local == null && remote != null -> {
+                        if (remote.isDeleted) {
+                            logCloudSyncTrace { "android.full_sync.decision action=skip_deleted_remote_only ${remote.cloudSyncTraceSummary()}" }
+                            return@forEach
+                        }
+                        logCloudSyncTrace { "android.full_sync.decision action=apply_remote_new ${remote.cloudSyncTraceSummary()}" }
                         recentFilesRepository.addRecentFile(remote.toRecentFileItem())
                         if (remote.hasAnnotations) {
-                            downloadAnnotationsForBook(accessToken, bookId)
+                            val remoteAnnotationDriveTimestamp =
+                                initialDriveFiles[cloudPdfAnnotationDriveFileName(bookId)]?.modifiedTimeMillis ?: 0L
+                            val remoteAnnotationTimestamp = remote.effectiveAnnotationModifiedTimestamp(remoteAnnotationDriveTimestamp)
+                            logCloudAnnotationSyncTrace {
+                                "android.full_sync.remote_only_download book=$bookId remoteTs=${remote.lastModifiedTimestamp} " +
+                                    "remoteAnnTs=$remoteAnnotationTimestamp remoteDriveAnnTs=$remoteAnnotationDriveTimestamp " +
+                                    "remoteHasAnnotations=${remote.hasAnnotations}"
+                            }
+                            downloadAnnotationsForBook(accessToken, bookId, remoteAnnotationTimestamp)
                         }
                     }
 
                     local != null && remote != null -> {
                         val remoteItem = remote.toRecentFileItem()
-                        val shouldDownloadContent = shouldDownloadRemoteBookContent(local, remoteItem)
+                        val inkFile = pdfAnnotationRepository.getAnnotationFileForSync(bookId)
+                        val deletedInkFile = pdfAnnotationRepository.getDeletedAnnotationsFileForSync(bookId)
+                        val richTextFile = pdfRichTextRepository.getFileForSync(bookId)
+                        val layoutFile = pageLayoutRepository.getLayoutFile(bookId)
+                        val textBoxFile = pdfTextBoxRepository.getFileForSync(bookId)
+                        val highlightFile = pdfHighlightRepository.getFileForSync(bookId)
+                        val localSidecars = AndroidPdfCloudSidecarState(
+                            hasInk = inkFile.hasSyncableCloudAnnotationPayload(),
+                            inkTimestamp = inkFile?.lastModified() ?: 0L,
+                            hasDeletedInk = deletedInkFile.hasSyncableCloudAnnotationPayload(),
+                            deletedInkTimestamp = deletedInkFile?.lastModified() ?: 0L,
+                            hasRichText = richTextFile.hasSyncableCloudAnnotationPayload(),
+                            richTextTimestamp = richTextFile.lastModified(),
+                            hasLayout = layoutFile.exists(),
+                            layoutTimestamp = layoutFile.lastModified(),
+                            hasTextBoxes = textBoxFile.hasSyncableCloudAnnotationPayload(),
+                            textBoxesTimestamp = textBoxFile.lastModified(),
+                            hasHighlights = highlightFile.hasSyncableCloudAnnotationPayload(),
+                            highlightsTimestamp = highlightFile.lastModified()
+                        )
+                        val fileLastModified = localSidecars.annotationPayloadTimestamp
+                        val remoteAnnotationDriveTimestamp =
+                            initialDriveFiles[cloudPdfAnnotationDriveFileName(bookId)]?.modifiedTimeMillis ?: 0L
+                        val remoteAnnotationTimestamp = remote.effectiveAnnotationModifiedTimestamp(remoteAnnotationDriveTimestamp)
+                        val localAnnotationsShouldUpload = shouldUploadLocalPdfCloudAnnotations(
+                            localSidecars = localSidecars,
+                            remoteHasAnnotations = remote.hasAnnotations,
+                            remoteAnnotationModifiedTimestamp = remoteAnnotationTimestamp
+                        )
+                        logCloudAnnotationSyncTrace {
+                            "android.full_sync.inspect book=$bookId remoteHas=${remote.hasAnnotations} " +
+                                "remoteTs=${remote.lastModifiedTimestamp} remoteAnnTs=$remoteAnnotationTimestamp " +
+                                "remoteDriveAnnTs=$remoteAnnotationDriveTimestamp " +
+                                "localTs=${local.lastModifiedTimestamp} " +
+                                "remoteReadTs=${remote.effectiveReadingPositionModifiedTimestamp()} " +
+                                "localReadTs=${local.effectiveReadingPositionModifiedTimestamp()} " +
+                                "localPayload=${localSidecars.hasAnnotationPayload} " +
+                                "localPayloadTs=${localSidecars.annotationPayloadTimestamp} " +
+                                "layoutExists=${localSidecars.hasLayout} layoutTs=${localSidecars.layoutTimestamp} " +
+                                "shouldUploadLocal=$localAnnotationsShouldUpload"
+                        }
+                        if (remote.isDeleted) {
+                            val localWinsDeletedRemote = shouldUploadLocalCloudBookMetadataUpdate(
+                                localModifiedTimestamp = local.lastModifiedTimestamp,
+                                remoteModifiedTimestamp = remote.lastModifiedTimestamp
+                            )
+                            val remoteDeleteWins = shouldApplyRemoteCloudBookMetadataUpdate(
+                                localModifiedTimestamp = local.lastModifiedTimestamp,
+                                remoteModifiedTimestamp = remote.lastModifiedTimestamp
+                            )
+                            when {
+                                localWinsDeletedRemote -> {
+                                    logCloudSyncTrace {
+                                        "android.full_sync.decision action=resurrect_upload_local book=$bookId " +
+                                            "localTs=${local.lastModifiedTimestamp} remoteTs=${remote.lastModifiedTimestamp} payloadSidecarTs=$fileLastModified"
+                                    }
+                                    if (shouldUploadLocalBookContent(local, null)) {
+                                        uploadNewBookAndMetadata(local)
+                                    } else {
+                                        uploadSingleBookMetadata(local)
+                                    }
+                                }
+
+                                remoteDeleteWins -> {
+                                    logCloudSyncTrace {
+                                        "android.full_sync.decision action=apply_remote_delete book=$bookId " +
+                                            "localTs=${local.lastModifiedTimestamp} remoteTs=${remote.lastModifiedTimestamp} payloadSidecarTs=$fileLastModified"
+                                    }
+                                    recentFilesRepository.deleteFilePermanently(listOf(bookId))
+                                }
+
+                                else -> {
+                                    logCloudSyncTrace {
+                                        "android.full_sync.decision action=skip_equal_delete book=$bookId " +
+                                            "localTs=${local.lastModifiedTimestamp} remoteTs=${remote.lastModifiedTimestamp} payloadSidecarTs=$fileLastModified"
+                                    }
+                                }
+                            }
+                            return@forEach
+                        }
+                        val localWithRemoteEpubAnnotations = local.mergeRemoteEpubAnnotationMetadata(remote)
+                        val effectiveLocal = if (localWithRemoteEpubAnnotations != local) {
+                            logCloudSyncTrace {
+                                "android.full_sync.decision action=merge_remote_epub_annotations book=$bookId " +
+                                    "local=${local.cloudSyncTraceSummary()} ${remote.cloudSyncTraceSummary()} " +
+                                    "merged=${localWithRemoteEpubAnnotations.cloudSyncTraceSummary()}"
+                            }
+                            recentFilesRepository.addRecentFile(localWithRemoteEpubAnnotations)
+                            localWithRemoteEpubAnnotations
+                        } else {
+                            local
+                        }
+                        val localReadingTimestamp = effectiveLocal.effectiveReadingPositionModifiedTimestamp()
+                        val remoteReadingTimestamp = remote.effectiveReadingPositionModifiedTimestamp()
+                        val localReadingPositionShouldUpload = localReadingTimestamp > remoteReadingTimestamp
+                        val shouldDownloadContent = shouldDownloadRemoteBookContent(effectiveLocal, remoteItem)
                         val downloadedRemoteContent = if (shouldDownloadContent) {
-                            downloadCloudBookFile(accessToken, remoteItem.copy(displayName = remoteItem.displayName.ifBlank { local.displayName }))
+                            logCloudSyncTrace {
+                                "android.full_sync.content_download_start book=$bookId " +
+                                    "localContentTs=${effectiveLocal.fileContentModifiedTimestamp} remoteContentTs=${remote.fileContentModifiedTimestamp}"
+                            }
+                            downloadCloudBookFile(accessToken, remoteItem.copy(displayName = remoteItem.displayName.ifBlank { effectiveLocal.displayName }))
                         } else {
                             false
                         }
+                        logCloudSyncTrace {
+                            "android.full_sync.content_decision book=$bookId shouldDownload=$shouldDownloadContent " +
+                                "downloaded=$downloadedRemoteContent localPayloadSidecarTs=$fileLastModified " +
+                                "localLayoutTs=${localSidecars.layoutTimestamp.takeIf { localSidecars.hasLayout } ?: 0L}"
+                        }
+                        if (shouldDownloadContent && !downloadedRemoteContent) {
+                            pendingContentDownloads += bookId
+                        }
 
-                        if (local.lastModifiedTimestamp > remote.lastModifiedTimestamp) {
-                            if (shouldUploadLocalBookContent(local, remoteItem)) {
-                                uploadNewBookAndMetadata(local)
+                        if (shouldUploadLocalCloudBookMetadataUpdate(
+                                localModifiedTimestamp = effectiveLocal.lastModifiedTimestamp,
+                                remoteModifiedTimestamp = remote.lastModifiedTimestamp
+                            )
+                        ) {
+                            logCloudSyncTrace {
+                                "android.full_sync.decision action=upload_local book=$bookId " +
+                                    "localTs=${effectiveLocal.lastModifiedTimestamp} remoteTs=${remote.lastModifiedTimestamp} " +
+                                    "localReadTs=$localReadingTimestamp remoteReadTs=$remoteReadingTimestamp payloadSidecarTs=$fileLastModified " +
+                                    "uploadContent=${shouldUploadLocalBookContent(effectiveLocal, remoteItem)}"
+                            }
+                            if (shouldUploadLocalBookContent(effectiveLocal, remoteItem)) {
+                                uploadNewBookAndMetadata(effectiveLocal)
                             } else {
-                                uploadSingleBookMetadata(local)
+                                uploadSingleBookMetadata(effectiveLocal)
                             }
                         } else {
                             val isMetadataNewer =
-                                remote.lastModifiedTimestamp > local.lastModifiedTimestamp
+                                shouldApplyRemoteCloudBookMetadataUpdate(
+                                    localModifiedTimestamp = effectiveLocal.lastModifiedTimestamp,
+                                    remoteModifiedTimestamp = remote.lastModifiedTimestamp
+                                )
 
                             if (isMetadataNewer) {
+                                logCloudSyncTrace {
+                                    "android.full_sync.decision action=apply_remote_metadata book=$bookId " +
+                                        "localTs=${effectiveLocal.lastModifiedTimestamp} remoteTs=${remote.lastModifiedTimestamp} payloadSidecarTs=$fileLastModified " +
+                                        "downloadedContent=$downloadedRemoteContent"
+                                }
                                 val remoteForLocalDb = if (shouldDownloadContent && !downloadedRemoteContent) {
                                     remote.toRecentFileItem().copy(
-                                        fileContentModifiedTimestamp = local.fileContentModifiedTimestamp
+                                        fileContentModifiedTimestamp = effectiveLocal.fileContentModifiedTimestamp
                                     )
                                 } else {
                                     remote.toRecentFileItem()
@@ -3165,31 +3907,76 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 recentFilesRepository.addRecentFile(
                                     remoteForLocalDb
                                 )
+                                if (localAnnotationsShouldUpload || localReadingPositionShouldUpload) {
+                                    recentFilesRepository.getFileByBookId(bookId)?.let { merged ->
+                                        logCloudAnnotationSyncTrace {
+                                            "android.full_sync.upload_local_annotations book=$bookId reason=remote_metadata_newer " +
+                                                "remoteTs=${remote.lastModifiedTimestamp} localPayloadTs=$fileLastModified " +
+                                                "localReadTs=$localReadingTimestamp remoteReadTs=$remoteReadingTimestamp " +
+                                                "uploadReadingPosition=$localReadingPositionShouldUpload"
+                                        }
+                                        logCloudSyncTrace {
+                                            "android.full_sync.decision action=upload_local_supplement book=$bookId " +
+                                                "remoteMetadataTs=${remote.lastModifiedTimestamp} payloadSidecarTs=$fileLastModified " +
+                                                "uploadAnnotations=$localAnnotationsShouldUpload uploadReadingPosition=$localReadingPositionShouldUpload"
+                                        }
+                                        uploadSingleBookMetadata(merged)
+                                    }
+                                }
+                            } else {
+                                logCloudSyncTrace {
+                                    "android.full_sync.decision action=metadata_noop book=$bookId " +
+                                        "localTs=${effectiveLocal.lastModifiedTimestamp} remoteTs=${remote.lastModifiedTimestamp} " +
+                                        "localReadTs=$localReadingTimestamp remoteReadTs=$remoteReadingTimestamp payloadSidecarTs=$fileLastModified"
+                                }
+                                if (localAnnotationsShouldUpload || localReadingPositionShouldUpload) {
+                                    logCloudAnnotationSyncTrace {
+                                        "android.full_sync.upload_local_annotations book=$bookId reason=metadata_noop " +
+                                            "remoteTs=${remote.lastModifiedTimestamp} localPayloadTs=$fileLastModified " +
+                                            "localReadTs=$localReadingTimestamp remoteReadTs=$remoteReadingTimestamp"
+                                    }
+                                    logCloudSyncTrace {
+                                        "android.full_sync.decision action=upload_local_supplement book=$bookId " +
+                                            "metadataEqual=${effectiveLocal.lastModifiedTimestamp == remote.lastModifiedTimestamp} " +
+                                            "uploadAnnotations=$localAnnotationsShouldUpload uploadReadingPosition=$localReadingPositionShouldUpload " +
+                                            "payloadSidecarTs=$fileLastModified"
+                                    }
+                                    uploadSingleBookMetadata(effectiveLocal)
+                                }
                             }
 
-                            val inkFile = pdfAnnotationRepository.getAnnotationFileForSync(bookId)
-                            val richTextFile = pdfRichTextRepository.getFileForSync(bookId)
-                            val layoutFile = pageLayoutRepository.getLayoutFile(bookId)
-                            val textBoxFile = pdfTextBoxRepository.getFileForSync(bookId)
-                            val highlightFile = pdfHighlightRepository.getFileForSync(bookId)
-
-                            val anyLocalFileExists =
-                                (inkFile?.exists() == true) || richTextFile.exists() || layoutFile.exists() || textBoxFile.exists() || highlightFile.exists()
-                            val localFileMissing = !anyLocalFileExists
-
-                            val fileLastModified = maxOf(
-                                inkFile?.lastModified() ?: 0L,
-                                richTextFile.lastModified(),
-                                layoutFile.lastModified(),
-                                textBoxFile.lastModified(),
-                                highlightFile.lastModified()
+                            val shouldDownloadRemoteAnnotations = shouldDownloadRemotePdfCloudAnnotations(
+                                localSidecars = localSidecars,
+                                localAnnotationsShouldUpload = localAnnotationsShouldUpload,
+                                remoteHasAnnotations = remote.hasAnnotations,
+                                remoteAnnotationModifiedTimestamp = remoteAnnotationTimestamp
                             )
-                            val isFileStale =
-                                remote.hasAnnotations && (remote.lastModifiedTimestamp > fileLastModified)
 
-                            if (isMetadataNewer || localFileMissing && remote.hasAnnotations || isFileStale) {
+                            if (shouldDownloadRemoteAnnotations) {
+                                logCloudAnnotationSyncTrace {
+                                    "android.full_sync.download_remote_annotations book=$bookId " +
+                                        "metadataNewer=$isMetadataNewer localPayloadMissing=${!localSidecars.hasAnnotationPayload} " +
+                                        "remoteTs=${remote.lastModifiedTimestamp} remoteAnnTs=$remoteAnnotationTimestamp " +
+                                        "localPayloadTs=$fileLastModified " +
+                                        "layoutTs=${localSidecars.layoutTimestamp.takeIf { localSidecars.hasLayout } ?: 0L}"
+                                }
+                                logCloudSyncTrace {
+                                    "android.full_sync.sidecar_download_start book=$bookId reason=" +
+                                        "metadataNewer=$isMetadataNewer localPayloadMissing=${!localSidecars.hasAnnotationPayload} " +
+                                        "remoteTs=${remote.lastModifiedTimestamp} remoteAnnTs=$remoteAnnotationTimestamp " +
+                                        "localPayloadSidecarTs=$fileLastModified " +
+                                        "localLayoutTs=${localSidecars.layoutTimestamp.takeIf { localSidecars.hasLayout } ?: 0L}"
+                                }
                                 Timber.tag("AnnotationSync").d("Triggering download for $bookId.")
-                                downloadAnnotationsForBook(accessToken, bookId)
+                                downloadAnnotationsForBook(accessToken, bookId, remoteAnnotationTimestamp)
+                            } else {
+                                logCloudAnnotationSyncTrace {
+                                    "android.full_sync.skip_remote_annotations book=$bookId " +
+                                        "remoteHas=${remote.hasAnnotations} localShouldUpload=$localAnnotationsShouldUpload " +
+                                        "metadataNewer=$isMetadataNewer localPayload=${localSidecars.hasAnnotationPayload} " +
+                                        "remoteTs=${remote.lastModifiedTimestamp} remoteAnnTs=$remoteAnnotationTimestamp " +
+                                        "localPayloadTs=$fileLastModified"
+                                }
                             }
                         }
                     }
@@ -3274,15 +4061,16 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 googleDriveRepository.getFiles(accessToken)?.files.orEmpty().associateBy { it.name }
             }
 
-            val downloadJobs = mutableListOf<Job>()
-
             finalMergedBooks.forEach { book ->
                 if (book.sourceFolderUri != null) return@forEach
-                val fileExtension = book.type.name.lowercase()
-                val fileName = "${book.bookId}.$fileExtension"
+                val fileName = sharedCloudBookContentFileName(book.bookId, book.type) ?: return@forEach
                 if (book.isDeleted) {
                     remoteFiles[fileName]?.id?.let { fileId ->
                         Timber.d("Deleting from Drive: $fileName")
+                        googleDriveRepository.deleteDriveFile(accessToken, fileId)
+                    }
+                    remoteFiles[cloudPdfAnnotationDriveFileName(book.bookId)]?.id?.let { fileId ->
+                        Timber.d("Deleting annotation bundle from Drive: ${book.bookId}")
                         googleDriveRepository.deleteDriveFile(accessToken, fileId)
                     }
                     recentFilesRepository.deleteFilePermanently(listOf(book.bookId))
@@ -3291,24 +4079,62 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     book.isAvailable &&
                     !remoteFiles.containsKey(fileName)
                 ) {
-                    book.getUri()?.path?.let { path ->
-                        val file = File(path)
-                        if (file.exists()) {
-                            Timber.d("Uploading book: ${book.displayName}")
-                            googleDriveRepository.uploadFile(
-                                accessToken, book.bookId, file, book.type
-                            )
+                    val remoteItem = remoteBooksMap[book.bookId]?.toRecentFileItem()
+                    if (remoteItem == null || shouldUploadLocalBookContent(book, remoteItem)) {
+                        book.getUri()?.path?.let { path ->
+                            val file = File(path)
+                            if (file.exists()) {
+                                Timber.d("Uploading book: ${book.displayName}")
+                                val uploadedFile = googleDriveRepository.uploadFile(
+                                    accessToken, book.bookId, file, book.type
+                                )
+                                if (uploadedFile != null) {
+                                    val contentTimestamp = book.fileContentModifiedTimestamp.takeIf { it > 0L }
+                                        ?: file.lastModified()
+                                    uploadSingleBookMetadata(
+                                        book.copy(
+                                            fileSize = file.length(),
+                                            fileContentModifiedTimestamp = contentTimestamp
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        pendingContentDownloads += book.bookId
+                        logCloudSyncTrace {
+                            "android.full_sync.content_wait_missing_remote book=${book.bookId} " +
+                                "file=$fileName localContentTs=${book.fileContentModifiedTimestamp} " +
+                                "remoteContentTs=${remoteItem.fileContentModifiedTimestamp}"
                         }
                     }
                 } else if (!book.isAvailable && remoteFiles.containsKey(fileName)) {
                     Timber.d("Sync: Triggering auto-download for ${book.displayName}")
-                    downloadJobs.add(downloadBook(book))
+                    val remoteItem = remoteBooksMap[book.bookId]
+                        ?.toRecentFileItem()
+                        ?.copy(displayName = book.displayName)
+                        ?: book
+                    val downloaded = downloadCloudBookFile(accessToken, remoteItem)
+                    if (!downloaded) {
+                        pendingContentDownloads += book.bookId
+                    }
+                } else if (!book.isAvailable) {
+                    pendingContentDownloads += book.bookId
                 }
             }
 
-            downloadJobs.joinAll()
+            if (pendingContentDownloads.isNotEmpty()) {
+                logCloudSyncTrace {
+                    "android.full_sync.content_pending books=${pendingContentDownloads.joinToString()}"
+                }
+                scheduleCloudContentRetry(pendingContentDownloads)
+            } else {
+                cloudContentRetryJob?.cancel()
+                cloudContentRetryJob = null
+            }
             syncFonts(currentUser.uid)
 
+            logCloudSyncTrace { "android.full_sync.complete user=${currentUser.uid}" }
             if (showBanner) {
                 _internalState.update {
                     it.copy(
@@ -3317,6 +4143,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         } catch (e: Exception) {
+            logCloudSyncError(e) { "android.full_sync.failed user=${currentUser.uid}" }
             Timber.tag("AnnotationSync").e(e, "Error during cloud sync")
             if (showBanner) {
                 _internalState.update {
@@ -3326,21 +4153,41 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private suspend fun downloadAnnotationsForBook(accessToken: String, bookId: String) {
+    private suspend fun downloadAnnotationsForBook(
+        accessToken: String,
+        bookId: String,
+        annotationModifiedTimestamp: Long
+    ) {
         // We download to a temp location first to inspect the content
         val tempDownloadFile = File(appContext.cacheDir, "temp_download_${bookId}.json")
 
+        logCloudSyncTrace {
+            "android.sidecar_download.start book=$bookId remoteAnnTs=$annotationModifiedTimestamp temp=${tempDownloadFile.name}"
+        }
+        logCloudAnnotationSyncTrace {
+            "android.download.start book=$bookId remoteAnnTs=$annotationModifiedTimestamp temp=${tempDownloadFile.name}"
+        }
         Timber.tag("AnnotationSync").d("Attempting download of bundle for $bookId.")
 
         val didDownload =
             googleDriveRepository.downloadAnnotationFile(accessToken, bookId, tempDownloadFile)
 
         if (didDownload && tempDownloadFile.exists()) {
+            logCloudAnnotationSyncTrace {
+                "android.download.success book=$bookId remoteAnnTs=$annotationModifiedTimestamp bytes=${tempDownloadFile.length()}"
+            }
+            logCloudSyncTrace {
+                "android.sidecar_download.success book=$bookId remoteAnnTs=$annotationModifiedTimestamp bytes=${tempDownloadFile.length()}"
+            }
             Timber.tag("AnnotationSync")
                 .d("Download SUCCESS. Size: ${tempDownloadFile.length()}. Unpacking...")
 
             try {
                 val jsonString = tempDownloadFile.readText()
+                val appliedAnnotationTimestamp =
+                    annotationModifiedTimestamp.takeIf { it > 0L }
+                        ?: tempDownloadFile.lastModified().takeIf { it > 0L }
+                        ?: 0L
                 Timber.d(
                     "android.cloud.import.downloaded book=$bookId rawLen=${jsonString.length}"
                 )
@@ -3358,16 +4205,22 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 } catch (_: Exception) {
                     false
                 }
+                logCloudAnnotationSyncTrace {
+                    "android.download.inspect book=$bookId isBundle=$isBundle rawBytes=${jsonString.length} " +
+                        "appliedAnnTs=$appliedAnnotationTimestamp rawPreview=${jsonString.take(80).replace('\n', ' ')}"
+                }
 
                 val inkFile = pdfAnnotationRepository.getAnnotationFileForSync(bookId) ?: File(
                     appContext.filesDir, "annotations/annotation_$bookId.json"
                 )
+                val deletedInkFile = File(appContext.filesDir, "annotations/deleted_annotation_$bookId.json")
                 val richTextFile = pdfRichTextRepository.getFileForSync(bookId)
                 val layoutFile = pageLayoutRepository.getLayoutFile(bookId)
                 val textBoxFile = pdfTextBoxRepository.getFileForSync(bookId)
                 val highlightFile = pdfHighlightRepository.getFileForSync(bookId)
 
                 inkFile.parentFile?.mkdirs()
+                deletedInkFile.parentFile?.mkdirs()
                 richTextFile.parentFile?.mkdirs()
                 layoutFile.parentFile?.mkdirs()
                 textBoxFile.parentFile?.mkdirs()
@@ -3380,44 +4233,94 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     Timber.d(
                         "android.cloud.import.bundle book=$bookId hasRichText=${bundle.has("text")} keys=${bundle.keys().asSequence().toList()}"
                     )
+                    logCloudAnnotationSyncTrace {
+                        "android.download.bundle_keys book=$bookId keys=${bundle.keys().asSequence().toList()} " +
+                            "hasInk=${bundle.has("ink")} hasText=${bundle.has("text")} " +
+                            "hasLayout=${bundle.has("layout")} hasTextBoxes=${bundle.has("textBoxes")} " +
+                            "hasHighlights=${bundle.has("highlights")} " +
+                            "hasDeletedInk=${bundle.has(SharedPdfAnnotationSidecarCodec.KEY_PDF_ANNOTATION_DELETIONS)}"
+                    }
 
                     fun writeSafe(key: String, file: File) {
                         if (bundle.has(key)) {
                             file.parentFile?.mkdirs()
                             val content = bundle.get(key).toString()
                             file.writeText(content)
+                            appliedAnnotationTimestamp.takeIf { it > 0L }?.let(file::setLastModified)
+                            logCloudAnnotationSyncTrace {
+                                "android.download.write key=$key book=$bookId bytes=${content.length} " +
+                                    "path=${file.absolutePath.cloudSyncPreview(140)} ts=${file.lastModified()}"
+                            }
                             if (key == "text") {
                                 Timber.d(
                                     "android.cloud.import.writeRichText book=$bookId rawLen=${content.length} file=${file.absolutePath}"
                                 )
                             }
                         } else {
+                            if (key == "layout") {
+                                logCloudAnnotationSyncTrace {
+                                    "android.download.preserve_missing key=layout book=$bookId " +
+                                        "path=${file.absolutePath.cloudSyncPreview(140)} exists=${file.exists()}"
+                                }
+                                Timber.d(
+                                    "android.cloud.import.preserveMissingLayout book=$bookId file=${file.absolutePath}"
+                                )
+                                return
+                            }
                             if (key == "text" && file.exists()) {
                                 Timber.d(
                                     "android.cloud.import.deleteMissingRichText book=$bookId file=${file.absolutePath}"
                                 )
                             }
-                            if (file.exists()) file.delete()
+                            if (file.exists()) {
+                                val deleted = file.delete()
+                                logCloudAnnotationSyncTrace {
+                                    "android.download.delete_missing key=$key book=$bookId deleted=$deleted " +
+                                        "path=${file.absolutePath.cloudSyncPreview(140)}"
+                                }
+                            } else {
+                                logCloudAnnotationSyncTrace {
+                                    "android.download.missing_key key=$key book=$bookId path=${file.absolutePath.cloudSyncPreview(140)}"
+                                }
+                            }
                         }
                     }
 
                     writeSafe("ink", inkFile)
+                    writeSafe(SharedPdfAnnotationSidecarCodec.KEY_PDF_ANNOTATION_DELETIONS, deletedInkFile)
                     writeSafe("text", richTextFile)
                     writeSafe("layout", layoutFile)
                     writeSafe("textBoxes", textBoxFile)
                     writeSafe("highlights", highlightFile)
 
+                    logCloudSyncTrace {
+                        "android.sidecar_download.applied_bundle book=$bookId remoteAnnTs=$annotationModifiedTimestamp " +
+                            "keys=${bundle.keys().asSequence().toList()}"
+                    }
                     Timber.tag("AnnotationSync").d("Unpacked unified bundle.")
                 } else {
                     Timber.tag("AnnotationSync").d("Detected legacy format (Ink only).")
                     inkFile.writeText(jsonString)
+                    appliedAnnotationTimestamp.takeIf { it > 0L }?.let(inkFile::setLastModified)
+                    logCloudAnnotationSyncTrace {
+                        "android.download.write_legacy_ink book=$bookId bytes=${jsonString.length} " +
+                            "path=${inkFile.absolutePath.cloudSyncPreview(140)} ts=${inkFile.lastModified()}"
+                    }
+                    logCloudSyncTrace { "android.sidecar_download.applied_legacy book=$bookId remoteAnnTs=$annotationModifiedTimestamp" }
                 }
             } catch (e: Exception) {
+                logCloudAnnotationSyncError(e) { "android.download.apply_failed book=$bookId remoteAnnTs=$annotationModifiedTimestamp" }
+                logCloudSyncError(e) { "android.sidecar_download.apply_failed book=$bookId remoteAnnTs=$annotationModifiedTimestamp" }
                 Timber.e(e, "Error unpacking synced annotation data")
             } finally {
                 tempDownloadFile.delete()
             }
         } else {
+            logCloudAnnotationSyncTrace {
+                "android.download.missing book=$bookId remoteAnnTs=$annotationModifiedTimestamp didDownload=$didDownload " +
+                    "tempExists=${tempDownloadFile.exists()} tempBytes=${tempDownloadFile.length()}"
+            }
+            logCloudSyncTrace { "android.sidecar_download.missing book=$bookId remoteAnnTs=$annotationModifiedTimestamp" }
             Timber.tag("AnnotationSync")
                 .d("FAILURE: No bundle found on Drive for $bookId (or download failed)")
         }
@@ -3611,7 +4514,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         coverPath = recentFilesRepository.saveCoverToCache(coverBitmap, uri)
                     }
                 }
-            } else if (uri.scheme != "opds-pse" && (type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7)) {
+            } else if (uri.scheme != "opds-pse" && type in COMIC_ARCHIVE_FILE_TYPES) {
                 if (coverPath == null) {
                     var cacheFile: File? = null
                     try {
@@ -3641,7 +4544,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         }
                         archiveDoc.close()
                     } catch (e: Exception) {
-                        Timber.e(e, "Error generating CBZ cover")
+                        Timber.e(e, "Error generating comic archive cover")
                     } finally {
                         try {
                             if (cacheFile?.exists() == true) {
@@ -3975,6 +4878,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     val (internalUri, bookId, type) = importResult
                     if (isExternalIntent) {
                         externalOpenedBookId = bookId
+                        if (prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") == "DELETE") {
+                            markPendingExternalFileRemoval(bookId, internalUri.toString())
+                        }
                     }
                     val displayName = getFileNameFromUri(externalUri, appContext) ?: "Unknown File"
                     openBook(
@@ -4027,9 +4933,28 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val currentBookUri = _internalState.value.selectedPdfUri ?: _internalState.value.selectedEpubUri
             if (currentBookUri != null) {
                 recentFilesRepository.getFileByUri(currentBookUri.toString())?.let { item ->
+                    if (annotationJsonEquivalentForNoop(item.highlightsJson, highlightsJson)) {
+                        logCloudSyncTrace {
+                            "android.reader.highlights_save_noop book=${item.bookId} highlights=${highlightsJson.cloudSyncAnnotationSummary()}"
+                        }
+                        return@launch
+                    }
+                    logCloudSyncTrace {
+                        "android.reader.highlights_save book=${item.bookId} highlights=${highlightsJson.cloudSyncAnnotationSummary()}"
+                    }
                     recentFilesRepository.updateHighlights(item.bookId, highlightsJson)
                 }
             } else if (bookId.isNotBlank()) {
+                val existing = recentFilesRepository.getFileByBookId(bookId)
+                if (annotationJsonEquivalentForNoop(existing?.highlightsJson, highlightsJson)) {
+                    logCloudSyncTrace {
+                        "android.reader.highlights_save_noop book=$bookId highlights=${highlightsJson.cloudSyncAnnotationSummary()}"
+                    }
+                    return@launch
+                }
+                logCloudSyncTrace {
+                    "android.reader.highlights_save book=$bookId highlights=${highlightsJson.cloudSyncAnnotationSummary()}"
+                }
                 recentFilesRepository.updateHighlights(bookId, highlightsJson)
             }
         }
@@ -4401,6 +5326,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         } else {
                             null
                         }
+                    logCloudSyncTrace {
+                        "android.reader.open_epub_position book=$bookId " +
+                            "overrideLocator=$initialLocatorOverride overrideCfi=${initialCfiOverride.cloudSyncPreview()} " +
+                            (recentItem?.cloudSyncTraceSummary("recent") ?: "recent=null") +
+                            " chosenLocator=$locator chosenCfi=${(initialCfiOverride ?: recentItem?.lastPositionCfi).cloudSyncPreview()}"
+                    }
 
                     _internalState.update {
                         it.copy(
@@ -4730,13 +5661,24 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     ) {
         Timber.d("Saving EPUB position locally: URI=$uri, Locator=$locator")
         viewModelScope.launch {
-            recentFilesRepository.getFileByUri(uri.toString())?.let { _ ->
+            recentFilesRepository.getFileByUri(uri.toString())?.let { existing ->
+                logCloudSyncTrace {
+                    "android.reader.position_save_start book=${existing.bookId} beforeTs=${existing.lastModifiedTimestamp} " +
+                        "locator={chapter=${locator.chapterIndex} block=${locator.blockIndex} char=${locator.charOffset}} " +
+                        "progress=$progress cfi=${cfiForWebView.cloudSyncPreview()}"
+                }
                 recentFilesRepository.updateEpubReadingPosition(
                     uriString = uri.toString(),
                     locator = locator,
                     cfiForWebView = cfiForWebView,
                     progress = progress
                 )
+                val updated = recentFilesRepository.getFileByBookId(existing.bookId)
+                logCloudSyncTrace {
+                    "android.reader.position_save_done beforeTs=${existing.lastModifiedTimestamp} " +
+                        (updated?.cloudSyncTraceSummary("after") ?: "after=null")
+                }
+                queueCloudMetadataUpload(existing.bookId, reason = "epub_position")
             }
         }
     }
@@ -4778,10 +5720,20 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
             Timber.tag("PdfPositionDebug").i("ViewModel: Save request triggered | Page: $page | Total: $totalPages | Progress: $progress | URI: ${currentPdfUri.lastPathSegment}")
             viewModelScope.launch {
-                recentFilesRepository.getFileByUri(currentPdfUri.toString())?.let { _ ->
+                recentFilesRepository.getFileByUri(currentPdfUri.toString())?.let { existing ->
+                    logCloudSyncTrace {
+                        "android.reader.pdf_position_save_start book=${existing.bookId} beforeTs=${existing.lastModifiedTimestamp} " +
+                            "beforeReadTs=${existing.effectiveReadingPositionModifiedTimestamp()} page=$page progress=$progress"
+                    }
                     recentFilesRepository.updatePdfReadingPosition(
                         uriString = currentPdfUri.toString(), page = page, progress = progress
                     )
+                    val updated = recentFilesRepository.getFileByBookId(existing.bookId)
+                    logCloudSyncTrace {
+                        "android.reader.pdf_position_save_done beforeTs=${existing.lastModifiedTimestamp} " +
+                            (updated?.cloudSyncTraceSummary("after") ?: "after=null")
+                    }
+                    queueCloudMetadataUpload(existing.bookId, reason = "pdf_position")
                 } ?: run {
                     Timber.tag("PdfPositionDebug").e("ViewModel: Save aborted. Could not resolve file item from URI in DB.")
                 }
@@ -4831,7 +5783,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun refreshLibrary() {
         val syncEnabled = _internalState.value.isSyncEnabled
-        val hasFolder = _internalState.value.syncedFolders.isNotEmpty()
+        val hasFolder = _internalState.value.syncedFolders.any { it.localSyncEnabled }
 
         if (!syncEnabled && !hasFolder) {
             Timber.d("Refresh skipped: No sync methods active.")
@@ -4924,19 +5876,25 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun uploadNewBookAndMetadata(book: RecentFileItem) {
-        if (!uiState.value.isSyncEnabled) return
+        if (!uiState.value.isSyncEnabled) {
+            logCloudSyncTrace { "android.upload_content.skip reason=sync_disabled ${book.cloudSyncTraceSummary()}" }
+            return
+        }
 
         if (book.uriString?.startsWith("opds-pse") == true) {
+            logCloudSyncTrace { "android.upload_content.skip reason=opds_stream ${book.cloudSyncTraceSummary()}" }
             Timber.d("Skipping book content sync for OPDS stream book: ${book.displayName}")
             return
         }
 
         if (book.sourceFolderUri != null) {
+            logCloudSyncTrace { "android.upload_content.skip reason=folder_book ${book.cloudSyncTraceSummary()}" }
             Timber.d("Skipping book content sync for local folder book: ${book.displayName}")
             return
         }
 
         if (book.isManualOnlyReaderFile()) {
+            logCloudSyncTrace { "android.upload_content.skip reason=manual_only ${book.cloudSyncTraceSummary()}" }
             Timber.d("Skipping book content sync for manual-only reader file: ${book.displayName}")
             return
         }
@@ -4944,16 +5902,22 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             _internalState.update { it.copy(uploadingBookIds = it.uploadingBookIds + book.bookId) }
             try {
-                val accessToken = googleDriveRepository.getAccessToken(appContext) ?: return@launch
+                logCloudSyncTrace { "android.upload_content.start ${book.cloudSyncTraceSummary()}" }
+                val accessToken = googleDriveRepository.getAccessToken(appContext) ?: run {
+                    logCloudSyncTrace { "android.upload_content.skip reason=no_access_token ${book.cloudSyncTraceSummary()}" }
+                    return@launch
+                }
 
                 book.getUri()?.path?.let { path ->
                     val file = File(path)
                     if (file.exists()) {
+                        logCloudSyncTrace { "android.upload_content.file book=${book.bookId} path=${path.cloudSyncPreview()} bytes=${file.length()}" }
                         Timber.d("Uploading newly added book content: ${book.displayName}")
                         val uploadedFile = googleDriveRepository.uploadFile(
                             accessToken, book.bookId, file, book.type
                         )
                         if (uploadedFile != null) {
+                            logCloudSyncTrace { "android.upload_content.success book=${book.bookId} driveId=${uploadedFile.id}" }
                             Timber.d("Upload successful, now syncing metadata for ${book.bookId}")
                             val latestBookState = recentFilesRepository.getFileByBookId(book.bookId)
                             if (latestBookState != null) {
@@ -4962,13 +5926,16 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 uploadSingleBookMetadata(book)
                             }
                         } else {
+                            logCloudSyncTrace { "android.upload_content.failed_null book=${book.bookId}" }
                             Timber.e("Google Drive upload returned null for ${book.bookId}")
                         }
                     } else {
+                        logCloudSyncTrace { "android.upload_content.skip reason=file_missing book=${book.bookId} path=${path.cloudSyncPreview()}" }
                         Timber.w("File for new book upload does not exist at path: $path")
                     }
                 }
             } catch (e: Exception) {
+                logCloudSyncError(e) { "android.upload_content.failed ${book.cloudSyncTraceSummary()}" }
                 Timber.e(e, "Failed to upload new book content for bookId: ${book.bookId}")
             } finally {
                 _internalState.update {
@@ -5029,8 +5996,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val newBehavior = if (keep) "KEEP" else "DELETE"
             setExternalFileBehavior(newBehavior)
         }
-        if (!keep) {
-            deleteBookPermanently(bookId)
+        if (keep) {
+            clearPendingExternalFileRemovals(setOf(bookId))
+        } else {
+            deletePendingExternalFileRemoval(bookId, null)
         }
         _internalState.update { it.copy(showExternalFileSavePromptFor = null) }
     }
@@ -5399,10 +6368,15 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                         deviceId
                                     )
 
-                                    val fileExtension = item.type.name.lowercase()
-                                    val fileName = "${item.bookId}.$fileExtension"
-                                    remoteFiles[fileName]?.id?.let { fileId ->
-                                        Timber.d("Deleting from Drive: $fileName")
+                                    sharedCloudBookContentFileName(item.bookId, item.type)
+                                        ?.let { fileName ->
+                                            remoteFiles[fileName]?.id?.let { fileId ->
+                                                Timber.d("Deleting from Drive: $fileName")
+                                                googleDriveRepository.deleteDriveFile(accessToken, fileId)
+                                            }
+                                        }
+                                    remoteFiles[cloudPdfAnnotationDriveFileName(item.bookId)]?.id?.let { fileId ->
+                                        Timber.d("Deleting annotation bundle from Drive: ${item.bookId}")
                                         googleDriveRepository.deleteDriveFile(accessToken, fileId)
                                     }
 
@@ -6097,7 +7071,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         private const val KEY_APP_OPEN_COUNT = "app_open_count"
         internal const val KEY_SYNCED_FOLDER_URI = "synced_folder_uri"
         internal const val KEY_LAST_FOLDER_SCAN_TIME = "last_folder_scan_time"
-        private const val KEY_SYNCED_FOLDERS_JSON = "synced_folders_list_json"
         private const val MAX_FOLDER_LIMIT = 10
         internal const val KEY_PINNED_HOME = "pinned_home_books"
         internal const val KEY_PINNED_LIBRARY = "pinned_library_books"
@@ -6108,6 +7081,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         private const val KEY_LAST_OPEN_BOOK_ID = "last_open_book_id"
         private const val KEY_LAST_OPEN_FILE_TYPE = "last_open_file_type"
         private const val KEY_EXTERNAL_FILE_BEHAVIOR = "external_file_behavior"
+        private const val KEY_PENDING_EXTERNAL_FILE_REMOVALS = "pending_external_file_removals"
         private const val KEY_USE_STRICT_FILE_FILTER = "use_strict_file_filter"
         private const val KEY_USE_PDF_FILE_NAME_AS_DISPLAY_NAME = "use_pdf_file_name_as_display_name"
         private const val KEY_SCREEN_CAPTURE_PROTECTION = "screen_capture_protection_enabled"
@@ -6131,4 +7105,62 @@ private fun RecentFileItem.isManualOnlyReaderFile(): Boolean {
 
 private fun BookMetadata.isManualOnlyReaderFile(): Boolean {
     return isManualOnlyReaderFileName(displayName)
+}
+
+private fun RecentFileItem.withFreshLocalReadingPositionForCloudUpload(
+    latestLocal: RecentFileItem?
+): RecentFileItem {
+    if (latestLocal == null || latestLocal.bookId != bookId) return this
+    val latestReadingTimestamp = latestLocal.effectiveReadingPositionModifiedTimestamp()
+    val currentReadingTimestamp = effectiveReadingPositionModifiedTimestamp()
+    val shouldRefresh = latestLocal.lastModifiedTimestamp > lastModifiedTimestamp ||
+        latestReadingTimestamp > currentReadingTimestamp
+    if (!shouldRefresh) return this
+
+    return latestLocal.copy(
+        fileSize = fileSize.takeIf { it > 0L } ?: latestLocal.fileSize,
+        fileContentModifiedTimestamp = maxOf(fileContentModifiedTimestamp, latestLocal.fileContentModifiedTimestamp),
+        isAvailable = isAvailable || latestLocal.isAvailable,
+        uriString = latestLocal.uriString ?: uriString,
+        bookmarksJson = latestLocal.bookmarksJson ?: bookmarksJson,
+        highlightsJson = latestLocal.highlightsJson ?: highlightsJson
+    )
+}
+
+private fun RecentFileItem.withCloudReadingPosition(remote: BookMetadata): RecentFileItem {
+    return copy(
+        lastChapterIndex = remote.lastChapterIndex,
+        lastPage = remote.lastPage,
+        lastPositionCfi = remote.lastPositionCfi,
+        locatorBlockIndex = remote.locatorBlockIndex,
+        locatorCharOffset = remote.locatorCharOffset,
+        progressPercentage = remote.progressPercentage,
+        readingPositionModifiedTimestamp = remote.effectiveReadingPositionModifiedTimestamp()
+    )
+}
+
+private fun RecentFileItem.withLocalReadingPosition(local: RecentFileItem): RecentFileItem {
+    return copy(
+        lastChapterIndex = local.lastChapterIndex,
+        lastPage = local.lastPage,
+        lastPositionCfi = local.lastPositionCfi,
+        locatorBlockIndex = local.locatorBlockIndex,
+        locatorCharOffset = local.locatorCharOffset,
+        progressPercentage = local.progressPercentage,
+        readingPositionModifiedTimestamp = local.effectiveReadingPositionModifiedTimestamp()
+    )
+}
+
+private fun RecentFileItem.withLocalStorageForCloudMetadata(local: RecentFileItem): RecentFileItem {
+    return copy(
+        uriString = local.uriString ?: uriString,
+        isAvailable = local.isAvailable || isAvailable,
+        coverImagePath = local.coverImagePath ?: coverImagePath,
+        sourceFolderUri = local.sourceFolderUri ?: sourceFolderUri,
+        fileSize = local.fileSize.takeIf { it > 0L } ?: fileSize,
+        fileContentModifiedTimestamp = maxOf(local.fileContentModifiedTimestamp, fileContentModifiedTimestamp),
+        folderTextMetadataParsed = local.folderTextMetadataParsed || folderTextMetadataParsed,
+        folderCoverMetadataParsed = local.folderCoverMetadataParsed || folderCoverMetadataParsed,
+        tags = local.tags
+    )
 }

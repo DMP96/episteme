@@ -141,6 +141,13 @@ data class SharedFolderBookMetadata(
             seriesIndex = existing?.seriesIndex,
             lastPageIndex = lastPage,
             readerPosition = parsedReaderPosition ?: existing?.readerPosition,
+            readingPositionModifiedTimestamp = if (
+                parsedReaderPosition != null || lastPage != null || progressPercentage > 0f
+            ) {
+                metadataTimestamp
+            } else {
+                existing?.readingPositionModifiedTimestamp ?: 0L
+            },
             readerBookmarks = parsedBookmarks ?: existing?.readerBookmarks.orEmpty(),
             readerHighlights = parsedHighlights ?: existing?.readerHighlights.orEmpty()
         )
@@ -152,6 +159,9 @@ data class SharedFolderBookMetadata(
             chapterIndex = lastChapterIndex,
             cfi = lastPositionCfi,
             pageIndex = lastPage
+        ).withFallbacks(
+            blockIndex = locatorBlockIndex,
+            charOffset = locatorCharOffset
         )
     }
 
@@ -272,6 +282,15 @@ object LocalFolderSyncEngine {
         nowMillis: Long = currentTimestamp(),
         metadataOnly: Boolean = false
     ): LocalFolderSyncResult {
+        if (!folder.localSyncEnabled) {
+            return LocalFolderSyncResult(
+                state = state,
+                idMigrations = emptyMap(),
+                removedBookIds = emptySet(),
+                stats = LocalFolderSyncStats()
+            )
+        }
+
         val folderRoot = folder.uriString
         val allowedTypes = folder.allowedFileTypes
         val booksById = linkedMapOf<String, BookItem>()
@@ -439,16 +458,7 @@ fun BookItem.toSharedFolderBookMetadata(): SharedFolderBookMetadata? {
         !bookmarksJson.isNullOrBlank() ||
         !highlightsJson.isNullOrBlank()
     if (!isDirty) return null
-    val positionCfi = position?.cfi ?: position?.let { locator ->
-        val chapterIndex = locator.chapterIndex
-        val startOffset = locator.startOffset
-        val endOffset = locator.endOffset ?: startOffset
-        if (chapterIndex != null && startOffset != null && endOffset != null) {
-            "desktop:$chapterIndex:$startOffset:$endOffset"
-        } else {
-            null
-        }
-    }
+    val positionCfi = position?.toStablePositionCfi()
 
     return SharedFolderBookMetadata(
         bookId = id,
@@ -463,8 +473,8 @@ fun BookItem.toSharedFolderBookMetadata(): SharedFolderBookMetadata? {
         isRecent = isRecent,
         lastModifiedTimestamp = localFolderModifiedTimestamp(),
         bookmarksJson = bookmarksJson,
-        locatorBlockIndex = null,
-        locatorCharOffset = null,
+        locatorBlockIndex = position?.blockIndex,
+        locatorCharOffset = position?.charOffset,
         customName = null,
         highlightsJson = highlightsJson,
         seriesName = null,

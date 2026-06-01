@@ -20,6 +20,7 @@ class SharedMeasuredEpubPaginatorTest {
             settings = ReaderSettings(
                 pageWidth = 760,
                 margin = 48,
+                readingMode = ReaderReadingMode.PAGINATED,
                 pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE
             ),
             viewport = ReaderViewportSpec(widthPx = 2_400, heightPx = 1_200)
@@ -27,6 +28,51 @@ class SharedMeasuredEpubPaginatorTest {
 
         assertEquals(760, geometry.pageWidthPx)
         assertEquals(1_104, geometry.pageHeightPx)
+    }
+
+    @Test
+    fun `two page geometry subtracts margins inside each rendered page on constrained viewports`() {
+        val geometry = measuredPageGeometryFor(
+            settings = ReaderSettings(
+                pageWidth = 760,
+                horizontalMargin = 80,
+                verticalMargin = 40,
+                readingMode = ReaderReadingMode.PAGINATED,
+                pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE
+            ),
+            viewport = ReaderViewportSpec(widthPx = 1_300, heightPx = 900)
+        )
+
+        assertEquals(476, geometry.pageWidthPx)
+        assertEquals(820, geometry.pageHeightPx)
+    }
+
+    @Test
+    fun `paginated single page geometry matches one rendered page in a spread`() {
+        val singlePageGeometry = measuredPageGeometryFor(
+            settings = ReaderSettings(
+                pageWidth = 760,
+                horizontalMargin = 80,
+                verticalMargin = 40,
+                readingMode = ReaderReadingMode.PAGINATED,
+                pageSpreadMode = ReaderPageSpreadMode.SINGLE
+            ),
+            viewport = ReaderViewportSpec(widthPx = 1_300, heightPx = 900)
+        )
+        val twoPageGeometry = measuredPageGeometryFor(
+            settings = ReaderSettings(
+                pageWidth = 760,
+                horizontalMargin = 80,
+                verticalMargin = 40,
+                readingMode = ReaderReadingMode.PAGINATED,
+                pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE
+            ),
+            viewport = ReaderViewportSpec(widthPx = 1_300, heightPx = 900)
+        )
+
+        assertEquals(twoPageGeometry, singlePageGeometry)
+        assertEquals(476, singlePageGeometry.pageWidthPx)
+        assertEquals(820, singlePageGeometry.pageHeightPx)
     }
 
     @Test

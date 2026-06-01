@@ -1,9 +1,12 @@
 import org.gradle.api.GradleException
 import org.gradle.api.DefaultTask
+import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.MapProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.JavaExec
 import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.Sync
 import org.gradle.api.tasks.TaskAction
@@ -11,39 +14,18 @@ import org.gradle.jvm.tasks.Jar
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.gradle.work.DisableCachingByDefault
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Properties
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.compose.multiplatform)
-}
-
-@DisableCachingByDefault(because = "Verification task has no outputs.")
-abstract class CheckBundledWebViewRuntimeTask : DefaultTask() {
-    @get:Input
-    abstract val bundleRootPath: Property<String>
-
-    @get:Input
-    abstract val osName: Property<String>
-
-    @get:Input
-    abstract val osArch: Property<String>
-
-    @get:Input
-    abstract val requiredPaths: ListProperty<String>
-
-    @TaskAction
-    fun checkRuntime() {
-        val bundleRoot = File(bundleRootPath.get())
-        val missingFiles = requiredPaths.get().filterNot { bundleRoot.resolve(it).exists() }
-        if (missingFiles.isNotEmpty()) {
-            throw GradleException(
-                "Missing bundled KCEF runtime at ${bundleRoot.absolutePath}. " +
-                    "Expected ${missingFiles.joinToString()} for ${osName.get()} ${osArch.get()} desktop packages."
-            )
-        }
-    }
 }
 
 @DisableCachingByDefault(because = "Verification task has no outputs.")
@@ -67,6 +49,179 @@ abstract class CheckBundledPdfiumRuntimeTask : DefaultTask() {
     }
 }
 
+@DisableCachingByDefault(because = "Renames package output produced by jpackage.")
+abstract class RenameDesktopMsiOutputTask : DefaultTask() {
+    @get:Input
+    abstract val msiDirectoryPath: Property<String>
+
+    @get:Input
+    abstract val packageName: Property<String>
+
+    @get:Input
+    abstract val packageVersion: Property<String>
+
+    @get:Input
+    abstract val architecture: Property<String>
+
+    @TaskAction
+    fun renameOutput() {
+        val msiDirectory = File(msiDirectoryPath.get())
+        val outputPackageName = packageName.get()
+        val outputPackageVersion = packageVersion.get()
+        val source = msiDirectory.resolve("$outputPackageName-$outputPackageVersion.msi")
+        if (!source.isFile) return
+
+        val target = msiDirectory.resolve("$outputPackageName-$outputPackageVersion-${architecture.get()}.msi")
+        if (target.exists() && !target.delete()) {
+            throw GradleException("Could not replace existing MSI at ${target.absolutePath}.")
+        }
+        if (!source.renameTo(target)) {
+            throw GradleException("Could not rename MSI from ${source.absolutePath} to ${target.absolutePath}.")
+        }
+    }
+}
+
+@DisableCachingByDefault(because = "Generates local desktop service config for native packages.")
+abstract class GenerateDesktopCloudConfigTask : DefaultTask() {
+    @get:Input
+    abstract val configValues: MapProperty<String, String>
+
+    @get:OutputFile
+    abstract val outputFile: RegularFileProperty
+
+    @TaskAction
+    fun generate() {
+        val file = outputFile.get().asFile
+        file.parentFile.mkdirs()
+        file.writeText(
+            configValues.get().entries.joinToString(separator = "\n", postfix = "\n") { (key, value) ->
+                "$key=${value.replace("\\", "\\\\").replace("\n", "")}"
+            }
+        )
+    }
+}
+
+@DisableCachingByDefault(because = "Verification task has no outputs.")
+abstract class VerifyDesktopNativePackagingTask : DefaultTask() {
+    @get:Input
+    abstract val supportedHost: Property<Boolean>
+
+    @get:Input
+    abstract val hostOsId: Property<String>
+
+    @get:Input
+    abstract val hostArchId: Property<String>
+
+    @get:Input
+    abstract val missingStandardServiceConfig: ListProperty<String>
+
+    @TaskAction
+    fun verify() {
+        if (!supportedHost.get()) {
+            throw GradleException(
+                "Desktop native packaging is currently release-supported only on Windows x64 and Linux x64. " +
+                    "Current host: ${hostOsId.get()} ${hostArchId.get()}."
+            )
+        }
+        val missing = missingStandardServiceConfig.get()
+        if (missing.isNotEmpty()) {
+            throw GradleException(
+                "Standard desktop packages require account/sync service config. Missing: " +
+                    missing.joinToString(", ") + ". " +
+                    "Set DESKTOP_FIREBASE_WEB_API_KEY and DESKTOP_GOOGLE_OAUTH_CLIENT_ID, " +
+                    "use -PdesktopFlavor=oss for the offline build, or set " +
+                    "-PdesktopAllowUnconfiguredStandardServices=true for a local non-GA package."
+            )
+        }
+    }
+}
+
+@DisableCachingByDefault(because = "Strips stale jar signatures in-place after ProGuard rewrites signed dependencies.")
+abstract class StripInvalidJarSignaturesTask : DefaultTask() {
+    @get:Input
+    abstract val jarDirectoryPath: Property<String>
+
+    @TaskAction
+    fun stripSignatures() {
+        val jarDirectory = File(jarDirectoryPath.get())
+        if (!jarDirectory.isDirectory) return
+
+        var strippedJarCount = 0
+        jarDirectory.walkTopDown()
+            .filter { it.isFile && it.extension.equals("jar", ignoreCase = true) }
+            .forEach { jar ->
+                val strippedEntries = stripInvalidJarSignatures(jar)
+                if (strippedEntries > 0) {
+                    strippedJarCount += 1
+                    logger.lifecycle("Stripped $strippedEntries stale jar signature entr${if (strippedEntries == 1) "y" else "ies"} from ${jar.name}")
+                }
+            }
+
+        if (strippedJarCount > 0) {
+            logger.lifecycle("Stripped stale jar signatures from $strippedJarCount ProGuard output jar${if (strippedJarCount == 1) "" else "s"}.")
+        }
+    }
+
+    private fun stripInvalidJarSignatures(jar: File): Int {
+        val temp = Files.createTempFile(jar.parentFile.toPath(), "${jar.nameWithoutExtension}-unsigned-", ".jar")
+        var strippedEntries = 0
+
+        ZipFile(jar).use { source ->
+            ZipOutputStream(Files.newOutputStream(temp)).use { target ->
+                val seenEntries = mutableSetOf<String>()
+                val entries = source.entries()
+                while (entries.hasMoreElements()) {
+                    val sourceEntry = entries.nextElement()
+                    val entryName = sourceEntry.name
+                    if (!seenEntries.add(entryName)) continue
+                    if (isJarSignatureResource(entryName)) {
+                        strippedEntries += 1
+                        continue
+                    }
+
+                    val targetEntry = ZipEntry(entryName)
+                    if (sourceEntry.time >= 0) {
+                        targetEntry.time = sourceEntry.time
+                    }
+                    target.putNextEntry(targetEntry)
+                    if (!sourceEntry.isDirectory) {
+                        source.getInputStream(sourceEntry).use { input ->
+                            input.copyTo(target)
+                        }
+                    }
+                    target.closeEntry()
+                }
+            }
+        }
+
+        if (strippedEntries > 0) {
+            try {
+                Files.move(temp, jar.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temp, jar.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } else {
+            Files.deleteIfExists(temp)
+        }
+
+        return strippedEntries
+    }
+
+    private fun isJarSignatureResource(entryName: String): Boolean {
+        val normalized = entryName.replace('\\', '/').uppercase()
+        if (!normalized.startsWith("META-INF/")) return false
+
+        val metaInfName = normalized.removePrefix("META-INF/")
+        if (metaInfName.contains("/")) return false
+
+        return metaInfName.startsWith("SIG-") ||
+            metaInfName.endsWith(".SF") ||
+            metaInfName.endsWith(".DSA") ||
+            metaInfName.endsWith(".RSA") ||
+            metaInfName.endsWith(".EC")
+    }
+}
+
 fun desktopOsId(osName: String = System.getProperty("os.name")): String {
     val normalized = osName.lowercase()
     return when {
@@ -86,24 +241,27 @@ fun desktopArchId(osArch: String = System.getProperty("os.arch")): String {
     }
 }
 
-fun desktopKcefBundleDirectoryName(
+fun desktopSwtArtifactId(
     osName: String = System.getProperty("os.name"),
     osArch: String = System.getProperty("os.arch")
-): String {
+): String? {
     return when (desktopOsId(osName)) {
-        "windows" -> "kcef-bundle"
-        "linux" -> "kcef-bundle-linux-${desktopArchId(osArch)}"
-        "macos" -> "kcef-bundle-macos-${desktopArchId(osArch)}"
-        else -> "kcef-bundle-${desktopArchId(osArch)}"
-    }
-}
+        "windows" -> when (desktopArchId(osArch)) {
+            "arm64" -> "org.eclipse.swt.win32.win32.aarch64"
+            else -> "org.eclipse.swt.win32.win32.x86_64"
+        }
 
-fun bundledWebViewRequiredPaths(osName: String, osArch: String): List<String> {
-    return when (desktopOsId(osName)) {
-        "windows" -> listOf("jcef.dll", "libcef.dll")
-        "linux" -> listOf("libcef.so", "chrome-sandbox", "icudtl.dat", "locales")
-        "macos" -> listOf("jcef Helper.app", "Chromium Embedded Framework.framework")
-        else -> emptyList()
+        "linux" -> when (desktopArchId(osArch)) {
+            "arm64" -> "org.eclipse.swt.gtk.linux.aarch64"
+            else -> "org.eclipse.swt.gtk.linux.x86_64"
+        }
+
+        "macos" -> when (desktopArchId(osArch)) {
+            "arm64" -> "org.eclipse.swt.cocoa.macosx.aarch64"
+            else -> "org.eclipse.swt.cocoa.macosx.x86_64"
+        }
+
+        else -> null
     }
 }
 
@@ -313,25 +471,82 @@ fun normalizeDesktopPackageArchitecture(osArch: String): String {
     }
 }
 
-fun renameDesktopMsiOutput(
-    msiDirectory: File,
-    packageName: String,
-    packageVersion: String,
-    architecture: String
-) {
-    val source = msiDirectory.resolve("$packageName-$packageVersion.msi")
-    if (!source.isFile) return
-
-    val target = msiDirectory.resolve("$packageName-$packageVersion-$architecture.msi")
-    if (target.exists() && !target.delete()) {
-        throw GradleException("Could not replace existing MSI at ${target.absolutePath}.")
-    }
-    if (!source.renameTo(target)) {
-        throw GradleException("Could not rename MSI from ${source.absolutePath} to ${target.absolutePath}.")
+fun desktopDefaultPackageFormats(osName: String = System.getProperty("os.name")): String {
+    return when (desktopOsId(osName)) {
+        "windows" -> "msi"
+        "linux" -> "deb,rpm"
+        "macos" -> "dmg"
+        else -> ""
     }
 }
 
-val desktopVersionName = "1.0.0"
+fun desktopTargetFormatForId(format: String): TargetFormat {
+    return when (format.lowercase()) {
+        "exe" -> TargetFormat.Exe
+        "msi" -> TargetFormat.Msi
+        "deb" -> TargetFormat.Deb
+        "rpm" -> TargetFormat.Rpm
+        "dmg" -> TargetFormat.Dmg
+        "pkg" -> TargetFormat.Pkg
+        else -> throw GradleException(
+            "Unsupported desktopPackageFormats entry '$format'. " +
+                "Use one or more of: msi, exe, deb, rpm, dmg, pkg."
+        )
+    }
+}
+
+fun desktopPackageFormatId(format: TargetFormat): String {
+    return when (format) {
+        TargetFormat.Exe -> "exe"
+        TargetFormat.Msi -> "msi"
+        TargetFormat.Deb -> "deb"
+        TargetFormat.Rpm -> "rpm"
+        TargetFormat.Dmg -> "dmg"
+        TargetFormat.Pkg -> "pkg"
+        else -> format.name.lowercase()
+    }
+}
+
+fun desktopPackageFormatSupportedOnHost(
+    format: TargetFormat,
+    osName: String = System.getProperty("os.name")
+): Boolean {
+    return when (desktopOsId(osName)) {
+        "windows" -> format == TargetFormat.Msi || format == TargetFormat.Exe
+        "linux" -> format == TargetFormat.Deb || format == TargetFormat.Rpm
+        "macos" -> format == TargetFormat.Dmg || format == TargetFormat.Pkg
+        else -> false
+    }
+}
+
+fun normalizeDesktopPackageFormats(
+    rawFormats: String,
+    osName: String = System.getProperty("os.name")
+): List<TargetFormat> {
+    val formats = rawFormats
+        .split(',', ';', ' ', '\n', '\t')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .map(::desktopTargetFormatForId)
+        .distinct()
+    if (formats.isEmpty()) {
+        throw GradleException(
+            "desktopPackageFormats resolved to no package formats for ${desktopOsId(osName)}. " +
+                "Set -PdesktopPackageFormats=msi on Windows or -PdesktopPackageFormats=deb,rpm on Linux."
+        )
+    }
+    val unsupported = formats.filterNot { desktopPackageFormatSupportedOnHost(it, osName) }
+    if (unsupported.isNotEmpty()) {
+        throw GradleException(
+            "desktopPackageFormats=${formats.joinToString(",") { desktopPackageFormatId(it) }} does not match " +
+                "the current packaging host ${desktopOsId(osName)}. Unsupported here: " +
+                unsupported.joinToString(",") { desktopPackageFormatId(it) } + "."
+        )
+    }
+    return formats
+}
+
+val desktopVersionName = "1.0.1"
 val desktopFlavor = providers.gradleProperty("desktopFlavor")
     .orElse("standard")
     .map(::normalizeDesktopFlavor)
@@ -359,7 +574,21 @@ val desktopVendor = providers.gradleProperty("desktopVendor").orElse("Aryan")
 val desktopOsName = System.getProperty("os.name")
 val desktopOsArch = System.getProperty("os.arch")
 val desktopPackageArchitecture = normalizeDesktopPackageArchitecture(desktopOsArch)
+val desktopPackageTargetFormats = providers.gradleProperty("desktopPackageFormats")
+    .orElse(desktopDefaultPackageFormats(desktopOsName))
+    .map { normalizeDesktopPackageFormats(it, desktopOsName) }
+    .get()
+val desktopNativePackageSupportedHost = desktopOsId(desktopOsName) in setOf("windows", "linux") &&
+    desktopArchId(desktopOsArch) == "x64"
+val desktopReleaseProguardEnabled = providers.gradleProperty("desktopReleaseProguard")
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
+    .get()
+val desktopSwtVersion = "3.133.0"
+val desktopSwtDependency = desktopSwtArtifactId(desktopOsName, desktopOsArch)
+    ?.let { artifactId -> "org.eclipse.platform:$artifactId:$desktopSwtVersion" }
 val generatedDesktopResourcesDir = layout.buildDirectory.dir("generated/desktopAppResources")
+val generatedDesktopCloudConfigFile = layout.buildDirectory.file("generated/desktopCloudConfig/desktop-cloud.properties")
 val generatedDesktopStringResourcesDir = layout.buildDirectory.dir("generated/desktopStringResources")
 val rootLocalProperties = Properties()
 val rootLocalPropertiesFile = rootProject.file("local.properties")
@@ -375,60 +604,26 @@ fun desktopConfigValue(vararg keys: String): String {
 }
 val desktopCloudConfig = mapOf(
     "AI_WORKER_URL" to desktopConfigValue("DESKTOP_AI_WORKER_URL", "AI_WORKER_URL"),
-    "TTS_WORKER_URL" to desktopConfigValue("DESKTOP_TTS_WORKER_URL", "TTS_WORKER_URL", "AI_WORKER_URL"),
+    "TTS_WORKER_URL" to desktopConfigValue("DESKTOP_TTS_WORKER_URL", "TTS_WORKER_URL"),
     "FIREBASE_WEB_API_KEY" to desktopConfigValue("DESKTOP_FIREBASE_WEB_API_KEY", "FIREBASE_WEB_API_KEY", "GOOGLE_API_KEY"),
     "FIREBASE_PROJECT_ID" to desktopConfigValue("DESKTOP_FIREBASE_PROJECT_ID", "FIREBASE_PROJECT_ID").ifBlank { "reader-9fc469d7" },
     "GOOGLE_OAUTH_CLIENT_ID" to desktopConfigValue("DESKTOP_GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "DEFAULT_WEB_CLIENT_ID"),
     "GOOGLE_OAUTH_CLIENT_SECRET" to desktopConfigValue("DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_WEB_CLIENT_SECRET", "DEFAULT_WEB_CLIENT_SECRET")
 )
-val bundledWebViewDir = layout.projectDirectory.dir(desktopKcefBundleDirectoryName(desktopOsName, desktopOsArch))
+val desktopAllowUnconfiguredStandardServices = providers.gradleProperty("desktopAllowUnconfiguredStandardServices")
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
+    .get()
+val desktopMissingStandardServiceConfig = if (isOssOfflineDesktop || desktopAllowUnconfiguredStandardServices) {
+    emptyList()
+} else {
+    listOf("FIREBASE_WEB_API_KEY", "GOOGLE_OAUTH_CLIENT_ID")
+        .filter { key -> desktopCloudConfig[key].isNullOrBlank() }
+}
 val bundledPdfiumDir = layout.projectDirectory.dir(
     "../third_party/pdfium/${desktopPdfiumDirectoryName(desktopOsName, desktopOsArch)}"
 )
 val bundledPdfiumLibraryPath = desktopPdfiumLibraryPath(desktopOsName, desktopOsArch)
-val bundledWebViewKeptLocales = setOf(
-    "ar.pak",
-    "de.pak",
-    "en-GB.pak",
-    "en-US.pak",
-    "es-419.pak",
-    "es.pak",
-    "fr.pak",
-    "hi.pak",
-    "pt-BR.pak",
-    "ru.pak",
-    "tr.pak",
-    "vi.pak"
-)
-val bundledWebViewTrimmedRuntimeFiles = listOf(
-    "ct.sym",
-    "jawt.lib",
-    "jvm.lib",
-    "jaccessinspector.exe",
-    "jaccesswalker.exe",
-    "jabswitch.exe",
-    "javac.exe",
-    "javadoc.exe",
-    "jcmd.exe",
-    "jdb.exe",
-    "jfr.exe",
-    "jhsdb.exe",
-    "jinfo.exe",
-    "jmap.exe",
-    "jps.exe",
-    "jrunscript.exe",
-    "jstack.exe",
-    "jstat.exe",
-    "jwebserver.exe",
-    "keytool.exe",
-    "kinit.exe",
-    "klist.exe",
-    "ktab.exe",
-    "rmiregistry.exe",
-    "serialver.exe",
-    "server/classes.jsa",
-    "server/classes_nocoops.jsa"
-)
 val desktopWindowsIconFile = layout.projectDirectory.file("src/desktopMain/resources/episteme.ico")
 val desktopLinuxIconFile = layout.projectDirectory.file("src/desktopMain/resources/episteme_icon.png")
 val desktopWindowsUpgradeUuid = if (isOssOfflineDesktop) {
@@ -455,49 +650,23 @@ val desktopPackagingJavaHome = findDesktopPackagingJavaHome(
     osName = desktopOsName
 )?.absolutePath
 
-val checkBundledWebViewRuntime by tasks.registering(CheckBundledWebViewRuntimeTask::class) {
-    val requiredPaths = bundledWebViewRequiredPaths(desktopOsName, desktopOsArch)
-    bundleRootPath.set(bundledWebViewDir.asFile.absolutePath)
-    osName.set(desktopOsName)
-    osArch.set(desktopOsArch)
-    this.requiredPaths.set(requiredPaths)
-}
-
 val checkBundledPdfiumRuntime by tasks.registering(CheckBundledPdfiumRuntimeTask::class) {
     bundleRootPath.set(bundledPdfiumDir.asFile.absolutePath)
     libraryPath.set(bundledPdfiumLibraryPath)
 }
 
+val generateDesktopCloudConfig by tasks.registering(GenerateDesktopCloudConfigTask::class) {
+    configValues.set(desktopCloudConfig)
+    outputFile.set(generatedDesktopCloudConfigFile)
+}
+
 val prepareBundledDesktopResources by tasks.registering(Sync::class) {
-    dependsOn(checkBundledWebViewRuntime, checkBundledPdfiumRuntime)
-    from(bundledWebViewDir) {
-        exclude(bundledWebViewTrimmedRuntimeFiles)
-        val localeExcludes = bundledWebViewDir.asFile
-            .resolve("locales")
-            .listFiles { file -> file.isFile && file.extension.equals("pak", ignoreCase = true) }
-            .orEmpty()
-            .map { it.name }
-            .filterNot { it in bundledWebViewKeptLocales }
-            .map { "locales/$it" }
-        exclude(localeExcludes)
-        into("common/kcef-bundle")
-    }
+    dependsOn(checkBundledPdfiumRuntime, generateDesktopCloudConfig)
     from(bundledPdfiumDir) {
         into("common/third_party/pdfium/${desktopPdfiumDirectoryName(desktopOsName, desktopOsArch)}")
     }
     into("common") {
-        from(
-            providers.provider {
-                temporaryDir.resolve("desktop-cloud.properties").also { file ->
-                    file.parentFile.mkdirs()
-                    file.writeText(
-                        desktopCloudConfig.entries.joinToString(separator = "\n", postfix = "\n") { (key, value) ->
-                            "$key=${value.replace("\\", "\\\\").replace("\n", "")}"
-                        }
-                    )
-                }
-            }
-        )
+        from(generatedDesktopCloudConfigFile)
     }
     into(generatedDesktopResourcesDir)
 }
@@ -512,6 +681,13 @@ val prepareDesktopStringResources by tasks.registering(Sync::class) {
     into(generatedDesktopStringResourcesDir)
 }
 
+val verifyDesktopNativePackaging by tasks.registering(VerifyDesktopNativePackagingTask::class) {
+    supportedHost.set(desktopNativePackageSupportedHost)
+    hostOsId.set(desktopOsId(desktopOsName))
+    hostArchId.set(desktopArchId(desktopOsArch))
+    missingStandardServiceConfig.set(desktopMissingStandardServiceConfig)
+}
+
 kotlin {
     jvm("desktop")
     jvmToolchain(21)
@@ -523,12 +699,14 @@ kotlin {
                 implementation(project(":shared"))
                 implementation(compose.desktop.currentOs)
                 implementation(compose.material3)
-                implementation(compose.materialIconsExtended)
-                implementation("io.github.kevinnzou:compose-webview-multiplatform:2.0.3")
+                desktopSwtDependency?.let { dependency ->
+                    compileOnly(dependency)
+                    runtimeOnly(dependency)
+                }
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.8.1")
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
                 implementation("net.java.dev.jna:jna:5.17.0")
                 implementation("org.apache.commons:commons-compress:1.28.0")
-                implementation("org.apache.thrift:libthrift:0.22.0")
                 implementation("org.tukaani:xz:1.10")
                 implementation("com.twelvemonkeys.imageio:imageio-webp:3.13.1")
             }
@@ -554,6 +732,10 @@ compose.desktop {
         jvmArgs("-Depisteme.desktop.version=${desktopResolvedVersionName.get()}")
 
         buildTypes.release.proguard {
+            // ProGuard still rewrites and shrinks release jars even when optimization and
+            // obfuscation are disabled. That has produced invalid stack-map frames in large
+            // Compose/PDF lambdas and stripped WebView bridge behavior in packaged MSIs.
+            isEnabled.set(desktopReleaseProguardEnabled)
             obfuscate.set(false)
             // Compose/Kotlin generated methods can produce very large stack-map frames.
             // ProGuard optimization has emitted invalid frames for SharedAppTheme in release builds.
@@ -562,8 +744,17 @@ compose.desktop {
         }
 
         nativeDistributions {
-            targetFormats(TargetFormat.Exe, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm)
-            modules("java.net.http")
+            targetFormats(*desktopPackageTargetFormats.toTypedArray())
+            modules(
+                "java.datatransfer",
+                "java.desktop",
+                "java.logging",
+                "java.management",
+                "java.net.http",
+                "jdk.charsets",
+                "jdk.httpserver",
+                "jdk.unsupported"
+            )
             packageName = desktopPackageName
             packageVersion = desktopPackageVersion.get()
             description = desktopPackageDescription
@@ -612,19 +803,41 @@ tasks.withType<Jar>().configureEach {
     }
 }
 
+val stripReleaseProguardJarSignatures = if (desktopReleaseProguardEnabled) {
+    tasks.registering(StripInvalidJarSignaturesTask::class) {
+        dependsOn("proguardReleaseJars")
+        jarDirectoryPath.set(layout.buildDirectory.dir("compose/tmp/main-release/proguard").map { it.asFile.absolutePath })
+    }
+} else {
+    null
+}
+
+tasks.matching {
+    it.name in setOf(
+        "createReleaseDistributable",
+        "packageReleaseDistributionForCurrentOS",
+        "packageReleaseExe",
+        "packageReleaseMsi",
+        "packageReleaseDeb",
+        "packageReleaseRpm",
+        "runReleaseDistributable"
+    )
+}.configureEach {
+    stripReleaseProguardJarSignatures?.let { dependsOn(it) }
+}
+
 mapOf(
     "packageMsi" to "main",
     "packageReleaseMsi" to "main-release"
 ).forEach { (taskName, distributionName) ->
+    val renameTask = tasks.register<RenameDesktopMsiOutputTask>("rename${taskName.replaceFirstChar(Char::titlecase)}Output") {
+        msiDirectoryPath.set(layout.buildDirectory.dir("compose/binaries/$distributionName/msi").get().asFile.absolutePath)
+        packageName.set(desktopPackageName)
+        packageVersion.set(desktopPackageVersion.get())
+        architecture.set(desktopPackageArchitecture)
+    }
     tasks.matching { it.name == taskName }.configureEach {
-        doLast {
-            renameDesktopMsiOutput(
-                msiDirectory = layout.buildDirectory.dir("compose/binaries/$distributionName/msi").get().asFile,
-                packageName = desktopPackageName,
-                packageVersion = desktopPackageVersion.get(),
-                architecture = desktopPackageArchitecture
-            )
-        }
+        finalizedBy(renameTask)
     }
 }
 
@@ -648,6 +861,7 @@ tasks.matching {
         "runReleaseDistributable"
     )
 }.configureEach {
+    dependsOn(verifyDesktopNativePackaging)
     dependsOn(prepareBundledDesktopResources)
     inputs.dir(generatedDesktopResourcesDir)
         .withPropertyName("bundledDesktopResources")

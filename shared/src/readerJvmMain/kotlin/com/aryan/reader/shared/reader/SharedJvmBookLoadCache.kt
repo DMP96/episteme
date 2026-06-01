@@ -14,16 +14,23 @@ import kotlinx.serialization.protobuf.ProtoNumber
 import java.io.File
 
 private const val SharedJvmBookLoadCacheSchemaVersion = 1
-private const val SharedJvmBookLoadCacheProcessingVersion = 3
+private const val SharedJvmBookLoadCacheProcessingVersion = 8
+
+enum class SharedJvmBookLoadSemanticMode {
+    FULL,
+    SKIP
+}
 
 data class SharedJvmBookLoadCacheKey(
     val canonicalPath: String,
     val type: FileType,
     val length: Long,
-    val lastModified: Long
+    val lastModified: Long,
+    val semanticMode: SharedJvmBookLoadSemanticMode = SharedJvmBookLoadSemanticMode.FULL,
+    val htmlChapterRange: String? = null
 ) {
     val cacheId: String = sha256Hex(
-        "$SharedJvmBookLoadCacheProcessingVersion|$canonicalPath|${type.name}|$length|$lastModified"
+        "$SharedJvmBookLoadCacheProcessingVersion|${semanticMode.name}|${htmlChapterRange.orEmpty()}|$canonicalPath|${type.name}|$length|$lastModified"
     ).take(32)
 }
 
@@ -41,11 +48,14 @@ class SharedJvmBookLoadCache(
         return runCatching {
             val record = proto.decodeFromByteArray<CachedSharedEpubBook>(file.readBytes())
             if (!record.matches(key)) return@runCatching null
-            record.toBook()
+            record.toBook().takeUnless {
+                key.requiresCachedSemanticBlocks() && it.hasHtmlContentWithoutSemanticBlocks()
+            }
         }.getOrNull()
     }
 
     fun save(key: SharedJvmBookLoadCacheKey, book: SharedEpubBook) {
+        if (key.requiresCachedSemanticBlocks() && book.hasHtmlContentWithoutSemanticBlocks()) return
         val record = CachedSharedEpubBook.from(key, book)
         runCatching {
             writeBookLoadCacheAtomically(cacheFile(key), proto.encodeToByteArray(record))
@@ -75,7 +85,9 @@ class SharedJvmBookLoadCache(
             canonicalPath == key.canonicalPath &&
             type == key.type.name &&
             length == key.length &&
-            lastModified == key.lastModified
+            lastModified == key.lastModified &&
+            semanticMode == key.semanticMode.name &&
+            htmlChapterRange == key.htmlChapterRange
     }
 
     companion object {
@@ -101,7 +113,9 @@ private data class CachedSharedEpubBook(
     @ProtoNumber(10) val author: String?,
     @ProtoNumber(11) val css: Map<String, String>,
     @ProtoNumber(12) val chapters: List<CachedSharedEpubChapter>,
-    @ProtoNumber(13) val tableOfContents: List<CachedSharedEpubTocEntry> = emptyList()
+    @ProtoNumber(13) val tableOfContents: List<CachedSharedEpubTocEntry> = emptyList(),
+    @ProtoNumber(14) val semanticMode: String = SharedJvmBookLoadSemanticMode.FULL.name,
+    @ProtoNumber(15) val htmlChapterRange: String? = null
 ) {
     fun toBook(): SharedEpubBook {
         return SharedEpubBook(
@@ -130,7 +144,9 @@ private data class CachedSharedEpubBook(
                 author = book.author,
                 css = book.css,
                 chapters = book.chapters.map(CachedSharedEpubChapter::from),
-                tableOfContents = book.tableOfContents.map(CachedSharedEpubTocEntry::from)
+                tableOfContents = book.tableOfContents.map(CachedSharedEpubTocEntry::from),
+                semanticMode = key.semanticMode.name,
+                htmlChapterRange = key.htmlChapterRange
             )
         }
     }
@@ -196,6 +212,29 @@ private data class CachedSharedEpubChapter(
             )
         }
     }
+}
+
+private fun SharedJvmBookLoadCacheKey.requiresCachedSemanticBlocks(): Boolean {
+    if (semanticMode == SharedJvmBookLoadSemanticMode.SKIP) return false
+    return type.requiresCachedSemanticBlocks()
+}
+
+private fun FileType.requiresCachedSemanticBlocks(): Boolean {
+    return when (this) {
+        FileType.EPUB,
+        FileType.MOBI,
+        FileType.HTML,
+        FileType.FB2,
+        FileType.DOCX,
+        FileType.ODT,
+        FileType.FODT -> true
+        else -> false
+    }
+}
+
+private fun SharedEpubBook.hasHtmlContentWithoutSemanticBlocks(): Boolean {
+    return chapters.any { it.htmlContent.isNotBlank() } &&
+        chapters.none { it.semanticBlocks.isNotEmpty() }
 }
 
 private fun writeBookLoadCacheAtomically(file: File, bytes: ByteArray) {

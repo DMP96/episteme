@@ -33,6 +33,7 @@ import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.WebSocket
+import java.net.http.WebSocketHandshakeException
 import java.nio.ByteBuffer
 import java.util.Base64
 import java.util.concurrent.CompletableFuture
@@ -56,7 +57,7 @@ class DesktopGeminiCloudTtsAdapter(
     private val networkAccess: () -> Boolean = { true },
     private val workerUrlProvider: () -> String = { "" },
     private val authTokenProvider: suspend () -> String? = { null },
-    private val useWorkerProvider: () -> Boolean = { false },
+    private val useWorkerProvider: () -> Boolean = { true },
     private val onWorkerUsageCompleted: suspend () -> Unit = {},
     httpClient: HttpClient? = null,
     private val cacheManager: ReaderTtsFileCacheManager = ReaderTtsFileCacheManager(defaultDesktopTtsCacheRoot())
@@ -75,14 +76,15 @@ class DesktopGeminiCloudTtsAdapter(
     @Volatile
     private var activePlayer: DesktopStreamingPcmPlayer? = null
 
+    val isPlaybackActive: Boolean
+        get() = activePlayer != null || activeWebSocket != null || activeLine != null
+
     override val isAvailable: Boolean
         get() {
             val settings = settingsProvider().sanitized()
-            return networkAccess() && if (useWorkerProvider()) {
-                settings.serverBackedCloudTts && workerUrlProvider().isNotBlank()
-            } else {
-                settings.isByokCloudTtsAvailable
-            }
+            return networkAccess() &&
+                (settings.isByokCloudTtsAvailable ||
+                    (useWorkerProvider() && settings.serverBackedCloudTts && workerUrlProvider().isNotBlank()))
         }
 
     override suspend fun speak(text: String) {
@@ -125,6 +127,12 @@ class DesktopGeminiCloudTtsAdapter(
                 )
             }
             .filter { it.text.isNotBlank() }
+        logDesktopTtsStartTrace {
+            "event=adapter_speak_chunks book=\"${bookTitle.desktopTtsPreview()}\" scope=${readScope.name} " +
+                "inputChunks=${chunks.size} sequenceChunks=${sequenceChunks.size} " +
+                "inputFirst=${chunks.firstOrNull().desktopTtsStartTraceSummary(160)} " +
+                "sequenceFirstText=\"${sequenceChunks.firstOrNull()?.text.orEmpty().desktopTtsPreview(180)}\""
+        }
         logDesktopTts(
             "chunk_sequence_speak_start book=\"${bookTitle.desktopTtsPreview()}\" scope=${readScope.name} " +
                 "chunks=${sequenceChunks.size} totalTextChars=${sequenceChunks.sumOf { it.text.length }}"
@@ -182,28 +190,27 @@ class DesktopGeminiCloudTtsAdapter(
         onChunkStart: suspend (Int) -> Unit
     ) = withContext(Dispatchers.IO) {
         val settings = settingsProvider().sanitized()
-        val useWorker = useWorkerProvider()
-        val authToken = if (useWorker) authTokenProvider() else null
+        val useWorker = useWorkerProvider() && !settings.isByokCloudTtsAvailable
         val totalTextChars = chunks.sumOf { it.text.length }
         logDesktopTts(
             "stream_start book=\"${bookTitle.desktopTtsPreview()}\" chunks=${chunks.size} totalTextChars=$totalTextChars keyPresent=${settings.geminiKey.isNotBlank()} " +
                 "ttsModel=\"${settings.ttsModel.desktopTtsPreview()}\" speaker=\"${settings.ttsSpeakerId.desktopTtsPreview()}\" " +
-                "available=${settings.isCloudTtsAvailable} worker=$useWorker"
+                "available=${settings.isCloudTtsAvailable} serverBacked=${settings.serverBackedCloudTts} worker=$useWorker"
         )
         if (!networkAccess()) {
             logDesktopTts("stream_blocked reason=network_disabled")
             throw IllegalStateException("Cloud TTS is unavailable in this desktop build.")
         }
-        if (!settings.isCloudTtsAvailable) {
-            logDesktopTts("stream_blocked reason=not_available")
-            throw IllegalStateException(
-                if (useWorker) {
-                    "Cloud TTS needs a signed-in account with credits."
-                } else {
-                    "Cloud TTS needs a saved Gemini key and the Gemini cloud TTS model selected."
-                }
-            )
+        if (useWorker) {
+            if (!settings.serverBackedCloudTts || workerUrlProvider().isBlank()) {
+                logDesktopTts("stream_blocked reason=server_backed_not_available")
+                throw IllegalStateException("Cloud TTS needs a signed-in account with credits.")
+            }
+        } else if (!settings.isByokCloudTtsAvailable) {
+            logDesktopTts("stream_blocked reason=byok_not_available")
+            throw IllegalStateException("Cloud TTS needs a saved Gemini key and the Gemini cloud TTS model selected.")
         }
+        val authToken = if (useWorker) authTokenProvider() else null
         if (useWorker && authToken.isNullOrBlank()) {
             logDesktopTts("stream_blocked reason=missing_auth_token")
             throw IllegalStateException("Sign in with Google to use cloud TTS.")
@@ -220,6 +227,7 @@ class DesktopGeminiCloudTtsAdapter(
         val messageBuffer = StringBuilder()
         var webSocket: WebSocket? = null
         var activeTempCacheFile: File? = null
+        var workerGeneratedAudio = false
 
         fun handleMessage(message: String) {
             handleGeminiTtsMessage(
@@ -329,7 +337,7 @@ class DesktopGeminiCloudTtsAdapter(
                     .get(15, TimeUnit.SECONDS)
             }.getOrElse { error ->
                 logDesktopTts("ws_connect_failed error=\"${error.desktopTtsSummary()}\"")
-                throw error
+                throw IllegalStateException(desktopTtsConnectionMessage(error), error)
             }
             activeWebSocket = connectedWebSocket
             webSocket = connectedWebSocket
@@ -361,6 +369,10 @@ class DesktopGeminiCloudTtsAdapter(
                 currentTurnAudioBytesReceived.set(0)
                 currentTurnComplete.set(turnComplete)
                 logDesktopTts("sequence_turn_start index=${index + 1}/${chunks.size} textChars=${text.length}")
+                logDesktopTtsStartTrace {
+                    "event=adapter_turn_start index=${index + 1}/${chunks.size} chapter=\"${chunk.chapterTitle.orEmpty().desktopTtsPreview()}\" " +
+                        "textChars=${text.length} text=\"${text.desktopTtsPreview(220)}\""
+                }
                 withContext(callbackContext) {
                     onChunkStart(index)
                 }
@@ -420,6 +432,10 @@ class DesktopGeminiCloudTtsAdapter(
                         logDesktopTts("stream_failed reason=empty_turn_audio index=${index + 1}/${chunks.size}")
                         throw IllegalStateException("Cloud TTS returned no audio for a text chunk.")
                     }
+                    if (useWorker) {
+                        workerGeneratedAudio = true
+                        onWorkerUsageCompleted()
+                    }
                     activeCacheOutput.getAndSet(null)?.close()
                     runCatching {
                         patchReaderTtsWavHeader(tempCacheFile, turnAudioBytes.toInt())
@@ -454,8 +470,15 @@ class DesktopGeminiCloudTtsAdapter(
             activeWebSocket = null
             activePlayer = null
             logDesktopTts("stream_complete chunks=${chunks.size} audioBytes=${audioBytesReceived.get()}")
-            if (useWorker) onWorkerUsageCompleted()
+            if (useWorker && workerGeneratedAudio) onWorkerUsageCompleted()
         } catch (error: Throwable) {
+            if (useWorker && desktopTtsShouldRefreshAccountAfterError(error)) {
+                try {
+                    onWorkerUsageCompleted()
+                } catch (_: Throwable) {
+                    // Keep the original TTS failure as the visible error.
+                }
+            }
             currentTurnComplete.set(null)
             activeCacheOutput.getAndSet(null)?.let { output -> runCatching { output.close() } }
             activeTempCacheFile?.delete()
@@ -629,6 +652,39 @@ private fun ByteArray.upsample16BitMonoLe2x(): ByteArray {
     return output
 }
 
+private fun desktopTtsConnectionMessage(error: Throwable): String {
+    val causes = generateSequence(error) { it.cause }.toList()
+    val handshake = causes.filterIsInstance<WebSocketHandshakeException>().firstOrNull()
+    return when (handshake?.response?.statusCode()) {
+        401 -> "Sign in again to use cloud TTS."
+        402 -> "Out of credits. Pro and credits can only be purchased from the Android app."
+        403 -> "Cloud TTS is unavailable for this account."
+        405 -> "Cloud TTS is not configured for this desktop build."
+        426 -> "Cloud TTS is not configured for this desktop build."
+        502 -> "Cloud TTS service is temporarily unavailable."
+        else -> {
+            val details = causes
+                .joinToString(" ") { it.message.orEmpty() }
+                .trim()
+            when {
+                details.contains("INSUFFICIENT_CREDITS", ignoreCase = true) ->
+                    "Out of credits. Pro and credits can only be purchased from the Android app."
+                details.contains("401") || details.contains("Unauthorized", ignoreCase = true) ->
+                    "Sign in again to use cloud TTS."
+                else -> "Cloud TTS failed to connect."
+            }
+        }
+    }
+}
+
+private fun desktopTtsShouldRefreshAccountAfterError(error: Throwable): Boolean {
+    val details = generateSequence(error) { it.cause }
+        .joinToString(" ") { it.message.orEmpty() }
+    return details.contains("Out of credits", ignoreCase = true) ||
+        details.contains("INSUFFICIENT_CREDITS", ignoreCase = true) ||
+        details.contains("402", ignoreCase = true)
+}
+
 private class DesktopStreamingPcmPlayer(
     private val onLineChanged: (SourceDataLine?) -> Unit
 ) {
@@ -742,7 +798,6 @@ private class DesktopStreamingPcmPlayer(
                 openLine(24_000f)
             }.onFailure { secondError ->
                 logDesktopTts("play_fallback_failed sampleRate=24000 error=\"${secondError.desktopTtsSummary()}\"")
-                secondError.printStackTrace()
             }.getOrElse {
                 throw firstError
             }

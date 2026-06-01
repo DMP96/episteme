@@ -61,6 +61,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -71,6 +72,7 @@ import androidx.core.text.HtmlCompat
 import com.aryan.reader.R
 import com.aryan.reader.epub.EpubChapter
 import com.aryan.reader.shared.EpubAnnotationSerializer
+import com.aryan.reader.shared.ReaderLocator
 
 private const val BOOKMARK_PREFS_NAME = "epub_reader_bookmarks"
 
@@ -155,14 +157,20 @@ fun processAndAddHighlight(
     newText: String,
     newColor: HighlightColor,
     chapterIndex: Int,
-    currentList: MutableList<UserHighlight>
+    currentList: MutableList<UserHighlight>,
+    locator: ReaderLocator = ReaderLocator.fromLegacy(
+        chapterIndex = chapterIndex,
+        cfi = newCfi,
+        textQuote = newText
+    )
 ): String {
     return EpubAnnotationSerializer.processAndAddHighlight(
         newCfi = newCfi,
         newText = newText,
         newColor = newColor,
         chapterIndex = chapterIndex,
-        currentList = currentList
+        currentList = currentList,
+        locator = locator
     )
 }
 
@@ -593,6 +601,7 @@ fun HighlightColorRow(
                 modifier = Modifier
                     .padding(horizontal = 4.dp)
                     .size(28.dp)
+                    .testTag("HighlightColor_${colorEnum.id}")
                     .clip(CircleShape) // 1. Clip shape for ripple
                     .background(colorEnum.color) // 2. Apply background
                     .clickable {

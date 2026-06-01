@@ -29,6 +29,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -48,7 +51,9 @@ import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
@@ -56,8 +61,9 @@ import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
@@ -91,10 +97,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
@@ -115,7 +123,7 @@ import com.aryan.reader.shared.PageInfoPosition
 import com.aryan.reader.shared.ReaderAiByokSettings
 import com.aryan.reader.shared.ReaderAiFeature
 import com.aryan.reader.shared.ReaderAiResultState
-import com.aryan.reader.shared.ReaderAutoScrollState
+import com.aryan.reader.shared.ReaderCloudTtsVoices
 import com.aryan.reader.shared.ReaderContextExtractor
 import com.aryan.reader.shared.ReaderExtrasState
 import com.aryan.reader.shared.ReaderExternalLookupAction
@@ -136,10 +144,15 @@ import com.aryan.reader.shared.ReaderTtsReplacementPreferences
 import com.aryan.reader.shared.ReaderTtsReplacementRule
 import com.aryan.reader.shared.ReaderTtsReplacementSuggestions
 import com.aryan.reader.shared.UserHighlight
-import com.aryan.reader.shared.SystemUiMode
+import com.aryan.reader.shared.currentTimestamp
 import com.aryan.reader.shared.reduce
 import com.aryan.reader.shared.readerTextureDisplayName
+import com.aryan.reader.shared.resetReaderFormatSettings
+import com.aryan.reader.shared.sanitizeCustomReaderThemes
+import com.aryan.reader.shared.shouldShowPageWidthFormatControl
 import com.aryan.reader.shared.toReaderSettings
+import com.aryan.reader.shared.withHorizontalReaderMargin
+import com.aryan.reader.shared.withVerticalReaderMargin
 import com.aryan.reader.shared.reader.PaginatedReaderState
 import com.aryan.reader.shared.reader.ReaderImageReference
 import com.aryan.reader.shared.reader.ReaderBookmark
@@ -154,12 +167,15 @@ import com.aryan.reader.shared.reader.ReaderSpreadLayout
 import com.aryan.reader.shared.reader.SharedEpubTocEntry
 import com.aryan.reader.shared.reader.SharedReaderTextAlign
 import com.aryan.reader.shared.reader.appearanceSignature
+import com.aryan.reader.shared.reader.isRightToLeftPaginationEnabled
 import com.aryan.reader.shared.reader.layoutSignature
 import com.aryan.reader.shared.reader.logSharedReaderDiagnostic
 import com.aryan.reader.shared.reader.readerImageReferences
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+
+private val SharedReaderFullscreenFocusRetryDelaysMillis = longArrayOf(80L, 120L, 160L, 240L)
 
 @Composable
 fun SharedScreenScaffold(
@@ -196,6 +212,9 @@ fun SharedReaderScreen(
     onFullscreenChange: (Boolean) -> Unit = {},
     toolbarPreferences: ReaderToolbarPreferences = ReaderToolbarPreferences(),
     onToolbarPreferencesChange: (ReaderToolbarPreferences) -> Unit = {},
+    appThemeControls: (@Composable () -> Unit)? = null,
+    customReaderThemes: List<ReaderTheme> = emptyList(),
+    onCustomReaderThemesChange: (List<ReaderTheme>) -> Unit = {},
     highlightPalette: ReaderHighlightPalette = ReaderHighlightPalette(),
     onHighlightPaletteChange: (ReaderHighlightPalette) -> Unit = {},
     ttsReplacementPreferences: ReaderTtsReplacementPreferences = ReaderTtsReplacementPreferences(),
@@ -215,11 +234,12 @@ fun SharedReaderScreen(
     onCloudTtsPauseResume: () -> Unit = {},
     onCloudTtsStop: () -> Unit = {},
     onCloudTtsClearCache: () -> Unit = {},
+    onCloudTtsVoiceChange: (String) -> Unit = {},
     onOpenAiHub: (() -> Unit)? = null,
-    onAutoScrollChange: (ReaderAutoScrollState) -> Unit = {},
     onDownloadReaderImage: ((ReaderImageReference) -> Unit)? = null,
     readerImagePreviewContent: (@Composable (ReaderImageReference, Modifier) -> Unit)? = null,
     readerTextureDataUri: (String) -> String? = { null },
+    readerTexturePreviewContent: (@Composable (String, Modifier) -> Unit)? = null,
     readerCustomTextureIds: List<String> = emptyList(),
     onImportReaderTexture: ((ReaderSettings) -> ReaderSettings?)? = null,
     bottomChromeExtraContent: @Composable ColumnScope.() -> Unit = {},
@@ -229,6 +249,7 @@ fun SharedReaderScreen(
         renderPlan: ReaderContentRenderPlan,
         onVisiblePageChanged: (Int, ReaderLocator?) -> Unit,
         onHighlightSelected: (String) -> Unit,
+        onOpenHighlightPaletteManager: () -> Unit,
         onChromeActivity: () -> Unit
     ) -> Unit
 ) {
@@ -242,6 +263,11 @@ fun SharedReaderScreen(
     val chromeContentColor = MaterialTheme.colorScheme.onSurface
     val pageInfoText = readerState.pageInfoText()
     val shouldShowPageInfo = settings.pageInfoMode != PageInfoMode.HIDDEN
+    val reserveTopPageInfoSpace =
+        settings.readingMode != ReaderReadingMode.VERTICAL &&
+            !isFullscreen &&
+            shouldShowPageInfo &&
+            settings.pageInfoPosition == PageInfoPosition.TOP
     val activeTtsProgress = readerExtrasState.cloudTts.progress
     val activeTtsChunk = activeTtsProgress.currentChunk
     val activeTtsLocator = activeTtsChunk?.toLocator()
@@ -249,12 +275,17 @@ fun SharedReaderScreen(
     val navigationLocator = session.navigationLocator ?: session.activeSearchResult?.locator ?: readerState.currentPageLocator()
     val effectiveCloudTtsAvailable = cloudTtsControlsAvailable && byokSettings.isCloudTtsAvailable
     val readerFocusRequester = remember(session.reader.book.id) { FocusRequester() }
+    var readerFocusRestoreRequest by remember(session.reader.book.id) { mutableIntStateOf(0) }
     val currentIsFullscreen by rememberUpdatedState(isFullscreen)
     val currentOnFullscreenChange by rememberUpdatedState(onFullscreenChange)
     var selectedHighlightId by remember(session.reader.book.id) { mutableStateOf<String?>(null) }
     var sidebarNavigationHighlightId by remember(session.reader.book.id) { mutableStateOf<String?>(null) }
     val selectedHighlight = remember(session.highlights, selectedHighlightId) {
         session.highlights.firstOrNull { it.id == selectedHighlightId }
+    }
+    var showHighlightPaletteManager by remember { mutableStateOf(false) }
+    fun openHighlightPaletteManager() {
+        showHighlightPaletteManager = true
     }
     fun dispatch(action: ReaderAction) {
         onSessionChange(session.reduce(action, readerEngine))
@@ -268,41 +299,48 @@ fun SharedReaderScreen(
     val workspaceModel = epubReaderWorkspaceModel(
         session = session,
         toolbarPreferences = toolbarPreferences,
+        appThemeControlsAvailable = appThemeControls != null,
         extrasState = readerExtrasState,
         aiAvailable = byokSettings.areReaderAiFeaturesAvailable,
         cloudTtsAvailable = effectiveCloudTtsAvailable,
         externalLookupAvailable = externalLookupAvailable
     )
 
-    LaunchedEffect(
-        readerExtrasState.autoScroll.sanitized(),
-        settings.readingMode,
-        readerState.currentPageIndex,
-        readerState.canGoNext
-    ) {
-        val autoScroll = readerExtrasState.autoScroll.sanitized()
-        if (!autoScroll.enabled || settings.readingMode != ReaderReadingMode.PAGINATED || !readerState.canGoNext) return@LaunchedEffect
-        val delayMs = (180_000f / autoScroll.speed).roundToInt().coerceIn(1_200, 12_000)
-        delay(delayMs.toLong())
-        dispatch(ReaderAction.NextPage)
-    }
-
     LaunchedEffect(session.reader.book.id, settings.readingMode, readerState.currentPageIndex) {
         runCatching { readerFocusRequester.requestFocus() }
     }
 
+    val readerPopupActive = selectedHighlight != null ||
+        showHighlightPaletteManager ||
+        readerExtrasState.aiResult.hasContent
+    val shouldRestoreReaderFocus = !session.isSearchActive && !readerPopupActive
+    val currentShouldRestoreReaderFocus by rememberUpdatedState(shouldRestoreReaderFocus)
+    val rightToLeftPaginationActive = settings.isRightToLeftPaginationEnabled()
+    fun requestReaderFocusRestore() {
+        readerFocusRestoreRequest += 1
+    }
     LaunchedEffect(isFullscreen, session.reader.book.id) {
-        repeat(if (isFullscreen) 4 else 1) { attempt ->
-            delay(if (attempt == 0) 80L else 120L)
+        for (delayMillis in SharedReaderFullscreenFocusRetryDelaysMillis) {
+            delay(delayMillis)
+            if (currentShouldRestoreReaderFocus) {
+                runCatching { readerFocusRequester.requestFocus() }
+            }
+        }
+    }
+
+    LaunchedEffect(shouldRestoreReaderFocus, session.reader.book.id) {
+        if (shouldRestoreReaderFocus) {
+            delay(120L)
             runCatching { readerFocusRequester.requestFocus() }
         }
     }
 
-    val readerPopupActive = selectedHighlight != null || readerExtrasState.aiResult.hasContent
-    LaunchedEffect(readerPopupActive, session.reader.book.id) {
-        if (!readerPopupActive) {
-            delay(120L)
-            runCatching { readerFocusRequester.requestFocus() }
+    LaunchedEffect(readerFocusRestoreRequest, session.reader.book.id) {
+        if (readerFocusRestoreRequest > 0) {
+            delay(140L)
+            if (currentShouldRestoreReaderFocus) {
+                runCatching { readerFocusRequester.requestFocus() }
+            }
         }
     }
 
@@ -325,8 +363,28 @@ fun SharedReaderScreen(
         isBookmarked = session.currentBookmark != null,
         onToggleBookmark = { dispatch(ReaderAction.ToggleBookmark) },
         onSearchAction = { dispatch(ReaderAction.SearchOpened) },
+        onAiHubAction = onOpenAiHub.takeIf { byokSettings.areReaderAiFeaturesAvailable },
+        onReadAloudAction = if (effectiveCloudTtsAvailable) {
+            {
+                if (readerExtrasState.cloudTts.isPlaying ||
+                    readerExtrasState.cloudTts.isLoading ||
+                    readerExtrasState.cloudTts.isPaused
+                ) {
+                    onCloudTtsStop()
+                } else {
+                    onCloudTtsStart(
+                        ReaderTtsReadScope.BOOK,
+                        ReaderTtsPlanner.chunksFromCurrentLocation(session)
+                    )
+                }
+            }
+        } else {
+            null
+        },
         useDetachedChromeLayer = useDetachedChromeLayer,
         useDetachedPanelLayer = useDetachedPanelLayer,
+        contentHandlesChromeTap = true,
+        onReaderFocusRestoreRequest = ::requestReaderFocusRestore,
         topSearchBar = if (session.isSearchActive) {
             {
                 SharedReaderSearchTopBar(
@@ -348,12 +406,22 @@ fun SharedReaderScreen(
                         true
                     }
 
-                    event.key == Key.DirectionRight || event.key == Key.PageDown -> {
+                    event.key == Key.DirectionRight -> {
+                        dispatch(if (rightToLeftPaginationActive) ReaderAction.PreviousPage else ReaderAction.NextPage)
+                        true
+                    }
+
+                    event.key == Key.DirectionLeft -> {
+                        dispatch(if (rightToLeftPaginationActive) ReaderAction.NextPage else ReaderAction.PreviousPage)
+                        true
+                    }
+
+                    event.key == Key.PageDown -> {
                         dispatch(ReaderAction.NextPage)
                         true
                     }
 
-                    event.key == Key.DirectionLeft || event.key == Key.PageUp -> {
+                    event.key == Key.PageUp -> {
                         dispatch(ReaderAction.PreviousPage)
                         true
                     }
@@ -404,6 +472,7 @@ fun SharedReaderScreen(
                 onHighlightColorChange = { highlight, color ->
                     dispatch(ReaderAction.HighlightUpdated(highlight.id, color = color))
                 },
+                onOpenHighlightPaletteManager = ::openHighlightPaletteManager,
                 onDeleteHighlight = {
                     dispatch(ReaderAction.HighlightDeleted(it.id))
                     if (selectedHighlightId == it.id) {
@@ -416,22 +485,21 @@ fun SharedReaderScreen(
             SharedReaderControlPanel(
                 session = session,
                 toolbarPreferences = toolbarPreferences,
+                appThemeControls = appThemeControls,
                 onPickCustomFont = onPickCustomFont,
                 customFonts = customFonts,
                 extrasState = readerExtrasState,
                 aiByokSettings = byokSettings,
                 cloudTtsControlsAvailable = cloudTtsControlsAvailable,
-                onAiAction = onAiAction,
-                onOpenAiHub = onOpenAiHub,
-                onCloudTtsStart = onCloudTtsStart,
-                onCloudTtsStop = onCloudTtsStop,
-                onAutoScrollChange = onAutoScrollChange,
+                onCloudTtsClearCache = onCloudTtsClearCache,
+                onCloudTtsVoiceChange = onCloudTtsVoiceChange,
                 ttsReplacementPreferences = ttsReplacementPreferences,
                 ttsReplacementBookId = ttsReplacementBookId ?: session.reader.book.title,
                 onTtsReplacementPreferencesChange = onTtsReplacementPreferencesChange,
-                highlightPalette = highlightPalette,
-                onHighlightPaletteChange = onHighlightPaletteChange,
+                customReaderThemes = customReaderThemes,
+                onCustomReaderThemesChange = onCustomReaderThemesChange,
                 readerCustomTextureIds = readerCustomTextureIds,
+                readerTexturePreviewContent = readerTexturePreviewContent,
                 onImportReaderTexture = onImportReaderTexture,
                 onReaderAction = { action -> dispatch(action) }
             )
@@ -446,37 +514,39 @@ fun SharedReaderScreen(
                             bounds = coordinates.boundsInWindow(),
                             details = "sliderVisible=${toolbarPreferences.isVisible(ReaderTool.SLIDER)} pageInfoBottom=${shouldShowPageInfo && settings.pageInfoPosition == PageInfoPosition.BOTTOM}"
                         )
-                    },
-                shape = RoundedCornerShape(6.dp),
+                },
+                shape = RoundedCornerShape(0.dp),
                 color = chromeBarColor,
                 contentColor = chromeContentColor,
                 tonalElevation = 0.dp,
-                shadowElevation = 1.dp,
-                border = BorderStroke(1.dp, chromeContentColor.copy(alpha = 0.12f))
+                shadowElevation = 0.dp
             ) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
-                    bottomChromeExtraContent()
-                    val showJumpHistory = !session.isSearchActive && session.shouldShowJumpHistory
-                    if (showJumpHistory) {
-                        SharedReaderJumpHistoryBar(
+                Column(Modifier.fillMaxWidth()) {
+                    HorizontalDivider(color = chromeContentColor.copy(alpha = 0.12f))
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+                        bottomChromeExtraContent()
+                        val showJumpHistory = !session.isSearchActive && session.shouldShowJumpHistory
+                        if (showJumpHistory) {
+                            SharedReaderJumpHistoryBar(
+                                session = session,
+                                onBack = { dispatch(ReaderAction.JumpBack) },
+                                onForward = { dispatch(ReaderAction.JumpForward) },
+                                onClear = { dispatch(ReaderAction.JumpHistoryCleared) }
+                            )
+                            HorizontalDivider(color = chromeContentColor.copy(alpha = 0.12f))
+                        }
+                        SharedReaderCompactNavigation(
                             session = session,
-                            onBack = { dispatch(ReaderAction.JumpBack) },
-                            onForward = { dispatch(ReaderAction.JumpForward) },
-                            onClear = { dispatch(ReaderAction.JumpHistoryCleared) }
+                            showSlider = toolbarPreferences.isVisible(ReaderTool.SLIDER),
+                            canGoPrevious = readerState.canGoPrevious,
+                            canGoNext = readerState.canGoNext,
+                            pageInfoText = if (shouldShowPageInfo && settings.pageInfoPosition == PageInfoPosition.BOTTOM) pageInfoText else null,
+                            onPrevious = { dispatch(ReaderAction.PreviousPage) },
+                            onNext = { dispatch(ReaderAction.NextPage) },
+                            onPageNumberChange = { pageNumber -> dispatch(ReaderAction.GoToPageNumber(pageNumber)) },
+                            contentColor = chromeContentColor
                         )
-                        HorizontalDivider(color = chromeContentColor.copy(alpha = 0.12f))
                     }
-                    SharedReaderCompactNavigation(
-                        session = session,
-                        showSlider = toolbarPreferences.isVisible(ReaderTool.SLIDER),
-                        canGoPrevious = readerState.canGoPrevious,
-                        canGoNext = readerState.canGoNext,
-                        pageInfoText = if (shouldShowPageInfo && settings.pageInfoPosition == PageInfoPosition.BOTTOM) pageInfoText else null,
-                        onPrevious = { dispatch(ReaderAction.PreviousPage) },
-                        onNext = { dispatch(ReaderAction.NextPage) },
-                        onPageNumberChange = { pageNumber -> dispatch(ReaderAction.GoToPageNumber(pageNumber)) },
-                        contentColor = chromeContentColor
-                    )
                 }
             }
         },
@@ -507,16 +577,15 @@ fun SharedReaderScreen(
                     logReaderGapChrome(
                         layer = "reader_content_column",
                         bounds = coordinates.boundsInWindow(),
-                        details = "mode=${settings.readingMode} columnGap=12 pageInfoTop=${shouldShowPageInfo && settings.pageInfoPosition == PageInfoPosition.TOP}"
+                        details = "mode=${settings.readingMode} columnGap=${if (reserveTopPageInfoSpace) 12 else 0} pageInfoTop=$reserveTopPageInfoSpace"
                     )
                 },
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(if (reserveTopPageInfoSpace) 12.dp else 0.dp)
         ) {
-            if (!isFullscreen && shouldShowPageInfo && settings.pageInfoPosition == PageInfoPosition.TOP) {
+            if (reserveTopPageInfoSpace) {
                 Text(pageInfoText, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
-            val documentLayoutSignature = settings.layoutSignature()
             val textureDataUri = remember(settings.textureId) {
                 settings.textureId?.let(readerTextureDataUri)
             }
@@ -524,29 +593,141 @@ fun SharedReaderScreen(
                 locator = navigationLocator,
                 requestId = session.navigationRequestId,
                 readingMode = settings.readingMode,
-                autoScroll = readerExtrasState.autoScroll.sanitized(),
                 ttsLocator = activeTtsLocator,
                 ttsRequestId = ttsRequestId
             )
             val renderPlan = if (settings.readingMode == ReaderReadingMode.VERTICAL) {
+                val lastChapterIndex = readerState.book.chapters.lastIndex
+                val activeChapterIndex = if (lastChapterIndex >= 0) {
+                    readerState.currentPage?.chapterIndex?.takeIf { it in 0..lastChapterIndex }
+                        ?: navigationLocator?.chapterIndex?.takeIf { it in 0..lastChapterIndex }
+                        ?: 0
+                } else {
+                    0
+                }
+                var renderedChapterRange by remember(readerState.book.id, lastChapterIndex, settings.readingMode) {
+                    mutableStateOf(readerVerticalRenderedChapterRange(activeChapterIndex, lastChapterIndex))
+                }
+                LaunchedEffect(readerState.book.id, lastChapterIndex, settings.readingMode) {
+                    logReaderPositionTrace {
+                        "event=vertical_render_window_init book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                            "mode=${settings.readingMode} activeChapter=$activeChapterIndex " +
+                            "range=${renderedChapterRange?.let { "${it.first}..${it.last}" } ?: "all"} " +
+                            "page=${readerState.currentPageIndex} pages=${readerState.pages.size}"
+                    }
+                }
+                LaunchedEffect(
+                    settings.readingMode,
+                    session.navigationRequestId,
+                    lastChapterIndex
+                ) {
+                    if (settings.readingMode != ReaderReadingMode.VERTICAL) return@LaunchedEffect
+                    val requestedChapterIndex = navigationLocator?.chapterIndex
+                        ?.takeIf { it in 0..lastChapterIndex }
+                        ?: return@LaunchedEffect
+                    val nextRange = readerVerticalRenderedChapterRange(requestedChapterIndex, lastChapterIndex)
+                    logReaderPositionTrace {
+                        "event=vertical_render_window_navigation_request book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                            "requestId=${session.navigationRequestId} requestedChapter=$requestedChapterIndex " +
+                            "previousRange=${renderedChapterRange?.let { "${it.first}..${it.last}" } ?: "all"} " +
+                            "nextRange=${nextRange?.let { "${it.first}..${it.last}" } ?: "all"} " +
+                            "locator=${navigationLocator.readerPositionTraceSummary()}"
+                    }
+                    renderedChapterRange = nextRange
+                }
+                LaunchedEffect(
+                    settings.readingMode,
+                    activeChapterIndex,
+                    readerState.currentPageIndex,
+                    lastChapterIndex,
+                    renderedChapterRange
+                ) {
+                    if (settings.readingMode != ReaderReadingMode.VERTICAL) return@LaunchedEffect
+                    val currentRange = renderedChapterRange ?: return@LaunchedEffect
+                    val activeChapterFirstPage = readerState.pages.indexOfFirst { it.chapterIndex == activeChapterIndex }
+                    val activeChapterLastPage = readerState.pages.indexOfLast { it.chapterIndex == activeChapterIndex }
+                    val nearChapterStart = activeChapterFirstPage < 0 ||
+                        readerState.currentPageIndex <= activeChapterFirstPage + 1
+                    val nearChapterEnd = activeChapterLastPage < 0 ||
+                        readerState.currentPageIndex >= activeChapterLastPage - 1
+                    val shouldShiftBackward = activeChapterIndex <= currentRange.first &&
+                        currentRange.first > 0 &&
+                        nearChapterStart
+                    val shouldShiftForward = activeChapterIndex >= currentRange.last &&
+                        currentRange.last < lastChapterIndex &&
+                        nearChapterEnd
+                    if (shouldShiftBackward || shouldShiftForward) {
+                        val nextRange = readerVerticalRenderedChapterRange(activeChapterIndex, lastChapterIndex)
+                        logReaderPositionTrace {
+                            "event=vertical_render_window_passive_shift book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                                "direction=${if (shouldShiftBackward) "backward" else "forward"} " +
+                                "activeChapter=$activeChapterIndex page=${readerState.currentPageIndex} " +
+                                "chapterPages=${activeChapterFirstPage}..${activeChapterLastPage} " +
+                                "previousRange=${currentRange.first}..${currentRange.last} " +
+                                "nextRange=${nextRange?.let { "${it.first}..${it.last}" } ?: "all"}"
+                        }
+                        renderedChapterRange = nextRange
+                    } else if (activeChapterIndex <= currentRange.first || activeChapterIndex >= currentRange.last) {
+                        logReaderPositionTrace {
+                            "event=vertical_render_window_passive_hold book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                                "activeChapter=$activeChapterIndex page=${readerState.currentPageIndex} " +
+                                "chapterPages=${activeChapterFirstPage}..${activeChapterLastPage} " +
+                                "range=${currentRange.first}..${currentRange.last} " +
+                                "nearStart=$nearChapterStart nearEnd=$nearChapterEnd"
+                        }
+                    }
+                }
                 val appearanceSignature = settings.appearanceSignature()
-                val appearanceScript = remember(appearanceSignature, textureDataUri) {
-                    ReaderHtmlDocumentBuilder.appearanceUpdateScript(
-                        settings = settings,
-                        textureDataUri = textureDataUri
-                    )
+                val formatSignature = settings.layoutSignature()
+                val appearanceScript = remember(appearanceSignature, formatSignature, textureDataUri, readerState.pages) {
+                    val startedAt = currentTimestamp()
+                    buildString {
+                        append(
+                            ReaderHtmlDocumentBuilder.appearanceUpdateScript(
+                                settings = settings,
+                                textureDataUri = textureDataUri
+                            )
+                        )
+                        append('\n')
+                        append(ReaderHtmlDocumentBuilder.pageAnchorsUpdateScript(readerState.pages))
+                    }.also { script ->
+                        logReaderOpenTrace {
+                            "event=vertical_appearance_script_built book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                                "durationMs=${startedAt.readerOpenTraceElapsedMs()} scriptChars=${script.length} " +
+                                "pages=${readerState.pages.size} mode=${settings.readingMode}"
+                        }
+                    }
+                }
+                val highlightPaletteScript = remember(highlightPalette) {
+                    ReaderHtmlDocumentBuilder.highlightPaletteUpdateScript(highlightPalette)
                 }
                 // Keep the initial locator in the document so its first position report is not the top of the book.
                 val html = remember(
                     readerState.book,
-                    documentLayoutSignature,
                     session.searchQuery,
                     session.searchOptions,
-                    readerState.pages,
+                    renderedChapterRange?.first,
+                    renderedChapterRange?.last,
                     byokSettings.areReaderAiFeaturesAvailable,
                     effectiveCloudTtsAvailable,
                     externalLookupAvailable
                 ) {
+                    val startedAt = currentTimestamp()
+                    val renderedChapterCount = renderedChapterRange
+                        ?.count { it in readerState.book.chapters.indices }
+                        ?: readerState.book.chapters.size
+                    logReaderOpenTrace {
+                        "event=vertical_html_build_start book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                            "chapters=${readerState.book.chapters.size} pages=${readerState.pages.size} " +
+                            "renderedChapters=${renderedChapterRange?.let { "${it.first}..${it.last}" } ?: "all"} " +
+                            "renderedChapterCount=$renderedChapterCount activeChapter=$activeChapterIndex " +
+                            "textChars=${readerState.book.chapters.sumOf { it.plainText.length }} " +
+                            "htmlChars=${readerState.book.chapters.sumOf { it.htmlContent.length }} " +
+                            "semanticBlocks=${readerState.book.chapters.sumOf { it.semanticBlocks.size }} " +
+                            "search=${session.searchQuery.isNotBlank()} hasNavigation=${navigationLocator != null} " +
+                            "ai=${byokSettings.areReaderAiFeaturesAvailable} cloudTts=$effectiveCloudTtsAvailable " +
+                            "externalLookup=$externalLookupAvailable"
+                    }
                     ReaderHtmlDocumentBuilder.verticalDocument(
                         book = readerState.book,
                         settings = settings,
@@ -559,12 +740,22 @@ fun SharedReaderScreen(
                         readerAiFeaturesEnabled = byokSettings.areReaderAiFeaturesAvailable,
                         cloudTtsEnabled = effectiveCloudTtsAvailable,
                         externalLookupEnabled = externalLookupAvailable,
-                        textureDataUri = textureDataUri
-                    )
+                        textureDataUri = textureDataUri,
+                        renderedChapterRange = renderedChapterRange
+                    ).also { html ->
+                        logReaderOpenTrace {
+                            "event=vertical_html_build_done book=\"${readerState.book.title.readerOpenTracePreview(120)}\" " +
+                                "durationMs=${startedAt.readerOpenTraceElapsedMs()} htmlChars=${html.length} " +
+                                "chapters=${readerState.book.chapters.size} renderedChapterCount=$renderedChapterCount " +
+                                "renderedChapters=${renderedChapterRange?.let { "${it.first}..${it.last}" } ?: "all"} " +
+                                "pages=${readerState.pages.size}"
+                        }
+                    }
                 }
                 ReaderContentRenderPlan.WebDocument(
                     html = html,
                     appearanceScript = appearanceScript,
+                    highlightPaletteScript = highlightPaletteScript,
                     background = background,
                     foreground = foreground,
                     navigationTarget = navigationTarget,
@@ -593,6 +784,7 @@ fun SharedReaderScreen(
                         selectedHighlightId = highlightId
                     }
                 },
+                ::openHighlightPaletteManager,
                 onChromeActivity
             )
         }
@@ -620,6 +812,7 @@ fun SharedReaderScreen(
                     onColorChange = { color ->
                         dispatch(ReaderAction.HighlightUpdated(selectedHighlight.id, color = color))
                     },
+                    onOpenPaletteManager = ::openHighlightPaletteManager,
                     onSaveNote = { note ->
                         dispatch(ReaderAction.HighlightUpdated(selectedHighlight.id, note = note))
                     },
@@ -637,6 +830,16 @@ fun SharedReaderScreen(
                     onDismiss = onAiResultDismiss
                 )
             }
+        }
+        if (showHighlightPaletteManager) {
+            SharedReaderHighlightPaletteDialog(
+                palette = highlightPalette,
+                onDismiss = { showHighlightPaletteManager = false },
+                onSave = { palette ->
+                    onHighlightPaletteChange(palette)
+                    showHighlightPaletteManager = false
+                }
+            )
         }
     }
 }
@@ -657,7 +860,7 @@ private fun SharedReaderSearchTopBar(
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(6.dp),
+        shape = RoundedCornerShape(0.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
         contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = 2.dp
@@ -667,7 +870,8 @@ private fun SharedReaderSearchTopBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            IconButton(
+            ReaderTooltipIconButton(
+                tooltip = readerString("tooltip_close_search_desc", "Exit search and go back to the reader"),
                 onClick = { onReaderAction(ReaderAction.SearchClosed) },
                 modifier = Modifier.size(36.dp)
             ) {
@@ -681,7 +885,10 @@ private fun SharedReaderSearchTopBar(
                 modifier = Modifier.weight(1f).focusRequester(focusRequester),
                 trailingIcon = if (session.searchQuery.isNotEmpty()) {
                     {
-                        IconButton(onClick = { onReaderAction(ReaderAction.SearchChanged("")) }) {
+                        ReaderTooltipIconButton(
+                            tooltip = readerString("tooltip_clear_search_desc", "Erase your current search query and start over"),
+                            onClick = { onReaderAction(ReaderAction.SearchChanged("")) }
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = readerString("tooltip_clear_search", "Clear search"))
                         }
                     }
@@ -690,7 +897,13 @@ private fun SharedReaderSearchTopBar(
                 },
                 selectionKey = session.reader.book.id
             )
-            IconButton(
+            val resultsTooltip = if (session.showSearchResultsPanel) {
+                readerString("tooltip_hide_results_desc", "Collapse the search results panel")
+            } else {
+                readerString("tooltip_show_results_desc", "Expand the panel to see all search matches")
+            }
+            ReaderTooltipIconButton(
+                tooltip = resultsTooltip,
                 onClick = { onReaderAction(ReaderAction.SearchResultsPanelToggled) },
                 modifier = Modifier.size(36.dp)
             ) {
@@ -703,8 +916,8 @@ private fun SharedReaderSearchTopBar(
                     }
                 )
             }
-        }
     }
+}
 }
 
 @Composable
@@ -828,7 +1041,8 @@ private fun SharedReaderSearchNavigationPill(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            IconButton(
+            ReaderTooltipIconButton(
+                tooltip = readerString("tooltip_prev_result_desc", "Jump to the previous search match in the document"),
                 onClick = onPrevious,
                 enabled = session.canGoToPreviousSearchResult,
                 modifier = Modifier.size(36.dp)
@@ -845,7 +1059,8 @@ private fun SharedReaderSearchNavigationPill(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.clickable(onClick = onShowResults).padding(horizontal = 8.dp)
             )
-            IconButton(
+            ReaderTooltipIconButton(
+                tooltip = readerString("tooltip_next_result_desc", "Jump to the next search match in the document"),
                 onClick = onNext,
                 enabled = session.canGoToNextSearchResult,
                 modifier = Modifier.size(36.dp)
@@ -863,6 +1078,7 @@ private fun SharedReaderHighlightSheet(
     palette: ReaderHighlightPalette,
     onDismiss: () -> Unit,
     onColorChange: (HighlightColor) -> Unit,
+    onOpenPaletteManager: () -> Unit,
     onSaveNote: (String) -> Unit,
     onDelete: () -> Unit,
     onCopy: () -> Unit,
@@ -886,29 +1102,48 @@ private fun SharedReaderHighlightSheet(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
+                .padding(vertical = 8.dp, horizontal = 10.dp),
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically
         ) {
             palette.sanitized().colors.forEach { color ->
-                Surface(
+                Box(
+                    contentAlignment = Alignment.Center,
                     modifier = Modifier
-                        .padding(horizontal = 6.dp)
-                        .size(30.dp)
+                        .padding(horizontal = 4.dp)
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(color.color)
                         .clickable { onColorChange(color) },
-                    color = color.color,
-                    shape = RoundedCornerShape(15.dp),
-                    border = BorderStroke(
-                        width = if (highlight.color == color) 3.dp else 1.dp,
-                        color = if (highlight.color == color) {
-                            MaterialTheme.colorScheme.onSurface
-                        } else {
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.28f)
-                        }
-                    ),
-                    content = {}
-                )
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .border(
+                                width = if (highlight.color == color) 3.dp else 1.dp,
+                                color = if (highlight.color == color) {
+                                    MaterialTheme.colorScheme.onSurface
+                                } else {
+                                    MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)
+                                },
+                                shape = CircleShape
+                            )
+                    )
+                    if (highlight.color == color) {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = null,
+                            tint = if (color == HighlightColor.WHITE || color == HighlightColor.YELLOW) Color.Black else Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
             }
+            Spacer(modifier = Modifier.width(6.dp))
+            SharedReaderHighlightPaletteSpectrumButton(
+                onClick = onOpenPaletteManager,
+                size = 28.dp
+            )
         }
         Surface(
             color = highlight.color.color.copy(alpha = 0.10f),
@@ -1127,7 +1362,6 @@ private fun SharedReaderQuickActions(
     onCloudTtsPauseResume: () -> Unit,
     onCloudTtsStop: () -> Unit,
     onCloudTtsClearCache: () -> Unit,
-    onAutoScrollChange: (ReaderAutoScrollState) -> Unit,
     session: ReaderSessionState,
     extrasState: ReaderExtrasState,
     aiByokSettings: ReaderAiByokSettings,
@@ -1216,22 +1450,6 @@ private fun SharedReaderQuickActions(
                     )
                 }
 
-                ReaderTool.AUTO_SCROLL -> IconButton(
-                    onClick = {
-                        val autoScroll = extrasState.autoScroll.sanitized()
-                        onAutoScrollChange(autoScroll.copy(enabled = !autoScroll.enabled))
-                    }
-                ) {
-                    Icon(
-                        Icons.Default.Speed,
-                        contentDescription = if (extrasState.autoScroll.enabled) {
-                            readerString("desktop_stop_auto_scroll", "Stop auto scroll")
-                        } else {
-                            readerString("desktop_start_auto_scroll", "Start auto scroll")
-                        }
-                    )
-                }
-
                 else -> Unit
             }
         }
@@ -1242,26 +1460,28 @@ private fun SharedReaderQuickActions(
 private fun SharedReaderControlPanel(
     session: ReaderSessionState,
     toolbarPreferences: ReaderToolbarPreferences,
+    appThemeControls: (@Composable () -> Unit)?,
     onPickCustomFont: (() -> String?)?,
     customFonts: List<CustomFontItem>,
     extrasState: ReaderExtrasState,
     aiByokSettings: ReaderAiByokSettings,
     cloudTtsControlsAvailable: Boolean,
-    onAiAction: (ReaderAiFeature, String) -> Unit,
-    onOpenAiHub: (() -> Unit)?,
-    onCloudTtsStart: (ReaderTtsReadScope, List<ReaderTtsChunk>) -> Unit,
-    onCloudTtsStop: () -> Unit,
-    onAutoScrollChange: (ReaderAutoScrollState) -> Unit,
+    onCloudTtsClearCache: () -> Unit,
+    onCloudTtsVoiceChange: (String) -> Unit,
     ttsReplacementPreferences: ReaderTtsReplacementPreferences,
     ttsReplacementBookId: String,
     onTtsReplacementPreferencesChange: (ReaderTtsReplacementPreferences) -> Unit,
-    highlightPalette: ReaderHighlightPalette,
-    onHighlightPaletteChange: (ReaderHighlightPalette) -> Unit,
+    customReaderThemes: List<ReaderTheme>,
+    onCustomReaderThemesChange: (List<ReaderTheme>) -> Unit,
     readerCustomTextureIds: List<String>,
+    readerTexturePreviewContent: (@Composable (String, Modifier) -> Unit)?,
     onImportReaderTexture: ((ReaderSettings) -> ReaderSettings?)?,
     onReaderAction: (ReaderAction) -> Unit
 ) {
-    val sections = toolbarPreferences.availableReaderControlSections(session)
+    val sections = toolbarPreferences.availableReaderControlSections(
+        cloudTtsControlsAvailable = cloudTtsControlsAvailable,
+        appThemeControlsAvailable = appThemeControls != null
+    )
     if (sections.isEmpty()) return
     val defaultSection = sections.first()
     var selectedSection by remember(sections) { mutableStateOf(defaultSection) }
@@ -1272,48 +1492,27 @@ private fun SharedReaderControlPanel(
     }
     val activeSection = selectedSection.takeIf { it in sections } ?: defaultSection
 
-    Surface(
-        modifier = Modifier
-            .width(340.dp)
-            .fillMaxHeight(),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        shape = RoundedCornerShape(SharedUiTokens.surfaceRadius),
-        border = sharedSubtleBorder()
+    Column(
+        modifier = Modifier.fillMaxSize()
     ) {
+        SharedReaderControlSectionTabs(
+            sections = sections,
+            activeSection = activeSection,
+            onSectionSelected = { selectedSection = it }
+        )
         LazyColumn(
-            modifier = Modifier.padding(SharedUiTokens.panelPadding),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(top = 12.dp),
             verticalArrangement = Arrangement.spacedBy(SharedUiTokens.contentGap)
         ) {
             item {
-                Text(readerString("desktop_reader_tools", "Reader tools"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.horizontalScroll(rememberScrollState())
-                ) {
-                    sections.forEach { section ->
-                        FilterChip(
-                            selected = activeSection == section,
-                            onClick = { selectedSection = section },
-                            label = { Text(section.localizedTitle()) }
-                        )
-                    }
-                }
-            }
-            item {
-                HorizontalDivider()
-            }
-            item {
                 when (activeSection) {
-                    ReaderControlSection.PAGE -> SharedReaderPageControls(
-                        session = session,
-                        onReaderAction = onReaderAction
-                    )
+                    ReaderControlSection.APP_THEME -> appThemeControls?.invoke()
 
                     ReaderControlSection.FORMAT -> SharedReaderFormatControls(
                         settings = session.reader.settings,
-                        toolbarPreferences = toolbarPreferences,
                         onPickCustomFont = onPickCustomFont,
                         customFonts = customFonts,
                         onReaderAction = onReaderAction
@@ -1323,22 +1522,24 @@ private fun SharedReaderControlPanel(
                         settings = session.reader.settings,
                         customTextureIds = readerCustomTextureIds,
                         onImportTexture = onImportReaderTexture,
-                        highlightPalette = highlightPalette,
-                        onHighlightPaletteChange = onHighlightPaletteChange,
+                        customThemes = customReaderThemes,
+                        onCustomThemesChange = onCustomReaderThemesChange,
+                        texturePreviewContent = readerTexturePreviewContent,
                         onSettingsChange = { onReaderAction(ReaderAction.SettingsChanged(it)) }
                     )
 
-                    ReaderControlSection.EXTRAS -> SharedReaderExtrasControls(
-                        session = session,
+                    ReaderControlSection.VISUAL -> SharedReaderVisualOptionsControls(
+                        settings = session.reader.settings,
+                        onReaderAction = onReaderAction
+                    )
+
+                    ReaderControlSection.TTS -> SharedReaderTtsControls(
                         extrasState = extrasState,
                         aiByokSettings = aiByokSettings,
                         toolbarPreferences = toolbarPreferences,
                         cloudTtsControlsAvailable = cloudTtsControlsAvailable,
-                        onAiAction = onAiAction,
-                        onOpenAiHub = onOpenAiHub,
-                        onCloudTtsStart = onCloudTtsStart,
-                        onCloudTtsStop = onCloudTtsStop,
-                        onAutoScrollChange = onAutoScrollChange,
+                        onCloudTtsClearCache = onCloudTtsClearCache,
+                        onCloudTtsVoiceChange = onCloudTtsVoiceChange,
                         ttsReplacementPreferences = ttsReplacementPreferences,
                         ttsReplacementBookId = ttsReplacementBookId,
                         onTtsReplacementPreferencesChange = onTtsReplacementPreferencesChange
@@ -1350,56 +1551,87 @@ private fun SharedReaderControlPanel(
     }
 }
 
+@Composable
+private fun SharedReaderControlSectionTabs(
+    sections: List<ReaderControlSection>,
+    activeSection: ReaderControlSection,
+    onSectionSelected: (ReaderControlSection) -> Unit
+) {
+    val activeIndex = sections.indexOf(activeSection).coerceAtLeast(0)
+    ScrollableTabRow(
+        selectedTabIndex = activeIndex,
+        edgePadding = 0.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        sections.forEach { section ->
+            Tab(
+                selected = activeSection == section,
+                onClick = { onSectionSelected(section) },
+                icon = {
+                    Icon(
+                        section.icon(),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                },
+                text = {
+                    Text(
+                        section.localizedTitle(),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            )
+        }
+    }
+}
+
 private enum class ReaderControlSection {
-    PAGE,
+    APP_THEME,
     FORMAT,
     THEME,
-    EXTRAS
+    VISUAL,
+    TTS
+}
+
+private fun ReaderControlSection.icon(): ImageVector {
+    return when (this) {
+        ReaderControlSection.APP_THEME -> Icons.Default.Palette
+        ReaderControlSection.FORMAT -> Icons.Default.TextFields
+        ReaderControlSection.THEME -> Icons.Default.Palette
+        ReaderControlSection.VISUAL -> Icons.Default.Tune
+        ReaderControlSection.TTS -> Icons.AutoMirrored.Filled.VolumeUp
+    }
 }
 
 @Composable
 private fun ReaderControlSection.localizedTitle(): String {
     return when (this) {
-        ReaderControlSection.PAGE -> readerString("desktop_navigation", "Navigation")
+        ReaderControlSection.APP_THEME -> readerString("app_theme_title", "App theme")
         ReaderControlSection.FORMAT -> readerString("desktop_typography", "Typography")
-        ReaderControlSection.THEME -> readerString("app_theme_appearance", "Appearance")
-        ReaderControlSection.EXTRAS -> readerString("desktop_assist", "Assist")
+        ReaderControlSection.THEME -> readerString("reading_themes", "Reading Themes")
+        ReaderControlSection.VISUAL -> readerString("visual_options_title", "Visual")
+        ReaderControlSection.TTS -> readerString("menu_tts_settings", "TTS")
     }
 }
 
-private fun ReaderToolbarPreferences.availableReaderControlSections(session: ReaderSessionState): List<ReaderControlSection> {
+private fun ReaderToolbarPreferences.availableReaderControlSections(
+    cloudTtsControlsAvailable: Boolean,
+    appThemeControlsAvailable: Boolean = false
+): List<ReaderControlSection> {
     return buildList {
-        if (session.shouldShowJumpHistory) {
-            add(ReaderControlSection.PAGE)
-        }
-        if (isVisible(ReaderTool.FORMAT) || isVisible(ReaderTool.READING_MODE)) add(ReaderControlSection.FORMAT)
+        if (isVisible(ReaderTool.FORMAT)) add(ReaderControlSection.FORMAT)
         if (isVisible(ReaderTool.THEME)) add(ReaderControlSection.THEME)
+        if (appThemeControlsAvailable) add(ReaderControlSection.APP_THEME)
+        if (isVisible(ReaderTool.VISUAL_OPTIONS) || isVisible(ReaderTool.READING_MODE)) add(ReaderControlSection.VISUAL)
         if (
-            isVisible(ReaderTool.AI_FEATURES) ||
-            isVisible(ReaderTool.TTS_CONTROLS) ||
-            isVisible(ReaderTool.TTS_SETTINGS) ||
-            isVisible(ReaderTool.TTS_REPLACEMENTS) ||
-            isVisible(ReaderTool.AUTO_SCROLL)
+            (cloudTtsControlsAvailable && (
+                isVisible(ReaderTool.TTS_CONTROLS) ||
+                    isVisible(ReaderTool.TTS_SETTINGS)
+                )) ||
+            isVisible(ReaderTool.TTS_REPLACEMENTS)
         ) {
-            add(ReaderControlSection.EXTRAS)
-        }
-    }
-}
-
-@Composable
-private fun SharedReaderPageControls(
-    session: ReaderSessionState,
-    onReaderAction: (ReaderAction) -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (session.shouldShowJumpHistory) {
-            Text(readerString("desktop_jump_history", "Jump history"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-            SharedReaderJumpHistoryBar(
-                session = session,
-                onBack = { onReaderAction(ReaderAction.JumpBack) },
-                onForward = { onReaderAction(ReaderAction.JumpForward) },
-                onClear = { onReaderAction(ReaderAction.JumpHistoryCleared) }
-            )
+            add(ReaderControlSection.TTS)
         }
     }
 }
@@ -1407,57 +1639,22 @@ private fun SharedReaderPageControls(
 @Composable
 fun SharedReaderFormatControls(
     settings: ReaderSettings,
-    toolbarPreferences: ReaderToolbarPreferences,
     onPickCustomFont: (() -> String?)?,
     customFonts: List<CustomFontItem>,
     onReaderAction: (ReaderAction) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        if (toolbarPreferences.isVisible(ReaderTool.READING_MODE)) {
-            SharedReaderPanelSection(readerString("label_reading", "Reading")) {
-                SharedReaderChoiceRow {
-                    FilterChip(
-                        selected = settings.readingMode == ReaderReadingMode.PAGINATED,
-                        onClick = {
-                            onReaderAction(ReaderAction.SettingsChanged(settings.copy(readingMode = ReaderReadingMode.PAGINATED)))
-                        },
-                        label = { Text(readerString("tab_pages", "Pages")) }
-                    )
-                    FilterChip(
-                        selected = settings.readingMode == ReaderReadingMode.VERTICAL,
-                        onClick = {
-                            onReaderAction(ReaderAction.SettingsChanged(settings.copy(readingMode = ReaderReadingMode.VERTICAL)))
-                        },
-                        label = { Text(readerString("menu_reading_mode_vertical", "Vertical")) }
-                    )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            TextButton(
+                onClick = {
+                    onReaderAction(ReaderAction.SettingsChanged(settings.resetReaderFormatSettings()))
                 }
-                if (settings.readingMode == ReaderReadingMode.PAGINATED) {
-                    SharedReaderChoiceRow {
-                        FilterChip(
-                            selected = settings.pageSpreadMode == ReaderPageSpreadMode.SINGLE,
-                            onClick = {
-                                onReaderAction(
-                                    ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.SINGLE))
-                                )
-                            },
-                            label = { Text(readerString("visual_options_pdf_spread_single", "Single page")) }
-                        )
-                        FilterChip(
-                            selected = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE,
-                            onClick = {
-                                onReaderAction(
-                                    ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE))
-                                )
-                            },
-                            label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
-                        )
-                    }
-                }
+            ) {
+                Text(readerString("action_reset", "Reset"))
             }
         }
 
-        if (toolbarPreferences.isVisible(ReaderTool.FORMAT)) {
-            SharedReaderPanelSection(readerString("section_font_alignment", "Font & Alignment")) {
+        SharedReaderPanelSection(readerString("section_font_alignment", "Font & Alignment")) {
                 val customFontName = settings.customFontPath
                     ?.substringAfterLast('/')
                     ?.substringAfterLast('\\')
@@ -1631,11 +1828,9 @@ fun SharedReaderFormatControls(
                     label = readerString("label_horizontal_margin", "Horizontal margin"),
                     value = settings.resolvedHorizontalMargin.toFloat(),
                     onValueChange = { value ->
-                        val nextHorizontal = value.roundToInt()
-                        val nextMargin = maxOf(nextHorizontal, settings.resolvedVerticalMargin)
                         onReaderAction(
                             ReaderAction.SettingsChanged(
-                                settings.copy(horizontalMargin = nextHorizontal, margin = nextMargin)
+                                settings.withHorizontalReaderMargin(value.roundToInt())
                             )
                         )
                     },
@@ -1648,11 +1843,9 @@ fun SharedReaderFormatControls(
                     label = readerString("label_vertical_margin", "Vertical margin"),
                     value = settings.resolvedVerticalMargin.toFloat(),
                     onValueChange = { value ->
-                        val nextVertical = value.roundToInt()
-                        val nextMargin = maxOf(settings.resolvedHorizontalMargin, nextVertical)
                         onReaderAction(
                             ReaderAction.SettingsChanged(
-                                settings.copy(verticalMargin = nextVertical, margin = nextMargin)
+                                settings.withVerticalReaderMargin(value.roundToInt())
                             )
                         )
                     },
@@ -1661,18 +1854,19 @@ fun SharedReaderFormatControls(
                     stepSize = 4f,
                     formatValue = { it.roundToInt().toString() }
                 )
-                SharedReaderSettingSlider(
-                    label = readerString("desktop_page_width", "Page width"),
-                    value = settings.pageWidth.toFloat(),
-                    onValueChange = { value ->
-                        onReaderAction(ReaderAction.SettingsChanged(settings.copy(pageWidth = value.roundToInt())))
-                    },
-                    valueRange = 520f..1100f,
-                    valueLabel = settings.pageWidth.toString(),
-                    stepSize = 20f,
-                    formatValue = { it.roundToInt().toString() }
-                )
-            }
+                if (settings.shouldShowPageWidthFormatControl()) {
+                    SharedReaderSettingSlider(
+                        label = readerString("desktop_page_width", "Page width"),
+                        value = settings.pageWidth.toFloat(),
+                        onValueChange = { value ->
+                            onReaderAction(ReaderAction.SettingsChanged(settings.copy(pageWidth = value.roundToInt())))
+                        },
+                        valueRange = 520f..1100f,
+                        valueLabel = settings.pageWidth.toString(),
+                        stepSize = 20f,
+                        formatValue = { it.roundToInt().toString() }
+                    )
+                }
         }
     }
 }
@@ -1681,15 +1875,23 @@ fun SharedReaderFormatControls(
 fun SharedReaderThemeControls(
     settings: ReaderSettings,
     builtInThemes: List<ReaderTheme> = BuiltInReaderThemes,
+    customThemes: List<ReaderTheme> = emptyList(),
+    onCustomThemesChange: ((List<ReaderTheme>) -> Unit)? = null,
     customTextureIds: List<String> = emptyList(),
     onImportTexture: ((ReaderSettings) -> ReaderSettings?)? = null,
-    highlightPalette: ReaderHighlightPalette? = null,
-    onHighlightPaletteChange: ((ReaderHighlightPalette) -> Unit)? = null,
+    texturePreviewContent: (@Composable (String, Modifier) -> Unit)? = null,
     onSettingsChange: (ReaderSettings) -> Unit
 ) {
-    var textured by remember(settings.themeId, settings.textureId) { mutableStateOf(settings.textureId != null) }
+    val activeCustomThemes = remember(customThemes) { customThemes.sanitizeCustomReaderThemes() }
+    val allThemes = remember(builtInThemes, activeCustomThemes) { builtInThemes + activeCustomThemes }
+    val selectedTheme = allThemes.firstOrNull { it.id == settings.themeId }
+    var textured by remember(settings.themeId, settings.textureId, builtInThemes, activeCustomThemes) {
+        mutableStateOf((selectedTheme?.textureId ?: settings.textureId) != null)
+    }
     var editingColorTarget by remember { mutableStateOf<ReaderThemeColorTarget?>(null) }
-    val activeThemes = builtInThemes.filter { (it.textureId != null) == textured }
+    var themeBuilderState by remember { mutableStateOf<ReaderCustomThemeBuilderState?>(null) }
+    val activeBuiltInThemes = builtInThemes.filter { (it.textureId != null) == textured }
+    val activeSavedThemes = activeCustomThemes.filter { (it.textureId != null) == textured }
     val visibleCustomTextureIds = remember(customTextureIds, settings.textureId) {
         buildList {
             addAll(customTextureIds.distinct())
@@ -1713,7 +1915,7 @@ fun SharedReaderThemeControls(
                     label = { Text(readerString("theme_textured", "Textured")) }
                 )
             }
-            activeThemes.chunked(3).forEach { rowThemes ->
+            activeBuiltInThemes.chunked(3).forEach { rowThemes ->
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                     rowThemes.forEach { theme ->
                         SharedReaderThemeChoice(
@@ -1728,11 +1930,38 @@ fun SharedReaderThemeControls(
                     }
                 }
             }
+            SharedReaderCustomThemeSection(
+                activeThemes = activeSavedThemes,
+                currentThemeId = settings.themeId,
+                canEditThemes = onCustomThemesChange != null,
+                onCreateTheme = {
+                    themeBuilderState = ReaderCustomThemeBuilderState(
+                        initialTheme = null,
+                        isTextured = textured
+                    )
+                },
+                onThemeSelected = { theme -> onSettingsChange(theme.toReaderSettings(settings)) },
+                onThemeEdit = { theme ->
+                    themeBuilderState = ReaderCustomThemeBuilderState(
+                        initialTheme = theme,
+                        isTextured = theme.textureId != null
+                    )
+                },
+                onThemeDelete = { theme ->
+                    val updated = activeCustomThemes.filterNot { it.id == theme.id }.sanitizeCustomReaderThemes()
+                    onCustomThemesChange?.invoke(updated)
+                    if (settings.themeId == theme.id) {
+                        builtInThemes.firstOrNull()?.let { fallback ->
+                            onSettingsChange(fallback.toReaderSettings(settings))
+                        }
+                    }
+                }
+            )
         }
 
         SharedReaderPanelSection(readerString("desktop_custom_colors", "Custom colors")) {
-            val backgroundColor = settings.readerBackgroundColor(builtInThemes)
-            val textColor = settings.readerTextColor(builtInThemes)
+            val backgroundColor = settings.readerBackgroundColor(allThemes)
+            val textColor = settings.readerTextColor(allThemes)
             Surface(
                 modifier = Modifier.fillMaxWidth().height(76.dp),
                 color = backgroundColor,
@@ -1764,46 +1993,47 @@ fun SharedReaderThemeControls(
             }
         }
 
-        if (highlightPalette != null && onHighlightPaletteChange != null) {
-            SharedReaderPanelSection(readerString("desktop_highlighter_palette", "Highlight palette")) {
-                SharedHighlightPaletteEditor(
-                    palette = highlightPalette,
-                    onPaletteChange = onHighlightPaletteChange
-                )
-            }
-        }
-
         if (textured) {
             SharedReaderPanelSection(readerString("theme_texture", "Texture")) {
-                SharedReaderChoiceRow {
-                    FilterChip(
-                        selected = settings.textureId == null,
-                        onClick = { onSettingsChange(settings.copy(textureId = null)) },
-                        label = { Text(readerString("label_none", "None")) }
-                    )
+                val textureChoices = buildList {
+                    add(SharedReaderTextureChoiceModel(textureId = null, label = readerString("label_none", "None")))
                     if (onImportTexture != null) {
-                        FilterChip(
-                            selected = settings.textureId?.startsWith(ReaderTextureFilePrefix) == true,
-                            onClick = {
-                                onImportTexture(settings)?.let(onSettingsChange)
-                            },
-                            leadingIcon = { Icon(Icons.Default.Add, contentDescription = null) },
-                            label = { Text(readerString("action_import", "Import")) }
+                        add(
+                            SharedReaderTextureChoiceModel(
+                                textureId = null,
+                                label = readerString("action_import", "Import"),
+                                icon = Icons.Default.Add,
+                                isImportAction = true
+                            )
                         )
                     }
                     ReaderTexture.entries.forEach { texture ->
-                        FilterChip(
-                            selected = settings.textureId == texture.id,
-                            onClick = { onSettingsChange(settings.copy(textureId = texture.id)) },
-                            label = { Text(texture.displayName) }
-                        )
+                        add(SharedReaderTextureChoiceModel(textureId = texture.id, label = texture.displayName))
                     }
                     visibleCustomTextureIds.forEach { textureId ->
-                        FilterChip(
-                            selected = settings.textureId == textureId,
-                            onClick = { onSettingsChange(settings.copy(textureId = textureId)) },
-                            label = { Text(readerTextureDisplayName(textureId)) }
-                        )
+                        add(SharedReaderTextureChoiceModel(textureId = textureId, label = readerTextureDisplayName(textureId)))
+                    }
+                }
+                textureChoices.chunked(3).forEach { rowChoices ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        rowChoices.forEach { choice ->
+                            SharedReaderTextureChoice(
+                                choice = choice,
+                                selected = !choice.isImportAction && settings.textureId == choice.textureId,
+                                texturePreviewContent = texturePreviewContent,
+                                onSelected = {
+                                    if (choice.isImportAction) {
+                                        onImportTexture?.invoke(settings)?.let(onSettingsChange)
+                                    } else {
+                                        onSettingsChange(settings.copy(textureId = choice.textureId))
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        repeat(3 - rowChoices.size) {
+                            Spacer(Modifier.weight(1f))
+                        }
                     }
                 }
                 if (settings.textureId != null) {
@@ -1824,8 +2054,8 @@ fun SharedReaderThemeControls(
     }
 
     editingColorTarget?.let { target ->
-        val backgroundColor = settings.readerBackgroundColor(builtInThemes)
-        val textColor = settings.readerTextColor(builtInThemes)
+        val backgroundColor = settings.readerBackgroundColor(allThemes)
+        val textColor = settings.readerTextColor(allThemes)
         val initialColor = when (target) {
             ReaderThemeColorTarget.BACKGROUND -> backgroundColor
             ReaderThemeColorTarget.TEXT -> textColor
@@ -1868,9 +2098,451 @@ fun SharedReaderThemeControls(
             }
         }
     }
+
+    themeBuilderState?.let { builderState ->
+        SharedReaderCustomThemeDialog(
+            initialTheme = builderState.initialTheme,
+            isTexturedMode = builderState.isTextured,
+            customThemes = activeCustomThemes,
+            customTextureIds = visibleCustomTextureIds,
+            onImportTexture = onImportTexture,
+            texturePreviewContent = texturePreviewContent,
+            onDismiss = { themeBuilderState = null },
+            onSave = { theme ->
+                val updated = if (builderState.initialTheme != null) {
+                    activeCustomThemes.map { if (it.id == theme.id) theme else it }
+                } else {
+                    activeCustomThemes + theme.copy(
+                        id = nextReaderCustomThemeId(activeCustomThemes),
+                        isCustom = true
+                    )
+                }.sanitizeCustomReaderThemes()
+                val savedTheme = updated.firstOrNull { it.id == theme.id } ?: updated.lastOrNull() ?: theme
+                onCustomThemesChange?.invoke(updated)
+                onSettingsChange(savedTheme.toReaderSettings(settings))
+                themeBuilderState = null
+            }
+        )
+    }
+}
+
+private data class SharedReaderTextureChoiceModel(
+    val textureId: String?,
+    val label: String,
+    val icon: ImageVector? = null,
+    val isImportAction: Boolean = false
+)
+
+@Composable
+private fun SharedReaderTextureChoice(
+    choice: SharedReaderTextureChoiceModel,
+    selected: Boolean,
+    texturePreviewContent: (@Composable (String, Modifier) -> Unit)?,
+    onSelected: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onSelected,
+        modifier = modifier.height(104.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        contentColor = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+        )
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clip(RoundedCornerShape(7.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                when {
+                    choice.textureId != null && texturePreviewContent != null -> {
+                        texturePreviewContent(choice.textureId, Modifier.fillMaxSize())
+                    }
+                    choice.textureId != null -> {
+                        SharedReaderTextureFallbackPreview(choice.textureId, Modifier.fillMaxSize())
+                    }
+                    else -> {
+                        val previewColor = if (choice.isImportAction) {
+                            MaterialTheme.colorScheme.secondaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant
+                        }
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(previewColor),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            choice.icon?.let { icon ->
+                                Icon(icon, contentDescription = null, modifier = Modifier.size(22.dp))
+                            }
+                        }
+                    }
+                }
+                if (selected) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(4.dp)
+                            .size(22.dp)
+                            .background(MaterialTheme.colorScheme.primary, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Check,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
+                }
+            }
+            Text(
+                choice.label,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun SharedReaderTextureFallbackPreview(
+    textureId: String,
+    modifier: Modifier = Modifier
+) {
+    val texture = ReaderTexture.entries.firstOrNull { it.id == textureId }
+    val baseColor = when (texture) {
+        ReaderTexture.NATURAL_BLACK,
+        ReaderTexture.GREY_WASH,
+        ReaderTexture.CLASSY_FABRIC,
+        ReaderTexture.SLATE -> Color(0xFF2C2C2C)
+        ReaderTexture.RETINA_WOOD,
+        ReaderTexture.LIGHT_VENEER -> Color(0xFFF0D4AD)
+        ReaderTexture.CANVAS -> Color(0xFFE9E2D2)
+        ReaderTexture.EINK -> Color(0xFFF3F3EE)
+        ReaderTexture.RETRO_INTRO -> Color(0xFFF5DFB6)
+        else -> Color(0xFFF7F1E5)
+    }
+    val accentColor = if (baseColor.luminance() > 0.5f) {
+        Color.Black.copy(alpha = 0.12f)
+    } else {
+        Color.White.copy(alpha = 0.14f)
+    }
+    Box(
+        modifier = modifier.background(
+            Brush.linearGradient(
+                listOf(
+                    baseColor,
+                    baseColor.copy(alpha = 0.84f),
+                    accentColor
+                )
+            )
+        ),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            "Aa",
+            color = if (baseColor.luminance() > 0.5f) Color(0xFF24231F) else Color(0xFFEDE7DA),
+            fontWeight = FontWeight.Bold
+        )
+    }
 }
 
 private const val ReaderCustomThemeId = "custom_reader"
+
+private data class ReaderCustomThemeBuilderState(
+    val initialTheme: ReaderTheme?,
+    val isTextured: Boolean
+)
+
+@Composable
+private fun SharedReaderCustomThemeSection(
+    activeThemes: List<ReaderTheme>,
+    currentThemeId: String?,
+    canEditThemes: Boolean,
+    onCreateTheme: () -> Unit,
+    onThemeSelected: (ReaderTheme) -> Unit,
+    onThemeEdit: (ReaderTheme) -> Unit,
+    onThemeDelete: (ReaderTheme) -> Unit
+) {
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            readerString("theme_my_themes", "My themes"),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.weight(1f)
+        )
+        if (canEditThemes) {
+            IconButton(onClick = onCreateTheme, modifier = Modifier.size(36.dp)) {
+                Icon(Icons.Default.Add, contentDescription = readerString("theme_new", "New"))
+            }
+        }
+    }
+    if (activeThemes.isEmpty()) {
+        Text(
+            readerString("theme_no_custom", "No custom themes yet"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    } else {
+        activeThemes.chunked(3).forEach { rowThemes ->
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                rowThemes.forEach { theme ->
+                    SharedReaderThemeChoice(
+                        theme = theme,
+                        selected = currentThemeId == theme.id,
+                        onSelected = { onThemeSelected(theme) },
+                        onEdit = if (canEditThemes) ({ onThemeEdit(theme) }) else null,
+                        onDelete = if (canEditThemes) ({ onThemeDelete(theme) }) else null,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                repeat(3 - rowThemes.size) {
+                    Spacer(Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SharedReaderCustomThemeDialog(
+    initialTheme: ReaderTheme?,
+    isTexturedMode: Boolean,
+    customThemes: List<ReaderTheme>,
+    customTextureIds: List<String>,
+    onImportTexture: ((ReaderSettings) -> ReaderSettings?)?,
+    texturePreviewContent: (@Composable (String, Modifier) -> Unit)?,
+    onDismiss: () -> Unit,
+    onSave: (ReaderTheme) -> Unit
+) {
+    val defaultName = if (isTexturedMode) {
+        readerString("theme_custom_textured_default", "Custom textured")
+    } else {
+        readerString("theme_custom_solid_default", "Custom solid")
+    }
+    val dialogCustomTextureIds = remember(customTextureIds, initialTheme?.textureId) {
+        buildList {
+            addAll(customTextureIds.distinct())
+            initialTheme?.textureId
+                ?.takeIf { it.startsWith(ReaderTextureFilePrefix) && it !in this }
+                ?.let(::add)
+        }
+    }
+    var name by remember(initialTheme?.id, isTexturedMode) { mutableStateOf(initialTheme?.name ?: defaultName) }
+    var backgroundColor by remember(initialTheme?.id) { mutableStateOf(initialTheme?.backgroundColor ?: Color(0xFFF5F5F5)) }
+    var textColor by remember(initialTheme?.id) { mutableStateOf(initialTheme?.textColor ?: Color(0xFF111111)) }
+    var textureId by remember(initialTheme?.id, dialogCustomTextureIds) {
+        mutableStateOf(initialTheme?.textureId ?: dialogCustomTextureIds.firstOrNull())
+    }
+    var editingColorTarget by remember { mutableStateOf<ReaderThemeColorTarget?>(null) }
+    val contrast = readerThemeContrastRatio(backgroundColor, textColor)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                if (initialTheme == null) {
+                    readerString("theme_new", "New theme")
+                } else {
+                    readerString("theme_edit", "Edit theme")
+                }
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                SharedStableOutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text(readerString("theme_name", "Theme name")) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    selectionKey = initialTheme?.id ?: defaultName
+                )
+                Surface(
+                    modifier = Modifier.fillMaxWidth().height(116.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    color = backgroundColor,
+                    contentColor = textColor,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Box(Modifier.fillMaxSize()) {
+                        if (isTexturedMode && textureId != null) {
+                            if (texturePreviewContent != null) {
+                                texturePreviewContent(textureId.orEmpty(), Modifier.fillMaxSize())
+                            } else {
+                                SharedReaderTextureFallbackPreview(textureId.orEmpty(), Modifier.fillMaxSize())
+                            }
+                            Box(Modifier.fillMaxSize().background(backgroundColor.copy(alpha = 0.54f)))
+                        }
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(readerString("theme_preview_quote", "Reading should feel easy."), fontWeight = FontWeight.SemiBold)
+                            Text(readerString("theme_preview_author", "Theme preview"), style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                if (contrast < 4.5f) {
+                    Text(
+                        readerString("theme_low_contrast_warning", "Low contrast may be hard to read."),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    SharedReaderThemeColorButton(
+                        label = readerString("theme_page_color", "Page color"),
+                        color = backgroundColor,
+                        onClick = { editingColorTarget = ReaderThemeColorTarget.BACKGROUND },
+                        modifier = Modifier.weight(1f)
+                    )
+                    SharedReaderThemeColorButton(
+                        label = readerString("theme_text_color", "Text color"),
+                        color = textColor,
+                        onClick = { editingColorTarget = ReaderThemeColorTarget.TEXT },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (isTexturedMode) {
+                    Text(
+                        readerString("theme_select_custom_texture", "Select texture"),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    val textureChoices = buildList {
+                        if (onImportTexture != null) {
+                            add(
+                                SharedReaderTextureChoiceModel(
+                                    textureId = null,
+                                    label = readerString("action_import", "Import"),
+                                    icon = Icons.Default.Add,
+                                    isImportAction = true
+                                )
+                            )
+                        }
+                        ReaderTexture.entries.forEach { texture ->
+                            add(SharedReaderTextureChoiceModel(textureId = texture.id, label = texture.displayName))
+                        }
+                        dialogCustomTextureIds.forEach { importedTextureId ->
+                            add(
+                                SharedReaderTextureChoiceModel(
+                                    textureId = importedTextureId,
+                                    label = readerTextureDisplayName(importedTextureId)
+                                )
+                            )
+                        }
+                    }
+                    textureChoices.chunked(3).forEach { rowChoices ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            rowChoices.forEach { choice ->
+                                SharedReaderTextureChoice(
+                                    choice = choice,
+                                    selected = !choice.isImportAction && textureId == choice.textureId,
+                                    texturePreviewContent = texturePreviewContent,
+                                    onSelected = {
+                                        if (choice.isImportAction) {
+                                            val imported = onImportTexture?.invoke(
+                                                ReaderSettings(
+                                                    textureId = textureId,
+                                                    backgroundColorArgb = backgroundColor.toArgb().toLong(),
+                                                    textColorArgb = textColor.toArgb().toLong()
+                                                )
+                                            )
+                                            textureId = imported?.textureId ?: textureId
+                                        } else {
+                                            textureId = choice.textureId
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            repeat(3 - rowChoices.size) {
+                                Spacer(Modifier.weight(1f))
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = name.isNotBlank(),
+                onClick = {
+                    onSave(
+                        ReaderTheme(
+                            id = initialTheme?.id ?: nextReaderCustomThemeId(customThemes),
+                            name = name.trim().ifBlank { defaultName },
+                            backgroundColor = backgroundColor,
+                            textColor = textColor,
+                            isDark = backgroundColor.luminance() < 0.5f,
+                            textureId = if (isTexturedMode) textureId else null,
+                            isCustom = true
+                        )
+                    )
+                }
+            ) {
+                Text(readerString("action_save", "Save"))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(readerString("action_cancel", "Cancel"))
+            }
+        }
+    )
+
+    editingColorTarget?.let { target ->
+        SharedHsvColorPickerDialog(
+            initialColor = if (target == ReaderThemeColorTarget.BACKGROUND) backgroundColor else textColor,
+            title = target.localizedTitle(),
+            onDismiss = { editingColorTarget = null },
+            onSave = { color ->
+                if (target == ReaderThemeColorTarget.BACKGROUND) {
+                    backgroundColor = color
+                } else {
+                    textColor = color
+                }
+                editingColorTarget = null
+            }
+        )
+    }
+}
+
+private fun nextReaderCustomThemeId(customThemes: List<ReaderTheme>): String {
+    val usedIds = customThemes.mapTo(mutableSetOf()) { it.id }
+    var index = customThemes.size + 1
+    while ("reader_theme_$index" in usedIds) {
+        index += 1
+    }
+    return "reader_theme_$index"
+}
+
+private fun readerThemeContrastRatio(color1: Color, color2: Color): Float {
+    val l1 = maxOf(color1.luminance(), color2.luminance())
+    val l2 = minOf(color1.luminance(), color2.luminance())
+    return (l1 + 0.05f) / (l2 + 0.05f)
+}
 
 private enum class ReaderThemeColorTarget {
     BACKGROUND,
@@ -1929,180 +2601,155 @@ fun SharedReaderVisualOptionsControls(
     onReaderAction: (ReaderAction) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        SharedReaderPanelSection(readerString("visual_options_system_ui", "System UI")) {
+        SharedReaderPanelSection(readerString("label_reading", "Reading")) {
             SharedReaderChoiceRow {
-                SystemUiMode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = settings.systemUiMode == mode,
-                        onClick = { onReaderAction(ReaderAction.SettingsChanged(settings.copy(systemUiMode = mode))) },
-                        label = { Text(mode.localizedTitle()) }
-                    )
-                }
-            }
-        }
-
-        SharedReaderPanelSection(readerString("desktop_page_info", "Page Info")) {
-            SharedReaderChoiceRow {
-                PageInfoMode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = settings.pageInfoMode == mode,
-                        onClick = { onReaderAction(ReaderAction.SettingsChanged(settings.copy(pageInfoMode = mode))) },
-                        label = { Text(mode.localizedTitle()) }
-                    )
-                }
-            }
-            SharedReaderChoiceRow {
-                PageInfoPosition.entries.forEach { position ->
-                    FilterChip(
-                        selected = settings.pageInfoPosition == position,
-                        onClick = { onReaderAction(ReaderAction.SettingsChanged(settings.copy(pageInfoPosition = position))) },
-                        label = { Text(position.localizedTitle()) }
-                    )
-                }
-            }
-        }
-
-        SharedReaderPanelSection(readerString("desktop_chapter_turns", "Chapter Turns")) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(readerString("visual_options_seamless_chapter", "Seamless chapters"), modifier = Modifier.weight(1f))
-                Switch(
-                    checked = settings.seamlessChapterNavigation,
-                    onCheckedChange = { enabled ->
-                        onReaderAction(ReaderAction.SettingsChanged(settings.copy(seamlessChapterNavigation = enabled)))
-                    }
+                FilterChip(
+                    selected = settings.readingMode == ReaderReadingMode.PAGINATED && !settings.rightToLeftPagination,
+                    onClick = {
+                        onReaderAction(
+                            ReaderAction.SettingsChanged(
+                                settings.copy(
+                                    readingMode = ReaderReadingMode.PAGINATED,
+                                    rightToLeftPagination = false
+                                )
+                            )
+                        )
+                    },
+                    label = { Text(readerString("menu_reading_mode_paginated", "Paginated (left-to-right)")) }
+                )
+                FilterChip(
+                    selected = settings.readingMode == ReaderReadingMode.PAGINATED && settings.rightToLeftPagination,
+                    onClick = {
+                        onReaderAction(
+                            ReaderAction.SettingsChanged(
+                                settings.copy(
+                                    readingMode = ReaderReadingMode.PAGINATED,
+                                    rightToLeftPagination = true
+                                )
+                            )
+                        )
+                    },
+                    label = { Text(readerString("menu_right_to_left_pagination", "Paginated (right-to-left)")) }
+                )
+                FilterChip(
+                    selected = settings.readingMode == ReaderReadingMode.VERTICAL,
+                    onClick = {
+                        onReaderAction(ReaderAction.SettingsChanged(settings.copy(readingMode = ReaderReadingMode.VERTICAL)))
+                    },
+                    label = { Text(readerString("menu_reading_mode_vertical", "Vertical")) }
                 )
             }
-            SharedReaderSettingSlider(
-                label = readerString("setting_pull_distance_change_chapter", "Pull distance"),
-                value = settings.chapterTurnDragMultiplier.coerceIn(0.5f, 2.0f),
-                onValueChange = { value ->
-                    onReaderAction(ReaderAction.SettingsChanged(settings.copy(chapterTurnDragMultiplier = value)))
-                },
-                valueRange = 0.5f..2.0f,
-                valueLabel = "${settings.chapterTurnDragMultiplier.formatTwoDecimals()}x",
-                stepSize = 0.05f,
-                formatValue = { "${it.formatTwoDecimals()}x" }
-            )
+            if (settings.readingMode == ReaderReadingMode.PAGINATED) {
+                SharedReaderChoiceRow {
+                    FilterChip(
+                        selected = settings.pageSpreadMode == ReaderPageSpreadMode.SINGLE,
+                        onClick = {
+                            onReaderAction(
+                                ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.SINGLE))
+                            )
+                        },
+                        label = { Text(readerString("visual_options_pdf_spread_single", "Single page")) }
+                    )
+                    FilterChip(
+                        selected = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE,
+                        onClick = {
+                            onReaderAction(
+                                ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE))
+                            )
+                        },
+                        label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun SystemUiMode.localizedTitle(): String {
-    return when (this) {
-        SystemUiMode.DEFAULT -> readerString("label_always_show", "Always Show")
-        SystemUiMode.SYNC -> readerString("label_sync_with_menus", "Sync with Menus")
-        SystemUiMode.HIDDEN -> readerString("label_always_hide", "Always Hide")
-    }
-}
-
-@Composable
-private fun PageInfoMode.localizedTitle(): String {
-    return when (this) {
-        PageInfoMode.DEFAULT -> readerString("label_always_show", "Always Show")
-        PageInfoMode.SYNC -> readerString("label_sync_with_menus", "Sync with Menus")
-        PageInfoMode.HIDDEN -> readerString("label_always_hide", "Always Hide")
-    }
-}
-
-@Composable
-private fun PageInfoPosition.localizedTitle(): String {
-    return when (this) {
-        PageInfoPosition.BOTTOM -> readerString("label_bottom", "Bottom")
-        PageInfoPosition.TOP -> readerString("label_top", "Top")
-    }
-}
-
-@Composable
-private fun SharedReaderExtrasControls(
-    session: ReaderSessionState,
+private fun SharedReaderTtsControls(
     extrasState: ReaderExtrasState,
     aiByokSettings: ReaderAiByokSettings,
     toolbarPreferences: ReaderToolbarPreferences,
     cloudTtsControlsAvailable: Boolean,
-    onAiAction: (ReaderAiFeature, String) -> Unit,
-    onOpenAiHub: (() -> Unit)?,
-    onCloudTtsStart: (ReaderTtsReadScope, List<ReaderTtsChunk>) -> Unit,
-    onCloudTtsStop: () -> Unit,
-    onAutoScrollChange: (ReaderAutoScrollState) -> Unit,
+    onCloudTtsClearCache: () -> Unit,
+    onCloudTtsVoiceChange: (String) -> Unit,
     ttsReplacementPreferences: ReaderTtsReplacementPreferences,
     ttsReplacementBookId: String,
     onTtsReplacementPreferencesChange: (ReaderTtsReplacementPreferences) -> Unit
 ) {
     val settings = aiByokSettings.sanitized()
-    val currentPageText = ReaderContextExtractor.currentPageText(session)
+    val ttsBusy = extrasState.cloudTts.isLoading || extrasState.cloudTts.isPlaying || extrasState.cloudTts.isPaused
 
     Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        SharedReaderPanelSection(readerString("menu_auto_scroll", "Auto Scroll")) {
-            val autoScroll = extrasState.autoScroll.sanitized()
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(readerString("menu_auto_scroll", "Auto Scroll"), modifier = Modifier.weight(1f))
-                Switch(
-                    checked = autoScroll.enabled,
-                    onCheckedChange = { enabled -> onAutoScrollChange(autoScroll.copy(enabled = enabled)) }
-                )
-            }
-            SharedReaderSettingSlider(
-                label = readerString("desktop_speed", "Speed"),
-                value = autoScroll.speed,
-                onValueChange = { speed -> onAutoScrollChange(autoScroll.copy(speed = speed).sanitized()) },
-                valueRange = 12f..160f,
-                valueLabel = "${autoScroll.speed.roundToInt()}",
-                stepSize = 1f,
-                formatValue = { it.roundToInt().toString() }
-            )
-        }
-
-        if (cloudTtsControlsAvailable) {
+        if (
+            cloudTtsControlsAvailable &&
+            (toolbarPreferences.isVisible(ReaderTool.TTS_CONTROLS) || toolbarPreferences.isVisible(ReaderTool.TTS_SETTINGS))
+        ) {
             SharedReaderPanelSection(readerString("credits_cloud_tts_title", "Cloud TTS")) {
-                val ttsBusy = extrasState.cloudTts.isLoading || extrasState.cloudTts.isPlaying || extrasState.cloudTts.isPaused
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            when {
-                                extrasState.cloudTts.isLoading -> readerString("desktop_preparing_audio", "Preparing audio")
-                                extrasState.cloudTts.isPaused -> readerString("desktop_paused", "Paused")
-                                extrasState.cloudTts.isPlaying -> readerString("label_reading", "Reading")
-                                settings.isCloudTtsAvailable -> readerString("desktop_cloud_tts_ready", "Ready")
-                                settings.serverBackedReaderAiFeatures -> readerString("desktop_cloud_tts_needs_signed_in_credits", "Needs signed-in credits")
-                                else -> readerString("desktop_cloud_tts_needs_gemini", "Needs Gemini key")
-                            },
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        val errorMessage = extrasState.cloudTts.errorMessage?.takeIf { it.isNotBlank() }
-                        val statusMessage = extrasState.cloudTts.progress.currentPositionLabel
-                            ?: extrasState.cloudTts.statusMessage?.takeIf { it.isNotBlank() }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
                         when {
-                            errorMessage != null -> Text(errorMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                            statusMessage != null -> Text(statusMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            extrasState.cloudTts.isLoading -> readerString("desktop_preparing_audio", "Preparing audio")
+                            extrasState.cloudTts.isPaused -> readerString("desktop_paused", "Paused")
+                            extrasState.cloudTts.isPlaying -> readerString("label_reading", "Reading")
+                            settings.isCloudTtsAvailable -> readerString("desktop_cloud_tts_ready", "Ready")
+                            settings.serverBackedReaderAiFeatures -> readerString("desktop_cloud_tts_needs_signed_in_credits", "Needs signed-in credits")
+                            else -> readerString("desktop_cloud_tts_needs_gemini", "Needs Gemini key")
+                        },
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    val errorMessage = extrasState.cloudTts.errorMessage?.takeIf { it.isNotBlank() }
+                    val statusMessage = extrasState.cloudTts.progress.currentPositionLabel
+                        ?: extrasState.cloudTts.statusMessage?.takeIf { it.isNotBlank() }
+                    when {
+                        errorMessage != null -> Text(errorMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        statusMessage != null -> Text(statusMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(readerString("desktop_cloud_tts_voice", "Cloud TTS voice"), fontWeight = FontWeight.SemiBold)
+                    if (ttsBusy) {
+                        Text(
+                            readerString("desktop_stop_reading_change_voices", "Stop reading to change voices."),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.horizontalScroll(rememberScrollState())
+                    ) {
+                        ReaderCloudTtsVoices.forEach { voice ->
+                            FilterChip(
+                                selected = settings.ttsSpeakerId == voice.id,
+                                enabled = !ttsBusy,
+                                onClick = { onCloudTtsVoiceChange(voice.id) },
+                                label = {
+                                    Column {
+                                        Text(voice.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(
+                                            voice.description,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            )
                         }
                     }
-                    TextButton(
-                        enabled = settings.isCloudTtsAvailable || ttsBusy,
-                        onClick = {
-                            if (ttsBusy) {
-                                onCloudTtsStop()
-                            } else {
-                                onCloudTtsStart(
-                                    ReaderTtsReadScope.BOOK,
-                                    ReaderTtsPlanner.chunksFromCurrentLocation(session)
-                                )
+                    val cacheSummary = extrasState.cloudTts.cacheSummary
+                    if (cacheSummary.hasCachedAudio) {
+                        Text(
+                            readerString("desktop_cache_format", "Cache: %1\$s", cacheSummary.currentVoiceLabel),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (cacheSummary.hasCurrentVoiceCachedAudio) {
+                            TextButton(onClick = onCloudTtsClearCache) {
+                                Text(readerString("desktop_clear_voice_cache", "Clear voice cache"))
                             }
                         }
-                    ) {
-                        Text(if (ttsBusy) readerString("action_stop", "Stop") else readerString("action_read", "Read"))
                     }
                 }
             }
@@ -2115,30 +2762,7 @@ private fun SharedReaderExtrasControls(
                 onPreferencesChange = onTtsReplacementPreferencesChange
             )
         }
-
-        if (settings.areReaderAiFeaturesAvailable) {
-            SharedReaderPanelSection(readerString("desktop_ai", "AI")) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.horizontalScroll(rememberScrollState())
-                ) {
-                    onOpenAiHub?.let { openAiHub ->
-                        TextButton(onClick = openAiHub) {
-                            Text(readerString("desktop_ai_hub", "AI hub"))
-                        }
-                    }
-                    TextButton(
-                        enabled = currentPageText.isNotBlank() && !extrasState.aiResult.isLoading,
-                        onClick = { onAiAction(ReaderAiFeature.DEFINE, currentPageText.take(1200)) }
-                    ) {
-                        Text(readerString("desktop_define_page", "Define page"))
-                    }
-                }
-            }
-        }
     }
-
 }
 
 private enum class SharedTtsReplacementScope {
@@ -2840,6 +3464,8 @@ private fun SharedReaderThemeChoice(
     theme: ReaderTheme,
     selected: Boolean,
     onSelected: () -> Unit,
+    onEdit: (() -> Unit)? = null,
+    onDelete: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val swatch = if (theme.backgroundColor == Color.Unspecified) {
@@ -2884,17 +3510,82 @@ private fun SharedReaderThemeChoice(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+        if (theme.isCustom && (onEdit != null || onDelete != null)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (onEdit != null) {
+                    IconButton(onClick = onEdit, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Default.Edit,
+                            contentDescription = readerString("action_edit", "Edit"),
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+                if (onDelete != null) {
+                    IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = readerString("action_delete", "Delete"),
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
 private const val ReaderGapChromeLogTag = "EpistemeReaderGap"
+private const val ReaderChromeWebViewLayoutLogTag = "EpistemeWebViewLayout"
+private const val ReaderOpenTraceLogTag = "EpistemeDesktopOpenTrace"
+private const val ReaderPositionTraceLogTag = "EpistemeDesktopPositionTrace"
+private const val ReaderVerticalRenderedChapterRadius = 2
+
+private fun readerVerticalRenderedChapterRange(chapterIndex: Int, lastChapterIndex: Int): IntRange? {
+    if (lastChapterIndex < 0) return null
+    val safeChapterIndex = chapterIndex.coerceIn(0, lastChapterIndex)
+    return (safeChapterIndex - ReaderVerticalRenderedChapterRadius).coerceAtLeast(0)..
+        (safeChapterIndex + ReaderVerticalRenderedChapterRadius).coerceAtMost(lastChapterIndex)
+}
+
+private fun logReaderOpenTrace(message: () -> String) {
+    logSharedReaderDiagnostic(ReaderOpenTraceLogTag, message)
+}
+
+private fun logReaderPositionTrace(message: () -> String) {
+    logSharedReaderDiagnostic(ReaderPositionTraceLogTag, message)
+}
+
+private fun Long.readerOpenTraceElapsedMs(nowMillis: Long = currentTimestamp()): Long {
+    return (nowMillis - this).coerceAtLeast(0L)
+}
+
+private fun String.readerOpenTracePreview(maxLength: Int = 96): String {
+    return replace(Regex("\\s+"), " ")
+        .trim()
+        .let { if (it.length <= maxLength) it else it.take(maxLength) + "..." }
+        .replace("\"", "\\\"")
+}
+
+private fun ReaderLocator?.readerPositionTraceSummary(maxTextLength: Int = 90): String {
+    if (this == null) return "null"
+    return "chapter=${chapterIndex ?: "null"} page=${pageIndex ?: "null"} " +
+        "offsets=${startOffset ?: "null"}..${endOffset ?: "null"} " +
+        "block=${blockIndex ?: "null"} char=${charOffset ?: "null"} " +
+        "chapterId=\"${chapterId.orEmpty().readerOpenTracePreview(80)}\" " +
+        "href=\"${href.orEmpty().readerOpenTracePreview(120)}\" " +
+        "cfi=\"${cfi.orEmpty().readerOpenTracePreview(180)}\" " +
+        "text=\"${textQuote.orEmpty().readerOpenTracePreview(maxTextLength)}\""
+}
 
 private fun logReaderGapChrome(
     layer: String,
     bounds: Rect,
     details: String = ""
 ) {
-    logSharedReaderDiagnostic(ReaderGapChromeLogTag) {
+    val message = {
         buildString {
             append("compose_reader layer=")
             append(layer)
@@ -2913,6 +3604,10 @@ private fun logReaderGapChrome(
                 append(details)
             }
         }
+    }
+    logSharedReaderDiagnostic(ReaderGapChromeLogTag, message)
+    if (layer == "reader_content_column") {
+        logSharedReaderDiagnostic(ReaderChromeWebViewLayoutLogTag, message)
     }
 }
 
@@ -2942,7 +3637,8 @@ private fun SharedReaderCompactNavigation(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        IconButton(
+        ReaderTooltipIconButton(
+            tooltip = readerString("desktop_previous_page", "Previous page"),
             enabled = canGoPrevious,
             onClick = onPrevious,
             modifier = Modifier.size(36.dp)
@@ -2970,7 +3666,8 @@ private fun SharedReaderCompactNavigation(
                 modifier = Modifier.weight(1f)
             )
         }
-        IconButton(
+        ReaderTooltipIconButton(
+            tooltip = readerString("desktop_next_page", "Next page"),
             enabled = canGoNext,
             onClick = onNext,
             modifier = Modifier.size(36.dp)
@@ -3031,7 +3728,8 @@ private fun SharedReaderFullscreenNavigation(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(
+                ReaderTooltipIconButton(
+                    tooltip = readerString("desktop_previous_page", "Previous page"),
                     enabled = readerState.canGoPrevious,
                     onClick = onPrevious
                 ) {
@@ -3060,7 +3758,8 @@ private fun SharedReaderFullscreenNavigation(
                     thumbColor = contentColor.copy(alpha = 0.92f),
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(
+                ReaderTooltipIconButton(
+                    tooltip = readerString("desktop_next_page", "Next page"),
                     enabled = readerState.canGoNext,
                     onClick = onNext
                 ) {
@@ -3139,6 +3838,7 @@ private fun SharedReaderSidebar(
     onEditHighlight: (UserHighlight) -> Unit,
     highlightPalette: ReaderHighlightPalette,
     onHighlightColorChange: (UserHighlight, HighlightColor) -> Unit,
+    onOpenHighlightPaletteManager: () -> Unit,
     onDeleteHighlight: (UserHighlight) -> Unit
 ) {
     val tabs = remember(sections) {
@@ -3149,63 +3849,62 @@ private fun SharedReaderSidebar(
     var selectedSection by remember(tabs) { mutableStateOf(tabs.firstOrNull()) }
     val selectedTabIndex = tabs.indexOf(selectedSection).takeIf { it >= 0 } ?: 0
 
-    Surface(
+    Column(
         modifier = Modifier
-            .width(300.dp)
-            .fillMaxHeight(),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        shape = RoundedCornerShape(8.dp)
+            .fillMaxWidth()
+            .fillMaxHeight()
     ) {
-        Column(Modifier.fillMaxSize()) {
-            if (tabs.isNotEmpty()) {
-                ScrollableTabRow(
-                    selectedTabIndex = selectedTabIndex,
-                    edgePadding = 0.dp,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    tabs.forEach { section ->
-                        Tab(
-                            selected = selectedSection == section,
-                            onClick = { selectedSection = section },
-                            text = {
-                                Text(
-                                    section.readerNavigationTabLabel(),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        )
-                    }
+        if (tabs.isNotEmpty()) {
+            ScrollableTabRow(
+                selectedTabIndex = selectedTabIndex,
+                edgePadding = 0.dp,
+                containerColor = Color.Transparent,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                tabs.forEach { section ->
+                    Tab(
+                        selected = selectedSection == section,
+                        onClick = { selectedSection = section },
+                        text = {
+                            Text(
+                                section.readerNavigationTabLabel(),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    )
                 }
             }
+        }
 
-            when (selectedSection) {
-                ReaderWorkspaceLeftSection.CONTENTS -> SharedReaderTocTab(
-                    session = session,
-                    readerEngine = readerEngine,
-                    onGoToLocator = onGoToLocator,
-                    onGoToChapter = onGoToChapter
-                )
-                ReaderWorkspaceLeftSection.NOTES -> SharedReaderAnnotationsTab(
-                    session = session,
-                    onGoToHighlight = onGoToHighlight,
-                    onEditHighlight = onEditHighlight,
-                    highlightPalette = highlightPalette,
-                    onHighlightColorChange = onHighlightColorChange,
-                    onDeleteHighlight = onDeleteHighlight
-                )
-                ReaderWorkspaceLeftSection.BOOKMARKS -> SharedReaderBookmarksTab(
-                    session = session,
-                    onGoToBookmark = onGoToBookmark
-                )
-                ReaderWorkspaceLeftSection.IMAGES -> SharedReaderImagesTab(
-                    session = session,
-                    onGoToImage = onGoToLocator,
-                    onDownloadImage = onDownloadImage,
-                    imagePreviewContent = imagePreviewContent
-                )
-                else -> SharedReaderEmptyNavigation(readerString("desktop_no_navigation_items", "No navigation items"))
-            }
+        when (selectedSection) {
+            ReaderWorkspaceLeftSection.CONTENTS -> SharedReaderTocTab(
+                session = session,
+                readerEngine = readerEngine,
+                onGoToLocator = onGoToLocator,
+                onGoToChapter = onGoToChapter
+            )
+            ReaderWorkspaceLeftSection.NOTES -> SharedReaderAnnotationsTab(
+                session = session,
+                onGoToHighlight = onGoToHighlight,
+                onEditHighlight = onEditHighlight,
+                highlightPalette = highlightPalette,
+                onHighlightColorChange = onHighlightColorChange,
+                onOpenHighlightPaletteManager = onOpenHighlightPaletteManager,
+                onDeleteHighlight = onDeleteHighlight
+            )
+            ReaderWorkspaceLeftSection.BOOKMARKS -> SharedReaderBookmarksTab(
+                session = session,
+                onGoToBookmark = onGoToBookmark
+            )
+            ReaderWorkspaceLeftSection.IMAGES -> SharedReaderImagesTab(
+                session = session,
+                onGoToImage = onGoToLocator,
+                onDownloadImage = onDownloadImage,
+                imagePreviewContent = imagePreviewContent
+            )
+            else -> SharedReaderEmptyNavigation(readerString("desktop_no_navigation_items", "No navigation items"))
         }
     }
 }
@@ -3607,6 +4306,7 @@ private fun SharedReaderAnnotationsTab(
     onEditHighlight: (UserHighlight) -> Unit,
     highlightPalette: ReaderHighlightPalette,
     onHighlightColorChange: (UserHighlight, HighlightColor) -> Unit,
+    onOpenHighlightPaletteManager: () -> Unit,
     onDeleteHighlight: (UserHighlight) -> Unit
 ) {
     if (session.highlights.isEmpty()) {
@@ -3678,32 +4378,55 @@ private fun SharedReaderAnnotationsTab(
                                         ) {
                                             Row(
                                                 modifier = Modifier
-                                                    .padding(horizontal = 12.dp, vertical = 8.dp)
-                                                    .horizontalScroll(rememberScrollState()),
-                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                    .padding(vertical = 8.dp, horizontal = 10.dp)
+                                                    .fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.Center,
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
                                                 colors.forEach { color ->
                                                     Box(
+                                                        contentAlignment = Alignment.Center,
                                                         modifier = Modifier
-                                                            .size(26.dp)
+                                                            .padding(horizontal = 4.dp)
+                                                            .size(28.dp)
                                                             .clip(CircleShape)
                                                             .background(color.color)
-                                                            .border(
-                                                                width = if (highlight.color == color) 3.dp else 1.dp,
-                                                                color = if (highlight.color == color) {
-                                                                    MaterialTheme.colorScheme.primary
-                                                                } else {
-                                                                    MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
-                                                                },
-                                                                shape = CircleShape
-                                                            )
                                                             .clickable {
                                                                 menuExpandedFor = null
                                                                 onHighlightColorChange(highlight, color)
                                                             }
-                                                    )
+                                                    ) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .matchParentSize()
+                                                                .border(
+                                                                    width = if (highlight.color == color) 3.dp else 1.dp,
+                                                                    color = if (highlight.color == color) {
+                                                                        MaterialTheme.colorScheme.onSurface
+                                                                    } else {
+                                                                        MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)
+                                                                    },
+                                                                    shape = CircleShape
+                                                                )
+                                                        )
+                                                        if (highlight.color == color) {
+                                                            Icon(
+                                                                imageVector = Icons.Default.Check,
+                                                                contentDescription = null,
+                                                                tint = if (color == HighlightColor.WHITE || color == HighlightColor.YELLOW) Color.Black else Color.White,
+                                                                modifier = Modifier.size(16.dp)
+                                                            )
+                                                        }
+                                                    }
                                                 }
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                SharedReaderHighlightPaletteSpectrumButton(
+                                                    onClick = {
+                                                        menuExpandedFor = null
+                                                        onOpenHighlightPaletteManager()
+                                                    },
+                                                    size = 28.dp
+                                                )
                                             }
                                             HorizontalDivider()
                                             DropdownMenuItem(
@@ -3800,75 +4523,134 @@ private fun ReaderWorkspaceLeftSection.readerNavigationTabLabel(): String {
 }
 
 @Composable
-private fun SharedHighlightPaletteEditor(
+private fun SharedReaderHighlightPaletteDialog(
     palette: ReaderHighlightPalette,
-    onPaletteChange: (ReaderHighlightPalette) -> Unit
+    onDismiss: () -> Unit,
+    onSave: (ReaderHighlightPalette) -> Unit
 ) {
-    val sanitized = palette.sanitized()
-    var selectedSlotIndex by remember(sanitized.colors) { mutableIntStateOf(0) }
-    val colors = sanitized.colors
+    var draftColors by remember(palette) { mutableStateOf(palette.sanitized().colors) }
+    var selectedSlotIndex by remember { mutableIntStateOf(0) }
 
     fun replaceSlot(color: HighlightColor) {
-        if (colors.isEmpty()) return
-        val next = colors.toMutableList()
+        if (draftColors.isEmpty()) return
+        val next = draftColors.toMutableList()
         val slot = selectedSlotIndex.coerceIn(0, next.lastIndex)
-        val previousColor = next[slot]
-        val existingIndex = next.indexOf(color)
-        if (existingIndex >= 0 && existingIndex != slot) {
-            next[existingIndex] = previousColor
-        }
         next[slot] = color
-        onPaletteChange(ReaderHighlightPalette(colors = next).sanitized())
+        draftColors = next
     }
 
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(readerString("desktop_highlight_palette_hint", "Tap a slot, then pick a color."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.horizontalScroll(rememberScrollState())
-        ) {
-            colors.forEachIndexed { index, color ->
-                val selected = index == selectedSlotIndex.coerceIn(0, colors.lastIndex)
-                Box(
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clip(CircleShape)
-                        .background(color.color)
-                        .border(
-                            width = if (selected) 3.dp else 1.dp,
-                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
-                            shape = CircleShape
-                        )
-                        .clickable { selectedSlotIndex = index },
-                    contentAlignment = Alignment.Center
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                readerString("dialog_customize_palette", "Customize palette"),
+                style = MaterialTheme.typography.titleMedium
+            )
+        },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    readerString("palette_tap_slot_to_edit", "Tap a slot to edit it."),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    if (selected) {
-                        Icon(
-                            imageVector = Icons.Default.Check,
-                            contentDescription = null,
-                            tint = if (color.color.luminance() > 0.5f) Color.Black else Color.White,
-                            modifier = Modifier.size(20.dp)
+                    draftColors.forEachIndexed { index, color ->
+                        val selected = index == selectedSlotIndex
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(color.color, CircleShape)
+                                .border(
+                                    width = if (selected) 3.dp else 1.dp,
+                                    color = if (selected) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        Color.Transparent
+                                    },
+                                    shape = CircleShape
+                                )
+                                .clip(CircleShape)
+                                .clickable { selectedSlotIndex = index },
+                        ) {
+                            if (selected) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = null,
+                                    tint = if (color == HighlightColor.WHITE) Color.Black else Color.White,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider()
+                Text(
+                    readerString("palette_select_color_for_slot", "Select a color for the slot."),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(minSize = 40.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.height(200.dp)
+                ) {
+                    items(HighlightColor.entries) { color ->
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .background(color.color, CircleShape)
+                                .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.20f), CircleShape)
+                                .clickable { replaceSlot(color) }
                         )
                     }
                 }
             }
-        }
-        HighlightColor.entries.chunked(7).forEach { rowColors ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                rowColors.forEach { color ->
-                    Box(
-                        modifier = Modifier
-                            .size(28.dp)
-                            .clip(CircleShape)
-                            .background(color.color)
-                            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f), CircleShape)
-                            .clickable { replaceSlot(color) }
-                    )
-                }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(ReaderHighlightPalette(draftColors).sanitized()) }) {
+                Text(readerString("action_save", "Save"))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(readerString("action_cancel", "Cancel"))
             }
         }
-    }
+    )
+}
+
+@Composable
+private fun SharedReaderHighlightPaletteSpectrumButton(
+    onClick: () -> Unit,
+    size: androidx.compose.ui.unit.Dp,
+    modifier: Modifier = Modifier
+) {
+    val rainbowColors = listOf(
+        Color.Red,
+        Color(0xFFFF7F00),
+        Color.Yellow,
+        Color.Green,
+        Color.Blue,
+        Color(0xFF4B0082),
+        Color(0xFF8B00FF)
+    )
+    Box(
+        modifier = modifier
+            .size(size)
+            .background(
+                brush = Brush.sweepGradient(rainbowColors),
+                shape = CircleShape
+            )
+            .clickable(onClick = onClick)
+    )
 }
 
 private fun Float.formatTwoDecimals(): String {

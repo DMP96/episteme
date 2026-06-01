@@ -3,6 +3,8 @@ package com.aryan.reader
 import com.aryan.reader.data.BookTagCrossRef
 import com.aryan.reader.data.RecentFileItem
 import com.aryan.reader.data.TagEntity
+import com.aryan.reader.data.toBookMetadata
+import com.aryan.reader.data.toRecentFileItem
 import com.aryan.reader.shared.ReaderFeatureSurface
 import com.aryan.reader.shared.FileType as SharedFileType
 import com.aryan.reader.shared.SharedReaderScreenState
@@ -44,6 +46,48 @@ class SharedModelMappersTest {
         assertEquals(original.sourceFolderUri, mapped.sourceFolderUri)
         assertFalse(mapped.isAvailable)
         assertEquals(listOf(tag), mapped.tags)
+    }
+
+    @Test
+    fun `book mapper carries android epub block locator through shared model`() {
+        val original = recentFile(
+            id = "book",
+            type = FileType.EPUB,
+            lastChapterIndex = 3,
+            lastPage = 18,
+            lastPositionCfi = "android-locator:3:44:120",
+            locatorBlockIndex = 44,
+            locatorCharOffset = 120
+        )
+
+        val shared = original.toSharedBookItem()
+        val mapped = shared.toRecentFileItem()
+
+        assertEquals(3, shared.readerPosition?.chapterIndex)
+        assertEquals(18, shared.readerPosition?.pageIndex)
+        assertEquals(44, shared.readerPosition?.blockIndex)
+        assertEquals(120, shared.readerPosition?.charOffset)
+        assertEquals(original.lastChapterIndex, mapped.lastChapterIndex)
+        assertEquals(original.lastPage, mapped.lastPage)
+        assertEquals(original.lastPositionCfi, mapped.lastPositionCfi)
+        assertEquals(original.locatorBlockIndex, mapped.locatorBlockIndex)
+        assertEquals(original.locatorCharOffset, mapped.locatorCharOffset)
+    }
+
+    @Test
+    fun `android cloud metadata preserves file content timestamp`() {
+        val original = recentFile(
+            id = "book",
+            type = FileType.EPUB,
+            fileContentModifiedTimestamp = 1_500L
+        )
+
+        val metadata = original.toBookMetadata()
+        val restored = metadata.toRecentFileItem()
+
+        assertEquals(1_500L, metadata.fileContentModifiedTimestamp)
+        assertEquals(1_500L, restored.fileContentModifiedTimestamp)
+        assertFalse(restored.isAvailable)
     }
 
     @Test
@@ -93,6 +137,41 @@ class SharedModelMappersTest {
     }
 
     @Test
+    fun `shared projection state reuses mapped android book instances by id`() {
+        val book = recentFile("book")
+        val sharedBook = book.toSharedBookItem()
+        val sharedShelf = SharedShelf(
+            id = "manual",
+            name = "Manual",
+            type = SharedShelfType.MANUAL,
+            books = listOf(sharedBook),
+            directBooks = listOf(sharedBook)
+        )
+        val projected = SharedReaderScreenState(
+            recentBooks = listOf(sharedBook),
+            libraryBooks = listOf(sharedBook),
+            rawLibraryBooks = listOf(sharedBook),
+            shelves = listOf(sharedShelf),
+            openTabs = listOf(sharedBook),
+            booksAvailableForAdding = listOf(sharedBook)
+        )
+
+        val android = projected.toAndroidReaderScreenState(
+            base = ReaderScreenState(),
+            androidBooksById = mapOf(book.bookId to book)
+        )
+
+        val mappedBook = android.rawLibraryFiles.single()
+        assertSame(book, mappedBook)
+        assertSame(mappedBook, android.recentFiles.single())
+        assertSame(mappedBook, android.allRecentFiles.single())
+        assertSame(mappedBook, android.shelves.single().books.single())
+        assertSame(mappedBook, android.shelves.single().directBooks.single())
+        assertSame(mappedBook, android.openTabs.single())
+        assertSame(mappedBook, android.booksAvailableForAdding.single())
+    }
+
+    @Test
     fun `enum filter and folder mappers round trip between android and shared`() {
         val filters = LibraryFilters(
             fileTypes = setOf(FileType.PDF, FileType.EPUB),
@@ -115,6 +194,7 @@ class SharedModelMappersTest {
         assertEquals(filters, filters.toSharedLibraryFilters().toAndroidLibraryFilters())
         assertEquals(folder, folder.toSharedSyncedFolder().toAndroidSyncedFolder())
         assertTrue(FileType.PPTX in PDF_VIEWER_FILE_TYPES)
+        assertTrue(FileType.CBT in PDF_VIEWER_FILE_TYPES)
         assertEquals(ReaderFeatureSurface.PDF_VIEWER, FileType.PPTX.readerSurfaceOnAndroid())
         assertFalse(FileType.UNKNOWN in ANDROID_READABLE_FILE_TYPES)
         assertFalse(FileType.UNKNOWN in ANDROID_SYNCABLE_FILE_TYPES)
@@ -133,6 +213,18 @@ class SharedModelMappersTest {
         assertEquals(listOf(tag), tagged.single().tags)
     }
 
+    @Test
+    fun `tag resolver reuses book item when resolved tags are unchanged`() {
+        val file = recentFile("book")
+
+        val resolved = listOf(file).withResolvedTags(
+            dbTags = emptyList(),
+            tagRefs = emptyList()
+        )
+
+        assertSame(file, resolved.single())
+    }
+
     private fun recentFile(
         id: String,
         type: FileType = FileType.EPUB,
@@ -141,6 +233,12 @@ class SharedModelMappersTest {
         isAvailable: Boolean = true,
         bookmarksJson: String? = null,
         sourceFolderUri: String? = null,
+        lastChapterIndex: Int? = null,
+        lastPage: Int? = null,
+        lastPositionCfi: String? = null,
+        locatorBlockIndex: Int? = null,
+        locatorCharOffset: Int? = null,
+        fileContentModifiedTimestamp: Long = 0L,
         tags: List<TagEntity> = emptyList()
     ) = RecentFileItem(
         bookId = id,
@@ -152,6 +250,12 @@ class SharedModelMappersTest {
         bookmarksJson = bookmarksJson,
         sourceFolderUri = sourceFolderUri,
         customName = customName,
+        lastChapterIndex = lastChapterIndex,
+        lastPage = lastPage,
+        lastPositionCfi = lastPositionCfi,
+        locatorBlockIndex = locatorBlockIndex,
+        locatorCharOffset = locatorCharOffset,
+        fileContentModifiedTimestamp = fileContentModifiedTimestamp,
         tags = tags
     )
 

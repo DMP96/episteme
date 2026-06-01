@@ -28,11 +28,31 @@ enum class SharedAppToolAction {
     TABS_TOGGLE
 }
 
+enum class SharedAppMoreGroup {
+    LIBRARY,
+    ACCOUNT,
+    PREFERENCES,
+    HELP
+}
+
+data class SharedAppMoreSection(
+    val group: SharedAppMoreGroup,
+    val actions: List<SharedAppToolAction>
+)
+
 data class SharedAppShellModel(
     val primaryTabs: List<SharedAppTab>,
+    val primaryActions: List<SharedAppToolAction>,
     val selectedPrimaryTab: SharedAppTab,
     val toolActions: List<SharedAppToolAction>,
+    val moreSections: List<SharedAppMoreSection>,
     val showPrimaryNavigation: Boolean
+)
+
+data class SharedSidebarSyncToggleModel(
+    val visible: Boolean,
+    val enabled: Boolean,
+    val checked: Boolean
 )
 
 fun sharedAppShellModel(
@@ -43,12 +63,16 @@ fun sharedAppShellModel(
     val primaryTabs = buildList {
         add(SharedAppTab.LIBRARY)
         if (featurePolicy.opdsCatalogs) add(SharedAppTab.CATALOGS)
+        if (featurePolicy.aiAndCloud) add(SharedAppTab.PRO)
+    }
+    val primaryActions = buildList {
+        if (aiSettingsAvailable && featurePolicy.aiAndCloud && !featurePolicy.byokAi) {
+            add(SharedAppToolAction.AI_SETTINGS)
+        }
     }
     val selectedPrimaryTab = when (selectedTab) {
-        SharedAppTab.HOME -> SharedAppTab.LIBRARY
         SharedAppTab.SHELVES -> SharedAppTab.LIBRARY
         SharedAppTab.SETTINGS,
-        SharedAppTab.PRO,
         SharedAppTab.CUSTOM_FONTS,
         SharedAppTab.SUPPORT,
         SharedAppTab.FEEDBACK,
@@ -57,11 +81,7 @@ fun sharedAppShellModel(
     }.takeIf { it in primaryTabs } ?: SharedAppTab.LIBRARY
     val toolActions = buildList {
         add(SharedAppToolAction.SETTINGS)
-        add(SharedAppToolAction.IMPORT_FILES)
-        add(SharedAppToolAction.IMPORT_FOLDER)
-        add(SharedAppToolAction.SYNC)
         add(SharedAppToolAction.APP_THEME)
-        if (featurePolicy.aiAndCloud) add(SharedAppToolAction.PRO)
         if (aiSettingsAvailable && featurePolicy.aiAndCloud) add(SharedAppToolAction.AI_SETTINGS)
         add(SharedAppToolAction.CUSTOM_FONTS)
         if (featurePolicy.projectLinks) {
@@ -69,13 +89,55 @@ fun sharedAppShellModel(
             add(SharedAppToolAction.SUPPORT)
         }
         add(SharedAppToolAction.ABOUT)
-        add(SharedAppToolAction.TABS_TOGGLE)
     }
     return SharedAppShellModel(
         primaryTabs = primaryTabs,
+        primaryActions = primaryActions,
         selectedPrimaryTab = selectedPrimaryTab,
         toolActions = toolActions,
+        moreSections = sharedAppMoreSections(toolActions),
         showPrimaryNavigation = selectedTab != SharedAppTab.READER
+    )
+}
+
+fun sharedAppMoreSections(actions: List<SharedAppToolAction>): List<SharedAppMoreSection> {
+    return listOf(
+        SharedAppMoreSection(
+            group = SharedAppMoreGroup.PREFERENCES,
+            actions = actions.filter {
+                it == SharedAppToolAction.SETTINGS ||
+                    it == SharedAppToolAction.APP_THEME ||
+                    it == SharedAppToolAction.AI_SETTINGS ||
+                    it == SharedAppToolAction.CUSTOM_FONTS
+            }
+        ),
+        SharedAppMoreSection(
+            group = SharedAppMoreGroup.HELP,
+            actions = actions.filter {
+                it == SharedAppToolAction.HELP_FEEDBACK ||
+                    it == SharedAppToolAction.SUPPORT ||
+                    it == SharedAppToolAction.ABOUT
+            }
+        )
+    ).filter { it.actions.isNotEmpty() }
+}
+
+fun sharedSidebarSyncToggleModel(
+    isSignedIn: Boolean,
+    accountAvailable: Boolean,
+    syncAvailable: Boolean,
+    isProUser: Boolean,
+    isSyncEnabled: Boolean,
+    featurePolicy: SharedFeaturePolicy = SharedFeaturePolicy.Standard
+): SharedSidebarSyncToggleModel {
+    val visible = isSignedIn &&
+        accountAvailable &&
+        syncAvailable &&
+        featurePolicy.aiAndCloud
+    return SharedSidebarSyncToggleModel(
+        visible = visible,
+        enabled = visible && isProUser,
+        checked = visible && isSyncEnabled
     )
 }
 
@@ -153,7 +215,7 @@ private val LibraryFileTypeGroupTemplates = listOf(
     NonReaderLibraryFileTypeGroup(
         titleKey = "desktop_file_type_group_comics",
         titleFallback = "Comics",
-        fileTypes = listOf(FileType.CBZ, FileType.CBR, FileType.CB7)
+        fileTypes = listOf(FileType.CBZ, FileType.CBR, FileType.CB7, FileType.CBT)
     )
 )
 
@@ -166,8 +228,19 @@ private val AndroidLibraryTabs = listOf(
 private val DesktopLibraryTabs = listOf(
     NonReaderLibraryTab.BOOKS,
     NonReaderLibraryTab.SHELVES,
-    NonReaderLibraryTab.FOLDERS
+    NonReaderLibraryTab.FOLDERS,
+    NonReaderLibraryTab.UNREAD,
+    NonReaderLibraryTab.IN_PROGRESS,
+    NonReaderLibraryTab.COMPLETED
 )
+
+internal enum class NonReaderLibraryPrimaryAction {
+    NEW_SHELF
+}
+
+internal enum class NonReaderBookOverflowAction {
+    ADD_TO_SHELF
+}
 
 internal fun visibleNonReaderLibraryTabs(
     platform: ReaderPlatform = ReaderPlatform.ANDROID
@@ -175,6 +248,42 @@ internal fun visibleNonReaderLibraryTabs(
     return when (platform) {
         ReaderPlatform.ANDROID -> AndroidLibraryTabs
         ReaderPlatform.DESKTOP -> DesktopLibraryTabs
+    }
+}
+
+internal fun primaryLibraryActionsForTab(
+    tab: NonReaderLibraryTab,
+    platform: ReaderPlatform = ReaderPlatform.ANDROID
+): List<NonReaderLibraryPrimaryAction> {
+    return if (platform == ReaderPlatform.DESKTOP && tab.visibleLibraryTab(platform) == NonReaderLibraryTab.SHELVES) {
+        listOf(NonReaderLibraryPrimaryAction.NEW_SHELF)
+    } else {
+        emptyList()
+    }
+}
+
+internal fun bookOverflowActionsForPlatform(
+    platform: ReaderPlatform = ReaderPlatform.ANDROID
+): Set<NonReaderBookOverflowAction> {
+    return when (platform) {
+        ReaderPlatform.DESKTOP -> setOf(NonReaderBookOverflowAction.ADD_TO_SHELF)
+        ReaderPlatform.ANDROID -> emptySet()
+    }
+}
+
+internal enum class LibraryCommandBarLayout {
+    INLINE,
+    STACKED
+}
+
+internal fun libraryCommandBarLayoutForWidth(
+    widthDp: Float,
+    platform: ReaderPlatform = ReaderPlatform.DESKTOP
+): LibraryCommandBarLayout {
+    return if (platform == ReaderPlatform.DESKTOP && widthDp >= 980f) {
+        LibraryCommandBarLayout.INLINE
+    } else {
+        LibraryCommandBarLayout.STACKED
     }
 }
 
@@ -221,7 +330,7 @@ internal fun nonReaderLibraryFileTypeGroups(
 }
 
 fun SharedReaderScreenState.toNonReaderLibraryOrganizationModel(): NonReaderLibraryOrganizationModel {
-    val books = rawLibraryBooks
+    val books = organizationBooks()
     val rootFolderCount = shelves.count { it.type == ShelfType.FOLDER && it.parentShelfId == null }
     val tagIds = (allTags.map { it.id } + books.flatMap { book -> book.tags.map { it.id } }).toSet()
     return NonReaderLibraryOrganizationModel(
@@ -242,6 +351,13 @@ fun SharedReaderScreenState.toNonReaderLibraryOrganizationModel(): NonReaderLibr
         hasInAppBooks = books.any { it.sourceFolder == null && !it.isOpdsStream() },
         hasOpdsStreams = books.any { it.isOpdsStream() }
     )
+}
+
+private fun SharedReaderScreenState.organizationBooks(): List<BookItem> {
+    if (shelves.isEmpty()) return rawLibraryBooks
+    return shelves
+        .flatMap { it.books }
+        .distinctBy { it.id }
 }
 
 private fun LibraryFilters.activeFilterCount(): Int {

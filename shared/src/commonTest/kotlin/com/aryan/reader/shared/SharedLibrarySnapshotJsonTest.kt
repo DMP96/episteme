@@ -74,6 +74,7 @@ class SharedLibrarySnapshotJsonTest {
                         pageInfoMode = PageInfoMode.SYNC,
                         pageInfoPosition = PageInfoPosition.TOP,
                         pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE,
+                        rightToLeftPagination = true,
                         pdfVerticalPageGapVisible = false,
                         pdfPageNumberOverlayVisible = false,
                         pdfFirstPageStandaloneInSpread = true,
@@ -121,7 +122,8 @@ class SharedLibrarySnapshotJsonTest {
                         paginatedVerticalScrollOffset = 140,
                         verticalFirstPageIndex = 3,
                         verticalFirstPageScrollOffset = 44
-                    )
+                    ),
+                    readingPositionModifiedTimestamp = 9_000L
                 )
             ),
             shelfRecords = listOf(ShelfRecord(id = "shelf", name = "Shelf", isSmart = true, smartRulesJson = "{}")),
@@ -154,6 +156,25 @@ class SharedLibrarySnapshotJsonTest {
             customAppThemes = listOf(
                 CustomAppTheme(id = "forest", name = "Forest", seedColor = Color(0xFF006C4C))
             ),
+            customReaderThemes = listOf(
+                ReaderTheme(
+                    id = "my_solid",
+                    name = "My Solid",
+                    backgroundColor = Color(0xFFF5F5F5),
+                    textColor = Color(0xFF111111),
+                    isDark = false,
+                    isCustom = true
+                ),
+                ReaderTheme(
+                    id = "my_texture",
+                    name = "My Texture",
+                    backgroundColor = Color(0xFF222222),
+                    textColor = Color(0xFFEFEFEF),
+                    isDark = true,
+                    textureId = ReaderTexture.CANVAS.id,
+                    isCustom = true
+                )
+            ),
             readerDefaultSettings = ReaderSettings(themeId = "sepia"),
             pdfReaderDefaultSettings = ReaderSettings(themeId = "reverse"),
             readerToolbarPreferences = ReaderToolbarPreferences(
@@ -162,7 +183,7 @@ class SharedLibrarySnapshotJsonTest {
                 bottomToolIds = setOf(ReaderTool.BOOKMARK.id)
             ).sanitized(),
             readerHighlightPalette = ReaderHighlightPalette(
-                colors = listOf(HighlightColor.YELLOW, HighlightColor.CYAN)
+                colors = listOf(HighlightColor.YELLOW, HighlightColor.CYAN, HighlightColor.CYAN, HighlightColor.WHITE)
             ),
             readerTtsReplacementPreferences = ReaderTtsReplacementPreferences(
                 globalRules = listOf(
@@ -250,6 +271,7 @@ class SharedLibrarySnapshotJsonTest {
 
         assertTrue(settings.pdfVerticalPageGapVisible)
         assertTrue(settings.pdfPageNumberOverlayVisible)
+        assertFalse(settings.rightToLeftPagination)
     }
 
     @Test
@@ -295,7 +317,8 @@ class SharedLibrarySnapshotJsonTest {
                   "uriString": "C:/Books",
                   "name": "Books",
                   "lastScanTime": 12,
-                  "allowedFileTypes": ["PDF", "UNKNOWN", "EPUB"]
+                  "allowedFileTypes": ["PDF", "UNKNOWN", "EPUB"],
+                  "localSyncEnabled": false
                 }
               ]
             }
@@ -304,6 +327,7 @@ class SharedLibrarySnapshotJsonTest {
         val folder = decoded.syncedFolders.single()
 
         assertEquals(setOf(FileType.PDF, FileType.EPUB), folder.allowedFileTypes)
+        assertFalse(folder.localSyncEnabled)
         assertFalse(FileType.UNKNOWN in folder.allowedFileTypes)
 
         val encoded = SharedLibrarySnapshotJson.encode(

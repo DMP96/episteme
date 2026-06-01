@@ -2,7 +2,9 @@ package com.aryan.reader.desktop
 
 import com.aryan.reader.shared.ReaderAiByokSettings
 import com.aryan.reader.shared.SharedFeaturePolicy
-import java.io.File
+import com.aryan.reader.shared.SharedLegalLinks
+import com.aryan.reader.shared.SharedLegalProfile
+import com.aryan.reader.shared.sharedLegalLinksForProfile
 
 internal const val DesktopFlavorProperty = "episteme.desktop.flavor"
 internal const val DesktopVersionProperty = "episteme.desktop.version"
@@ -16,10 +18,21 @@ internal data class DesktopBuildProfile(
     val flavor: String,
     val appName: String,
     val buildLabel: String,
-    val featurePolicy: SharedFeaturePolicy
+    val featurePolicy: SharedFeaturePolicy,
+    val legalProfile: SharedLegalProfile = if (featurePolicy.byokAi) {
+        SharedLegalProfile.OSS
+    } else {
+        SharedLegalProfile.STANDARD
+    }
 ) {
     val isOssOffline: Boolean get() = flavor == DesktopFlavorOssOffline
+    val aiKeySettingsAvailable: Boolean
+        get() = featurePolicy.aiAndCloud && featurePolicy.networkAccess && legalProfile != SharedLegalProfile.OSS
     val byokAiAvailable: Boolean get() = featurePolicy.byokAi && featurePolicy.aiAndCloud && featurePolicy.networkAccess
+    val creditBackedCloudTtsControlsAvailable: Boolean
+        get() = featurePolicy.aiAndCloud && featurePolicy.networkAccess && !byokAiAvailable
+    val legalLinks: SharedLegalLinks
+        get() = sharedLegalLinksForProfile(legalProfile)
 }
 
 internal fun currentDesktopBuildProfile(): DesktopBuildProfile {
@@ -35,13 +48,15 @@ internal fun desktopBuildProfileForFlavor(rawFlavor: String?): DesktopBuildProfi
             flavor = DesktopFlavorOssOffline,
             appName = EpistemeDesktopOssAppName,
             buildLabel = "Offline OSS edition",
-            featurePolicy = SharedFeaturePolicy.OssOffline
+            featurePolicy = SharedFeaturePolicy.OssOffline,
+            legalProfile = SharedLegalProfile.OSS
         )
         else -> DesktopBuildProfile(
             flavor = DesktopFlavorStandard,
             appName = EpistemeDesktopStandardAppName,
             buildLabel = "Standard edition",
-            featurePolicy = SharedFeaturePolicy.Standard
+            featurePolicy = SharedFeaturePolicy.Standard,
+            legalProfile = SharedLegalProfile.STANDARD
         )
     }
 }
@@ -59,48 +74,12 @@ internal fun ReaderAiByokSettings.withDesktopFeaturePolicy(
     featurePolicy: SharedFeaturePolicy
 ): ReaderAiByokSettings {
     return if (featurePolicy.byokAi && featurePolicy.aiAndCloud && featurePolicy.networkAccess) {
-        sanitized()
+        toDesktopPersistableAiSettings()
     } else {
-        ReaderAiByokSettings(hideReaderAiFeatures = true)
+        ReaderAiByokSettings()
     }
 }
 
-internal fun bundledDesktopWebViewDir(): File {
-    val platform = currentDesktopPlatform()
-    val resourceDir = System.getProperty(ComposeApplicationResourcesDirProperty)
-        ?.takeIf { it.isNotBlank() }
-        ?.let(::File)
-    return listOfNotNull(
-        resourceDir?.resolve("kcef-bundle"),
-        File(System.getProperty("user.dir"), "kcef-bundle"),
-        File(System.getProperty("user.dir"), "desktopApp/${platform.kcefBundleDirectoryName}"),
-        File(System.getProperty("user.dir"), "desktopApp/kcef-bundle"),
-        File("desktopApp/${platform.kcefBundleDirectoryName}"),
-        File("desktopApp/kcef-bundle"),
-        File(platform.kcefBundleDirectoryName),
-        File("kcef-bundle")
-    ).firstOrNull(::isBundledDesktopWebViewPresent)
-        ?: resourceDir?.resolve("kcef-bundle")
-        ?: File(platform.kcefBundleDirectoryName)
-}
-
-internal fun isBundledDesktopWebViewPresent(
-    dir: File,
-    platform: DesktopPlatform = currentDesktopPlatform()
-): Boolean {
-    return dir.isDirectory &&
-        bundledDesktopWebViewRequiredPaths(platform).all { requiredPath ->
-            dir.resolve(requiredPath).exists()
-        }
-}
-
-internal fun bundledDesktopWebViewRequiredPaths(
-    platform: DesktopPlatform = currentDesktopPlatform()
-): List<String> {
-    return when (platform.os) {
-        DesktopOperatingSystem.WINDOWS -> listOf("jcef.dll", "libcef.dll")
-        DesktopOperatingSystem.LINUX -> listOf("libcef.so", "chrome-sandbox", "icudtl.dat", "locales")
-        DesktopOperatingSystem.MACOS -> listOf("jcef Helper.app", "Chromium Embedded Framework.framework")
-        DesktopOperatingSystem.OTHER -> emptyList()
-    }
+internal fun ReaderAiByokSettings.toDesktopPersistableAiSettings(): ReaderAiByokSettings {
+    return sanitized().copy(hideReaderAiFeatures = false)
 }

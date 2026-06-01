@@ -35,7 +35,6 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -49,6 +48,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -56,6 +56,7 @@ import androidx.compose.ui.zIndex
 import com.aryan.reader.shared.SearchHighlightMode
 import com.aryan.reader.shared.pdf.SharedPdfSearchResult
 import com.aryan.reader.shared.ui.ReaderMinimalSlider
+import com.aryan.reader.shared.ui.ReaderTooltipIconButton
 import com.aryan.reader.shared.ui.SharedStableOutlinedTextField
 import com.aryan.reader.shared.ui.readerString
 import kotlinx.coroutines.delay
@@ -82,12 +83,11 @@ internal fun DesktopPdfFullscreenBottomChrome(
     val chromeBackground = MaterialTheme.colorScheme.surfaceVariant
     val chromeContent = MaterialTheme.colorScheme.onSurface
     val sliderActive = MaterialTheme.colorScheme.primary
-    val sliderInactive = MaterialTheme.colorScheme.surfaceVariant
+    val sliderInactive = chromeContent.copy(alpha = if (chromeBackground.luminance() > 0.5f) 0.44f else 0.52f)
     Surface(
         modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 0.dp),
-        shape = RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp),
+            .fillMaxWidth(),
+        shape = RoundedCornerShape(0.dp),
         color = chromeBackground,
         contentColor = chromeContent,
         tonalElevation = 0.dp,
@@ -113,7 +113,11 @@ internal fun DesktopPdfFullscreenBottomChrome(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = onPrevious, enabled = canGoPrevious) {
+                ReaderTooltipIconButton(
+                    tooltip = readerString("desktop_previous_page", "Previous page"),
+                    onClick = onPrevious,
+                    enabled = canGoPrevious
+                ) {
                     Icon(
                         Icons.AutoMirrored.Filled.NavigateBefore,
                         contentDescription = readerString("desktop_previous_page", "Previous page"),
@@ -136,7 +140,11 @@ internal fun DesktopPdfFullscreenBottomChrome(
                     thumbColor = sliderActive,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = onNext, enabled = canGoNext) {
+                ReaderTooltipIconButton(
+                    tooltip = readerString("desktop_next_page", "Next page"),
+                    onClick = onNext,
+                    enabled = canGoNext
+                ) {
                     Icon(
                         Icons.AutoMirrored.Filled.NavigateNext,
                         contentDescription = readerString("desktop_next_page", "Next page"),
@@ -171,10 +179,10 @@ internal fun DesktopPdfBottomChrome(
     val chromeBackground = MaterialTheme.colorScheme.surfaceVariant
     val chromeContent = MaterialTheme.colorScheme.onSurface
     val sliderActive = MaterialTheme.colorScheme.primary
-    val sliderInactive = MaterialTheme.colorScheme.surfaceVariant
+    val sliderInactive = chromeContent.copy(alpha = if (chromeBackground.luminance() > 0.5f) 0.44f else 0.52f)
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(6.dp),
+        shape = RoundedCornerShape(0.dp),
         color = chromeBackground,
         contentColor = chromeContent,
         tonalElevation = 0.dp,
@@ -199,7 +207,11 @@ internal fun DesktopPdfBottomChrome(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = onPrevious, enabled = canGoPrevious) {
+                ReaderTooltipIconButton(
+                    tooltip = readerString("desktop_previous_page", "Previous page"),
+                    onClick = onPrevious,
+                    enabled = canGoPrevious
+                ) {
                     Icon(
                         Icons.AutoMirrored.Filled.NavigateBefore,
                         contentDescription = readerString("desktop_previous_page", "Previous page"),
@@ -230,7 +242,11 @@ internal fun DesktopPdfBottomChrome(
                     style = MaterialTheme.typography.labelSmall,
                     color = chromeContent.copy(alpha = 0.72f)
                 )
-                IconButton(onClick = onNext, enabled = canGoNext) {
+                ReaderTooltipIconButton(
+                    tooltip = readerString("desktop_next_page", "Next page"),
+                    onClick = onNext,
+                    enabled = canGoNext
+                ) {
                     Icon(
                         Icons.AutoMirrored.Filled.NavigateNext,
                         contentDescription = readerString("desktop_next_page", "Next page"),
@@ -298,7 +314,7 @@ internal fun DesktopPdfSearchTopBar(
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(6.dp),
+        shape = RoundedCornerShape(0.dp),
         color = MaterialTheme.colorScheme.surface,
         tonalElevation = 2.dp
     ) {
@@ -307,7 +323,11 @@ internal fun DesktopPdfSearchTopBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            IconButton(onClick = onClose, modifier = Modifier.size(36.dp)) {
+            ReaderTooltipIconButton(
+                tooltip = readerString("tooltip_close_search_desc", "Exit search and go back to the reader"),
+                onClick = onClose,
+                modifier = Modifier.size(36.dp)
+            ) {
                 Icon(Icons.Default.Close, contentDescription = readerString("content_desc_close_search", "Close search"))
             }
             SharedStableOutlinedTextField(
@@ -318,7 +338,10 @@ internal fun DesktopPdfSearchTopBar(
                 modifier = Modifier.weight(1f).focusRequester(focusRequester),
                 trailingIcon = if (query.isNotEmpty()) {
                     {
-                        IconButton(onClick = { onQueryChange("") }) {
+                        ReaderTooltipIconButton(
+                            tooltip = readerString("tooltip_clear_search_desc", "Erase your current search query and start over"),
+                            onClick = { onQueryChange("") }
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = readerString("tooltip_clear_search", "Clear search"))
                         }
                     }
@@ -327,7 +350,16 @@ internal fun DesktopPdfSearchTopBar(
                 },
                 selectionKey = "desktop-pdf-search"
             )
-            IconButton(onClick = onToggleResults, modifier = Modifier.size(36.dp)) {
+            val resultsTooltip = if (showResultsPanel) {
+                readerString("tooltip_hide_results_desc", "Collapse the search results panel")
+            } else {
+                readerString("tooltip_show_results_desc", "Expand the panel to see all search matches")
+            }
+            ReaderTooltipIconButton(
+                tooltip = resultsTooltip,
+                onClick = onToggleResults,
+                modifier = Modifier.size(36.dp)
+            ) {
                 Icon(
                     if (showResultsPanel) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                     contentDescription = if (showResultsPanel) {
@@ -507,7 +539,15 @@ private fun DesktopPdfSearchNavigationPill(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            IconButton(onClick = onToggleHighlightMode, modifier = Modifier.size(36.dp)) {
+            ReaderTooltipIconButton(
+                tooltip = if (highlightMode == SearchHighlightMode.ALL) {
+                    readerString("desktop_show_current_match_only", "Show current match only")
+                } else {
+                    readerString("desktop_show_all_search_matches", "Show all search matches")
+                },
+                onClick = onToggleHighlightMode,
+                modifier = Modifier.size(36.dp)
+            ) {
                 Icon(
                     if (highlightMode == SearchHighlightMode.ALL) Icons.Default.Visibility else Icons.Default.VisibilityOff,
                     contentDescription = readerString("content_desc_toggle_search_highlights", "Toggle search highlights"),
@@ -518,7 +558,12 @@ private fun DesktopPdfSearchNavigationPill(
                     }
                 )
             }
-            IconButton(onClick = onPrevious, enabled = resultCount > 0, modifier = Modifier.size(36.dp)) {
+            ReaderTooltipIconButton(
+                tooltip = readerString("tooltip_prev_result_desc", "Jump to the previous search match in the document"),
+                onClick = onPrevious,
+                enabled = resultCount > 0,
+                modifier = Modifier.size(36.dp)
+            ) {
                 Icon(Icons.AutoMirrored.Filled.NavigateBefore, contentDescription = readerString("desktop_previous_search_result", "Previous search result"))
             }
             Text(
@@ -531,7 +576,12 @@ private fun DesktopPdfSearchNavigationPill(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.clickable(onClick = onShowResults).padding(horizontal = 8.dp)
             )
-            IconButton(onClick = onNext, enabled = resultCount > 0, modifier = Modifier.size(36.dp)) {
+            ReaderTooltipIconButton(
+                tooltip = readerString("tooltip_next_result_desc", "Jump to the next search match in the document"),
+                onClick = onNext,
+                enabled = resultCount > 0,
+                modifier = Modifier.size(36.dp)
+            ) {
                 Icon(Icons.AutoMirrored.Filled.NavigateNext, contentDescription = readerString("desktop_next_search_result", "Next search result"))
             }
         }

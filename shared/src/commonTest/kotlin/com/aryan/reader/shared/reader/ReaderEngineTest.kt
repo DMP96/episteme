@@ -39,6 +39,40 @@ class ReaderEngineTest {
     }
 
     @Test
+    fun `visible locator and bookmarks prefer android style cfi when semantic blocks provide it`() {
+        val engine = ReaderEngine()
+        val session = engine.createSession(
+            SharedEpubBook(
+                id = "semantic",
+                fileName = "semantic.epub",
+                title = "Semantic",
+                chapters = listOf(
+                    SharedEpubChapter(
+                        id = "one",
+                        title = "One",
+                        plainText = "Alpha beta",
+                        semanticBlocks = listOf(
+                            SemanticParagraph(
+                                text = "Alpha beta",
+                                spans = emptyList(),
+                                style = CssStyle(),
+                                elementId = null,
+                                cfi = "/4/2/2",
+                                startCharOffsetInSource = 0
+                            )
+                        )
+                    )
+                )
+            )
+        )
+
+        val bookmarked = engine.toggleBookmark(session)
+
+        assertEquals("/4/2/2:0", session.navigationLocator?.cfi)
+        assertEquals("/4/2/2:0", bookmarked.bookmarks.single().locator.cfi)
+    }
+
+    @Test
     fun `visual settings update does not repaginate or move current page`() {
         val engine = ReaderEngine()
         val session = engine.goToPage(engine.createSession(longBook()), 1)
@@ -60,6 +94,43 @@ class ReaderEngineTest {
         assertSame(oldPages, updated.reader.pages)
         assertEquals(oldPageIndex, updated.reader.currentPageIndex)
         assertEquals("night", updated.reader.settings.themeId)
+    }
+
+    @Test
+    fun `vertical page navigation uses scroll page locator for webview slider sync`() {
+        val engine = ReaderEngine()
+        val session = engine.createSession(
+            book = longBook(),
+            settings = ReaderSettings(readingMode = ReaderReadingMode.VERTICAL)
+        )
+
+        val moved = engine.goToPage(session, 1)
+
+        assertEquals(1, moved.reader.currentPageIndex)
+        assertEquals("desktop-scroll-page:1", moved.navigationLocator?.cfi)
+        assertEquals(1, moved.navigationLocator?.pageIndex)
+    }
+
+    @Test
+    fun `visible page sync stores stable vertical locator cfi instead of scroll metrics`() {
+        val engine = ReaderEngine()
+        val session = engine.createSession(
+            book = longBook(),
+            settings = ReaderSettings(readingMode = ReaderReadingMode.VERTICAL)
+        )
+        val page = session.reader.pages[1]
+        val locator = ReaderLocator(
+            chapterIndex = page.chapterIndex,
+            pageIndex = page.pageIndex,
+            startOffset = page.startOffset + 24,
+            endOffset = page.startOffset + 24,
+            cfi = "desktop-scroll:120:800:desktop:${page.chapterIndex}:${page.startOffset + 24}:${page.startOffset + 24}"
+        )
+
+        val synced = engine.syncVisiblePage(session, page.pageIndex, locator)
+
+        assertEquals("desktop:${page.chapterIndex}:${page.startOffset + 24}:${page.startOffset + 24}", synced.navigationLocator?.cfi)
+        assertEquals(locator.startOffset, synced.navigationLocator?.startOffset)
     }
 
     @Test
@@ -356,6 +427,81 @@ class ReaderEngineTest {
         assertEquals(1, replaced.reader.currentPageIndex)
         assertEquals(1, replaced.navigationLocator?.pageIndex)
         assertEquals(160, replaced.navigationLocator?.startOffset)
+    }
+
+    @Test
+    fun `replacePages resolves page start anchors to the page after a touching boundary`() {
+        val engine = ReaderEngine()
+        val book = manualRangeBook()
+        val pages = listOf(
+            ReaderPage(0, 0, "One", "first", 0, 100),
+            ReaderPage(1, 0, "One", "second", 100, 200),
+            ReaderPage(2, 0, "One", "third", 200, 300)
+        )
+        val session = engine.createSession(book).copy(
+            reader = PaginatedReaderState(book, pages, currentPageIndex = 1),
+            navigationLocator = ReaderLocator(chapterIndex = 0, pageIndex = 1, startOffset = 100, endOffset = 100),
+            navigationRequestId = 8L
+        )
+
+        val replaced = engine.replacePages(
+            state = session,
+            pages = pages,
+            reflowAnchor = session.navigationLocator,
+            navigationRequestIdAtReflowStart = 8L
+        )
+
+        assertEquals(1, replaced.reader.currentPageIndex)
+        assertEquals(1, replaced.navigationLocator?.pageIndex)
+        assertEquals(100, replaced.navigationLocator?.startOffset)
+    }
+
+    @Test
+    fun `replacePages resolves android block locator after measured pagination`() {
+        val engine = ReaderEngine()
+        val book = manualRangeBook()
+        val initialSession = engine.createSession(
+            book = book,
+            initialLocator = ReaderLocator(
+                chapterIndex = 0,
+                pageIndex = 0,
+                blockIndex = 42,
+                charOffset = 160,
+                cfi = "android-locator:0:42:160"
+            )
+        )
+        val measuredPages = listOf(
+            ReaderPage(
+                pageIndex = 0,
+                chapterIndex = 0,
+                chapterTitle = "One",
+                text = "first",
+                startOffset = 0,
+                endOffset = 100,
+                semanticBlocks = listOf(SemanticParagraph("first", emptyList(), CssStyle(), null, null, 0, 7))
+            ),
+            ReaderPage(
+                pageIndex = 1,
+                chapterIndex = 0,
+                chapterTitle = "One",
+                text = "target",
+                startOffset = 150,
+                endOffset = 210,
+                semanticBlocks = listOf(SemanticParagraph("target", emptyList(), CssStyle(), null, null, 150, 42))
+            )
+        )
+
+        val replaced = engine.replacePages(
+            state = initialSession,
+            pages = measuredPages,
+            reflowAnchor = initialSession.navigationLocator,
+            navigationRequestIdAtReflowStart = initialSession.navigationRequestId
+        )
+
+        assertEquals(1, replaced.reader.currentPageIndex)
+        assertEquals(1, replaced.navigationLocator?.pageIndex)
+        assertEquals(42, replaced.navigationLocator?.blockIndex)
+        assertEquals(160, replaced.navigationLocator?.charOffset)
     }
 
     @Test

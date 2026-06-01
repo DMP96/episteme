@@ -96,6 +96,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -106,6 +108,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.edit
 import com.aryan.reader.R
 import com.aryan.reader.data.CustomFontEntity
+import com.aryan.reader.supportedFontMimeTypes
 import java.io.File
 import kotlin.math.roundToInt
 
@@ -130,6 +133,7 @@ private const val SYSTEM_UI_MODE_KEY = "reader_system_ui_mode"
 private const val PAGE_INFO_MODE_KEY = "reader_page_info_mode"
 private const val PAGE_INFO_POSITION_KEY = "reader_page_info_position"
 private const val PULL_TO_TURN_ENABLED_KEY = "reader_pull_to_turn_enabled"
+private const val NATIVE_VERTICAL_RENDERER_KEY = "reader_native_vertical_renderer"
 
 const val DEFAULT_FONT_SIZE_VAL = 1.0f
 const val DEFAULT_LINE_HEIGHT_VAL = 1.0f
@@ -293,6 +297,16 @@ fun savePullToTurn(context: Context, enabled: Boolean) {
 fun loadPullToTurn(context: Context): Boolean {
     val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
     return prefs.getBoolean(PULL_TO_TURN_ENABLED_KEY, true)
+}
+
+fun saveNativeVerticalRenderer(context: Context, enabled: Boolean) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putBoolean(NATIVE_VERTICAL_RENDERER_KEY, enabled) }
+}
+
+fun loadNativeVerticalRenderer(context: Context): Boolean {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getBoolean(NATIVE_VERTICAL_RENDERER_KEY, false)
 }
 
 private const val PULL_TO_TURN_MULTIPLIER_KEY = "reader_pull_to_turn_multiplier"
@@ -603,6 +617,7 @@ fun ReaderTextFormatPanel(
                 )
 
                 // Font Button
+                val fontSelectorDescription = stringResource(R.string.content_desc_select_font_family)
                 Surface(
                     onClick = onFontOptionClick,
                     shape = RoundedCornerShape(12.dp),
@@ -610,6 +625,9 @@ fun ReaderTextFormatPanel(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(52.dp)
+                        .semantics {
+                            contentDescription = fontSelectorDescription
+                        }
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -769,12 +787,12 @@ fun FontSelectionSheetContent(
     currentCustomFontPath: String?,
     onFontSelected: (ReaderFont, String?) -> Unit,
     customFonts: List<CustomFontEntity>,
-    onImportFont: (Uri) -> Unit,
+    onImportFonts: (List<Uri>) -> Unit,
     onDismiss: () -> Unit
 ) {
     var selectedTabIndex by remember { mutableIntStateOf(0) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let { onImportFont(it) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) onImportFonts(uris)
     }
 
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -817,7 +835,7 @@ fun FontSelectionSheetContent(
                     Column(modifier = Modifier.fillMaxSize()) {
                         Box(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                             Button(
-                                onClick = { launcher.launch(arrayOf("font/ttf", "font/otf", "application/x-font-ttf")) },
+                                onClick = { launcher.launch(supportedFontMimeTypes()) },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Icon(Icons.Default.Add, contentDescription = null)

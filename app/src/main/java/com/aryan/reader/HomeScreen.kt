@@ -130,6 +130,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -436,7 +437,7 @@ fun HomeScreen(
                                     onRefresh = { viewModel.refreshLibrary() },
                                     isRefreshing = uiState.isRefreshing,
                                     isSyncEnabled = uiState.isSyncEnabled,
-                                    hasSyncedFolder = uiState.syncedFolders.isNotEmpty(),
+                                    hasSyncedFolder = uiState.syncedFolders.any { it.localSyncEnabled },
                                     usePdfFileNameAsDisplayName = uiState.usePdfFileNameAsDisplayName
                                 )
                             }
@@ -767,7 +768,8 @@ private fun RecentFilesGrid(
                                     modifier = Modifier.size(16.dp)
                                 )
                             }
-                        }
+                        },
+                        modifier = Modifier.testTag("HomeTab_${tab.bookId}")
                     )
                 }
             }
@@ -817,6 +819,7 @@ fun RecentFileCard(
 
     androidx.compose.material3.ElevatedCard(
         modifier = modifier
+            .testTag("HomeRecentFileCard_${item.bookId}")
             .graphicsLayer { alpha = if (item.isAvailable) 1.0f else 0.8f }
             .then(
                 if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.large)
@@ -1485,7 +1488,7 @@ private fun AppDrawerContent(
             Spacer(modifier = Modifier.weight(1f))
 
             // legal links
-            if (uiState.currentUser != null && !isOss) {
+            if (uiState.currentUser != null || (isOss && !BuildConfig.IS_OFFLINE)) {
                 val uriHandler = LocalUriHandler.current
                 val baseStyle = MaterialTheme.typography.labelMedium
                 var scaledTextStyle by remember { mutableStateOf(baseStyle) }

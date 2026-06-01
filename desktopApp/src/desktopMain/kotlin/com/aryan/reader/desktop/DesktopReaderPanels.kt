@@ -26,7 +26,6 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -49,11 +48,8 @@ import com.aryan.reader.shared.ReaderAiByokSettings
 import com.aryan.reader.shared.ReaderAiModelOption
 import com.aryan.reader.shared.ReaderAiModelOptions
 import com.aryan.reader.shared.ReaderAiResultState
-import com.aryan.reader.shared.ReaderAutoScrollState
 import com.aryan.reader.shared.ReaderCloudTtsVoices
 import com.aryan.reader.shared.ReaderExtrasState
-import com.aryan.reader.shared.ReaderExternalLookupAction
-import com.aryan.reader.shared.ReaderTtsReadScope
 import com.aryan.reader.shared.ReaderTtsReplacementPreferences
 import com.aryan.reader.shared.maskedReaderAiKey
 import com.aryan.reader.shared.ui.SharedMarkdownText
@@ -197,7 +193,7 @@ internal fun DesktopAiByokSettingsDialog(
                 DesktopSavedAiKeyRow(
                     label = readerString("provider_gemini", "Gemini"),
                     keyValue = sanitized.geminiKey,
-                    onClear = { onSettingsChange(sanitized.copy(geminiKey = "", ttsModel = "")) }
+                    onClear = { onSettingsChange(sanitized.copy(geminiKey = "")) }
                 )
                 DesktopSavedAiKeyRow(
                     label = readerString("provider_groq", "Groq"),
@@ -252,26 +248,6 @@ internal fun DesktopAiByokSettingsDialog(
 
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(readerString("options_show_ai_in_reader", "Show AI in reader"), style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            readerString(
-                                "desktop_show_ai_in_reader_desc",
-                                "Matches the Android hide toggle for smart dictionary, summaries, and recaps."
-                            ),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = !sanitized.hideReaderAiFeatures,
-                        onCheckedChange = { enabled ->
-                            onSettingsChange(sanitized.copy(hideReaderAiFeatures = !enabled))
-                        }
-                    )
-                }
-
-                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f)) {
                         Text(readerString("ai_settings_use_one_model", "Use one model for all features"), style = MaterialTheme.typography.titleMedium)
                         Text(
                             readerString("ai_settings_use_one_model_desc", "When off, each reader AI feature uses its own selected model."),
@@ -320,31 +296,6 @@ internal fun DesktopAiByokSettingsDialog(
                     options = listOf(ReaderAiModelOption("gemini", GEMINI_CLOUD_TTS_MODEL)),
                     onSelected = { onSettingsChange(sanitized.copy(ttsModel = it)) }
                 )
-                Text(readerString("desktop_cloud_tts_voice", "Cloud TTS voice"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ReaderCloudTtsVoices.chunked(3).forEach { rowVoices ->
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                            rowVoices.forEach { voice ->
-                                FilterChip(
-                                    selected = sanitized.ttsSpeakerId == voice.id,
-                                    onClick = { onSettingsChange(sanitized.copy(ttsSpeakerId = voice.id)) },
-                                    label = {
-                                        Column {
-                                            Text(voice.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            Text(
-                                                voice.description,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
             }
         },
         confirmButton = {
@@ -405,53 +356,21 @@ private fun DesktopAiModelSelector(
 }
 
 @Composable
-internal fun DesktopPdfExtrasPanel(
-    pageText: String,
+internal fun DesktopPdfTtsPanel(
     extrasState: ReaderExtrasState,
     aiByokSettings: ReaderAiByokSettings,
-    externalLookupAvailable: Boolean,
     cloudTtsFeatureAvailable: Boolean,
-    onExternalLookup: (ReaderExternalLookupAction, String) -> Unit,
-    onOpenAiHub: (() -> Unit)? = null,
-    onCloudTtsStart: (ReaderTtsReadScope) -> Unit,
-    onCloudTtsPauseResume: () -> Unit,
-    onCloudTtsStop: () -> Unit,
     onCloudTtsClearCache: () -> Unit,
-    onAutoScrollChange: (ReaderAutoScrollState) -> Unit,
+    onCloudTtsVoiceChange: (String) -> Unit,
     ttsReplacementPreferences: ReaderTtsReplacementPreferences,
     ttsReplacementBookId: String,
     onTtsReplacementPreferencesChange: (ReaderTtsReplacementPreferences) -> Unit
 ) {
     val settings = aiByokSettings.sanitized()
-    val autoScroll = extrasState.autoScroll.sanitized()
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-        Text(readerString("desktop_extras", "Extras"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        if (externalLookupAvailable) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                ReaderExternalLookupAction.entries.forEach { action ->
-                    FilterChip(
-                        selected = false,
-                        enabled = pageText.isNotBlank(),
-                        onClick = { onExternalLookup(action, pageText) },
-                        label = { Text(action.title) }
-                    )
-                }
-            }
-        }
-        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(readerString("menu_auto_scroll", "Auto Scroll"), modifier = Modifier.weight(1f))
-            Switch(
-                checked = autoScroll.enabled,
-                onCheckedChange = { onAutoScrollChange(autoScroll.copy(enabled = it)) }
-            )
-        }
-        Slider(
-            value = autoScroll.speed,
-            onValueChange = { onAutoScrollChange(autoScroll.copy(speed = it).sanitized()) },
-            valueRange = 12f..160f
-        )
+        Text(readerString("menu_tts_settings", "TTS"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         val ttsBusy = extrasState.cloudTts.isLoading || extrasState.cloudTts.isPlaying || extrasState.cloudTts.isPaused
         if (cloudTtsFeatureAvailable) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -476,38 +395,36 @@ internal fun DesktopPdfExtrasPanel(
                         Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                TextButton(
-                    enabled = settings.isCloudTtsAvailable || ttsBusy,
-                    onClick = {
-                        if (ttsBusy) {
-                            onCloudTtsStop()
-                        } else {
-                            onCloudTtsStart(ReaderTtsReadScope.BOOK)
-                        }
-                    }
-                ) {
-                    Text(if (ttsBusy) readerString("action_stop", "Stop") else readerString("action_read", "Read"))
-                }
             }
-            if (extrasState.cloudTts.isPlaying || extrasState.cloudTts.isPaused) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(readerString("desktop_cloud_tts_voice", "Cloud TTS voice"), fontWeight = FontWeight.SemiBold)
+                if (ttsBusy) {
+                    Text(
+                        readerString("desktop_stop_reading_change_voices", "Stop reading to change voices."),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                    TextButton(onClick = onCloudTtsPauseResume) {
-                        Text(if (extrasState.cloudTts.isPaused) readerString("tooltip_tts_resume", "Resume") else readerString("tooltip_tts_pause", "Pause"))
+                    ReaderCloudTtsVoices.forEach { voice ->
+                        FilterChip(
+                            selected = settings.ttsSpeakerId == voice.id,
+                            enabled = !ttsBusy,
+                            onClick = { onCloudTtsVoiceChange(voice.id) },
+                            label = {
+                                Column {
+                                    Text(voice.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        voice.description,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        )
                     }
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                TextButton(
-                    enabled = settings.isCloudTtsAvailable && !ttsBusy && pageText.isNotBlank(),
-                    onClick = { onCloudTtsStart(ReaderTtsReadScope.PAGE) }
-                ) {
-                    Text(readerString("desktop_page", "Page"))
-                }
-                TextButton(
-                    enabled = settings.isCloudTtsAvailable && !ttsBusy && pageText.isNotBlank(),
-                    onClick = { onCloudTtsStart(ReaderTtsReadScope.BOOK) }
-                ) {
-                    Text(readerString("desktop_from_here", "From here"))
                 }
             }
             val cacheSummary = extrasState.cloudTts.cacheSummary
@@ -529,12 +446,5 @@ internal fun DesktopPdfExtrasPanel(
             bookId = ttsReplacementBookId,
             onPreferencesChange = onTtsReplacementPreferencesChange
         )
-        if (settings.areReaderAiFeaturesAvailable && onOpenAiHub != null) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                TextButton(onClick = onOpenAiHub) {
-                    Text(readerString("desktop_ai_hub", "AI hub"))
-                }
-            }
-        }
     }
 }

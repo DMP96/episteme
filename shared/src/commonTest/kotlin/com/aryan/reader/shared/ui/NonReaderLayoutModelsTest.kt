@@ -39,22 +39,63 @@ class NonReaderLayoutModelsTest {
     }
 
     @Test
-    fun `desktop library keeps browse focused on books shelves and folders`() {
+    fun `desktop library includes organization and reading status tabs`() {
         val visibleTabs = visibleNonReaderLibraryTabs(ReaderPlatform.DESKTOP)
 
         assertEquals(
             listOf(
                 NonReaderLibraryTab.BOOKS,
                 NonReaderLibraryTab.SHELVES,
-                NonReaderLibraryTab.FOLDERS
+                NonReaderLibraryTab.FOLDERS,
+                NonReaderLibraryTab.UNREAD,
+                NonReaderLibraryTab.IN_PROGRESS,
+                NonReaderLibraryTab.COMPLETED
             ),
             visibleTabs
         )
         assertFalse(NonReaderLibraryTab.SMART_SHELVES in visibleTabs)
         assertFalse(NonReaderLibraryTab.TAGS in visibleTabs)
-        assertFalse(NonReaderLibraryTab.UNREAD in visibleTabs)
-        assertFalse(NonReaderLibraryTab.IN_PROGRESS in visibleTabs)
-        assertFalse(NonReaderLibraryTab.COMPLETED in visibleTabs)
+    }
+
+    @Test
+    fun `desktop shelves tab exposes primary new shelf action only on desktop`() {
+        assertEquals(
+            listOf(NonReaderLibraryPrimaryAction.NEW_SHELF),
+            primaryLibraryActionsForTab(NonReaderLibraryTab.SHELVES, ReaderPlatform.DESKTOP)
+        )
+        assertEquals(
+            emptyList<NonReaderLibraryPrimaryAction>(),
+            primaryLibraryActionsForTab(NonReaderLibraryTab.SHELVES, ReaderPlatform.ANDROID)
+        )
+        assertEquals(
+            emptyList<NonReaderLibraryPrimaryAction>(),
+            primaryLibraryActionsForTab(NonReaderLibraryTab.BOOKS, ReaderPlatform.DESKTOP)
+        )
+    }
+
+    @Test
+    fun `desktop book overflow exposes add to shelf action without changing android`() {
+        assertEquals(
+            setOf(NonReaderBookOverflowAction.ADD_TO_SHELF),
+            bookOverflowActionsForPlatform(ReaderPlatform.DESKTOP)
+        )
+        assertEquals(emptySet<NonReaderBookOverflowAction>(), bookOverflowActionsForPlatform(ReaderPlatform.ANDROID))
+    }
+
+    @Test
+    fun `desktop library command bar uses inline layout only on wide panes`() {
+        assertEquals(
+            LibraryCommandBarLayout.STACKED,
+            libraryCommandBarLayoutForWidth(widthDp = 979f, platform = ReaderPlatform.DESKTOP)
+        )
+        assertEquals(
+            LibraryCommandBarLayout.INLINE,
+            libraryCommandBarLayoutForWidth(widthDp = 980f, platform = ReaderPlatform.DESKTOP)
+        )
+        assertEquals(
+            LibraryCommandBarLayout.STACKED,
+            libraryCommandBarLayoutForWidth(widthDp = 1200f, platform = ReaderPlatform.ANDROID)
+        )
     }
 
     @Test
@@ -71,7 +112,7 @@ class NonReaderLayoutModelsTest {
         assertTrue(FileType.PPTX in groupedTypes)
         assertTrue(
             nonReaderLibraryFileTypeGroups()
-                .any { it.title == "Comics" && FileType.CBR in it.fileTypes && FileType.CB7 in it.fileTypes }
+                .any { it.title == "Comics" && FileType.CBR in it.fileTypes && FileType.CB7 in it.fileTypes && FileType.CBT in it.fileTypes }
         )
     }
 
@@ -176,7 +217,7 @@ class NonReaderLayoutModelsTest {
     }
 
     @Test
-    fun `hidden desktop status tabs fall back to all books`() {
+    fun `desktop status tabs filter books while android hidden statuses fall back`() {
         val unread = book("unread", type = FileType.EPUB, progress = 0f)
         val inProgress = book("progress", type = FileType.PDF, progress = 44f)
         val complete = book("complete", type = FileType.CBZ, progress = 100f)
@@ -186,16 +227,20 @@ class NonReaderLayoutModelsTest {
         )
 
         assertEquals(
-            listOf("unread", "progress", "complete"),
+            listOf("unread"),
             state.booksForNonReaderLibraryTab(NonReaderLibraryTab.UNREAD, ReaderPlatform.DESKTOP).map { it.id }
         )
         assertEquals(
-            listOf("unread", "progress", "complete"),
+            listOf("progress"),
             state.visibleBooksForLibrarySelection(NonReaderLibraryTab.IN_PROGRESS, ReaderPlatform.DESKTOP).map { it.id }
         )
         assertEquals(
-            listOf("unread", "progress", "complete"),
+            listOf("complete"),
             state.booksForNonReaderLibraryTab(NonReaderLibraryTab.COMPLETED, ReaderPlatform.DESKTOP).map { it.id }
+        )
+        assertEquals(
+            listOf("unread", "progress", "complete"),
+            state.booksForNonReaderLibraryTab(NonReaderLibraryTab.UNREAD, ReaderPlatform.ANDROID).map { it.id }
         )
     }
 
@@ -250,34 +295,100 @@ class NonReaderLayoutModelsTest {
     }
 
     @Test
-    fun `shell model keeps primary navigation simple and exposes all tool actions`() {
+    fun `shell model keeps account in primary navigation and exposes more actions`() {
         val model = sharedAppShellModel(
             selectedTab = SharedAppTab.CUSTOM_FONTS,
             aiSettingsAvailable = true
         )
 
         assertEquals(
-            listOf(SharedAppTab.LIBRARY, SharedAppTab.CATALOGS),
+            listOf(SharedAppTab.LIBRARY, SharedAppTab.CATALOGS, SharedAppTab.PRO),
             model.primaryTabs
         )
+        assertEquals(listOf(SharedAppToolAction.AI_SETTINGS), model.primaryActions)
         assertEquals(SharedAppTab.LIBRARY, model.selectedPrimaryTab)
-        assertTrue(SharedAppToolAction.IMPORT_FILES in model.toolActions)
         assertTrue(SharedAppToolAction.SETTINGS in model.toolActions)
-        assertTrue(SharedAppToolAction.IMPORT_FOLDER in model.toolActions)
-        assertTrue(SharedAppToolAction.SYNC in model.toolActions)
         assertTrue(SharedAppToolAction.APP_THEME in model.toolActions)
-        assertTrue(SharedAppToolAction.PRO in model.toolActions)
         assertTrue(SharedAppToolAction.AI_SETTINGS in model.toolActions)
         assertTrue(SharedAppToolAction.CUSTOM_FONTS in model.toolActions)
         assertTrue(SharedAppToolAction.HELP_FEEDBACK in model.toolActions)
         assertTrue(SharedAppToolAction.SUPPORT in model.toolActions)
         assertTrue(SharedAppToolAction.ABOUT in model.toolActions)
-        assertTrue(SharedAppToolAction.TABS_TOGGLE in model.toolActions)
+        assertFalse(SharedAppToolAction.IMPORT_FILES in model.toolActions)
+        assertFalse(SharedAppToolAction.IMPORT_FOLDER in model.toolActions)
+        assertFalse(SharedAppToolAction.SYNC in model.toolActions)
+        assertFalse(SharedAppToolAction.PRO in model.toolActions)
+        assertFalse(SharedAppToolAction.TABS_TOGGLE in model.toolActions)
         assertTrue(model.showPrimaryNavigation)
+
+        assertEquals(
+            listOf(
+                SharedAppMoreGroup.PREFERENCES,
+                SharedAppMoreGroup.HELP
+            ),
+            model.moreSections.map { it.group }
+        )
+
+        val accountModel = sharedAppShellModel(SharedAppTab.PRO, aiSettingsAvailable = true)
+        assertEquals(SharedAppTab.PRO, accountModel.selectedPrimaryTab)
 
         val withoutAi = sharedAppShellModel(SharedAppTab.SHELVES, aiSettingsAvailable = false)
         assertEquals(SharedAppTab.LIBRARY, withoutAi.selectedPrimaryTab)
+        assertEquals(emptyList(), withoutAi.primaryActions)
         assertFalse(SharedAppToolAction.AI_SETTINGS in withoutAi.toolActions)
+
+        val byokModel = sharedAppShellModel(
+            selectedTab = SharedAppTab.LIBRARY,
+            aiSettingsAvailable = true,
+            featurePolicy = SharedFeaturePolicy.OssOnline
+        )
+        assertEquals(emptyList(), byokModel.primaryActions)
+    }
+
+    @Test
+    fun `shell model groups more menu preferences and help only`() {
+        val model = sharedAppShellModel(
+            selectedTab = SharedAppTab.LIBRARY,
+            aiSettingsAvailable = true
+        )
+
+        assertFalse(model.moreSections.any { it.group == SharedAppMoreGroup.LIBRARY })
+        assertFalse(model.moreSections.any { it.group == SharedAppMoreGroup.ACCOUNT })
+        assertEquals(
+            listOf(
+                SharedAppToolAction.SETTINGS,
+                SharedAppToolAction.APP_THEME,
+                SharedAppToolAction.AI_SETTINGS,
+                SharedAppToolAction.CUSTOM_FONTS
+            ),
+            model.moreSections.single { it.group == SharedAppMoreGroup.PREFERENCES }.actions
+        )
+        assertEquals(
+            listOf(
+                SharedAppToolAction.HELP_FEEDBACK,
+                SharedAppToolAction.SUPPORT,
+                SharedAppToolAction.ABOUT
+            ),
+            model.moreSections.single { it.group == SharedAppMoreGroup.HELP }.actions
+        )
+
+        val legacyActions = sharedAppMoreSections(
+            listOf(
+                SharedAppToolAction.IMPORT_FILES,
+                SharedAppToolAction.PRO,
+                SharedAppToolAction.SETTINGS,
+                SharedAppToolAction.TABS_TOGGLE,
+                SharedAppToolAction.ABOUT
+            )
+        )
+        assertEquals(
+            listOf(SharedAppMoreGroup.PREFERENCES, SharedAppMoreGroup.HELP),
+            legacyActions.map { it.group }
+        )
+        assertEquals(
+            listOf(SharedAppToolAction.SETTINGS),
+            legacyActions.single { it.group == SharedAppMoreGroup.PREFERENCES }.actions
+        )
     }
 
     @Test
@@ -304,15 +415,66 @@ class NonReaderLayoutModelsTest {
         )
 
         assertEquals(listOf(SharedAppTab.LIBRARY), model.primaryTabs)
+        assertEquals(emptyList(), model.primaryActions)
         assertEquals(SharedAppTab.LIBRARY, model.selectedPrimaryTab)
-        assertFalse(SharedAppToolAction.PRO in model.toolActions)
         assertFalse(SharedAppToolAction.AI_SETTINGS in model.toolActions)
         assertFalse(SharedAppToolAction.HELP_FEEDBACK in model.toolActions)
         assertFalse(SharedAppToolAction.SUPPORT in model.toolActions)
+        assertFalse(SharedAppToolAction.PRO in model.toolActions)
+        assertFalse(model.moreSections.any { it.group == SharedAppMoreGroup.ACCOUNT })
+        assertFalse(model.moreSections.any { it.group == SharedAppMoreGroup.LIBRARY })
+        assertFalse(model.moreSections.any { it.group == SharedAppMoreGroup.HELP && SharedAppToolAction.SUPPORT in it.actions })
         assertTrue(SharedAppToolAction.SETTINGS in model.toolActions)
         assertTrue(SharedAppToolAction.CUSTOM_FONTS in model.toolActions)
         assertTrue(SharedAppToolAction.ABOUT in model.toolActions)
         assertTrue(model.showPrimaryNavigation)
+    }
+
+    @Test
+    fun `sidebar sync toggle is visible only for signed in account builds and follows pro gating`() {
+        assertEquals(
+            SharedSidebarSyncToggleModel(visible = false, enabled = false, checked = false),
+            sharedSidebarSyncToggleModel(
+                isSignedIn = false,
+                accountAvailable = true,
+                syncAvailable = true,
+                isProUser = true,
+                isSyncEnabled = true
+            )
+        )
+
+        assertEquals(
+            SharedSidebarSyncToggleModel(visible = true, enabled = true, checked = true),
+            sharedSidebarSyncToggleModel(
+                isSignedIn = true,
+                accountAvailable = true,
+                syncAvailable = true,
+                isProUser = true,
+                isSyncEnabled = true
+            )
+        )
+
+        assertEquals(
+            SharedSidebarSyncToggleModel(visible = true, enabled = false, checked = true),
+            sharedSidebarSyncToggleModel(
+                isSignedIn = true,
+                accountAvailable = true,
+                syncAvailable = true,
+                isProUser = false,
+                isSyncEnabled = true
+            )
+        )
+
+        assertFalse(
+            sharedSidebarSyncToggleModel(
+                isSignedIn = true,
+                accountAvailable = false,
+                syncAvailable = true,
+                isProUser = true,
+                isSyncEnabled = true,
+                featurePolicy = SharedFeaturePolicy.OssOffline
+            ).visible
+        )
     }
 
     @Test

@@ -1,6 +1,8 @@
 package com.aryan.reader.desktop
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
@@ -37,6 +39,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -74,7 +77,6 @@ import com.aryan.reader.shared.PdfDisplayMode
 import com.aryan.reader.shared.ReaderAiByokSettings
 import com.aryan.reader.shared.ReaderAiFeature
 import com.aryan.reader.shared.ReaderAiResultState
-import com.aryan.reader.shared.ReaderAutoScrollState
 import com.aryan.reader.shared.ReaderCloudTtsState
 import com.aryan.reader.shared.ReaderExtrasState
 import com.aryan.reader.shared.ReaderExternalLookupAction
@@ -83,6 +85,7 @@ import com.aryan.reader.shared.ReaderTtsPlanner
 import com.aryan.reader.shared.ReaderTtsProgress
 import com.aryan.reader.shared.ReaderTtsReadScope
 import com.aryan.reader.shared.ReaderTtsReplacementPreferences
+import com.aryan.reader.shared.ReaderTheme
 import com.aryan.reader.shared.SaveMode
 import com.aryan.reader.shared.SearchHighlightMode
 import com.aryan.reader.shared.SharedFeaturePolicy
@@ -97,7 +100,6 @@ import com.aryan.reader.shared.pdf.PdfSpreadLayout
 import com.aryan.reader.shared.pdf.PdfVisiblePageLayout
 import com.aryan.reader.shared.pdf.SharedPdfAnnotation
 import com.aryan.reader.shared.pdf.SharedPdfAnnotationDefaults
-import com.aryan.reader.shared.pdf.SharedPdfAndroidHighlightColors
 import com.aryan.reader.shared.pdf.SharedPdfEmbeddedAnnotation
 import com.aryan.reader.shared.pdf.SharedPdfHighlighterPalette
 import com.aryan.reader.shared.pdf.SharedPdfJumpHistory
@@ -122,6 +124,7 @@ import com.aryan.reader.shared.pdf.withSharedPdfTextStyle
 import com.aryan.reader.shared.pdf.withStyle
 import com.aryan.reader.shared.pdf.withText
 import com.aryan.reader.shared.reader.ReaderSettings
+import com.aryan.reader.shared.readerCloudTtsControlsModel
 import com.aryan.reader.shared.reduce
 import com.aryan.reader.shared.ui.ReaderWorkspaceFileActionState
 import com.aryan.reader.shared.ui.ReaderWorkspaceShell
@@ -129,16 +132,19 @@ import com.aryan.reader.shared.ui.LocalSharedStringResolver
 import com.aryan.reader.shared.ui.SharedPdfAnnotationOverlay
 import com.aryan.reader.shared.ui.SharedPdfEmbeddedAnnotationOverlay
 import com.aryan.reader.shared.ui.SharedPdfInlineTextEditorOverlay
+import com.aryan.reader.shared.ui.SharedPdfInteractionDock
 import com.aryan.reader.shared.ui.SharedPdfPageNumberOverlay
 import com.aryan.reader.shared.ui.SharedPdfRichTextHiddenInput
 import com.aryan.reader.shared.ui.SharedPdfRichTextLayer
 import com.aryan.reader.shared.ui.SharedPdfTextBoxEditorOverlay
 import com.aryan.reader.shared.ui.SharedPdfVerticalScrollbar
+import com.aryan.reader.shared.ui.SharedReaderTtsOverlayControls
 import com.aryan.reader.shared.ui.pdfReaderWorkspaceModel
 import com.aryan.reader.shared.ui.readerString
 import com.aryan.reader.shared.ui.sharedPdfEmbeddedHitTest
 import com.aryan.reader.shared.ui.sharedPdfHitTest
 import com.aryan.reader.shared.ui.toSharedPdfPoint
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -153,6 +159,35 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+private val DesktopPdfReaderFullscreenFocusRetryDelaysMillis = longArrayOf(80L, 120L, 160L, 240L)
+private const val DesktopPdfPaginationPageTurnAnimationMillis = 140
+
+private data class DesktopPdfPaginatedPageDisplay(
+    val pageIndex: Int,
+    val render: DesktopPdfPageRender
+)
+
+private data class DesktopPdfPendingPaginatedScrollRestore(
+    val requestId: Int,
+    val pageIndex: Int,
+    val zoom: Float,
+    val horizontalScroll: Int,
+    val verticalScroll: Int
+)
+
+internal fun desktopPdfInitialPageIndex(
+    requestedPageIndex: Int,
+    pageCount: Int,
+    displayMode: PdfDisplayMode,
+    settings: ReaderSettings
+): Int {
+    val clampedPageIndex = requestedPageIndex.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
+    return if (displayMode == PdfDisplayMode.PAGINATION) {
+        PdfSpreadLayout.normalizePageIndex(clampedPageIndex, pageCount, settings)
+    } else {
+        clampedPageIndex
+    }
+}
 
 @Composable
 internal fun PdfReaderScreen(
@@ -162,10 +197,13 @@ internal fun PdfReaderScreen(
     initialReaderSettings: ReaderSettings? = null,
     onReturnToLibrary: (() -> Unit)? = null,
     onFullscreenChange: (Boolean) -> Unit = {},
+    appThemeControls: (@Composable () -> Unit)? = null,
     onPageStateChange: (pageIndex: Int, progress: Float, viewport: SharedPdfReaderViewport) -> Unit,
     onReaderSettingsChange: (ReaderSettings) -> Unit = {},
     pdfHighlighterPalette: SharedPdfHighlighterPalette = SharedPdfHighlighterPalette(),
     onPdfHighlighterPaletteChange: (SharedPdfHighlighterPalette) -> Unit = {},
+    customReaderThemes: List<ReaderTheme> = emptyList(),
+    onCustomReaderThemesChange: (List<ReaderTheme>) -> Unit = {},
     customTextureIds: List<String> = emptyList(),
     onImportTexture: ((ReaderSettings) -> ReaderSettings?)? = null,
     onLocalSidecarsChanged: () -> Unit = {},
@@ -179,6 +217,7 @@ internal fun PdfReaderScreen(
     showPaidCredits: Boolean = false,
     onAiByokSettingsChange: (ReaderAiByokSettings) -> Unit = {},
     featurePolicy: SharedFeaturePolicy = SharedFeaturePolicy.Standard,
+    cloudTtsControlsAvailable: Boolean = true,
     onReaderAiEntitlementRequired: (ReaderAiFeature, String) -> Boolean = { _, _ -> false },
     onCloudTtsEntitlementRequired: () -> Boolean = { false },
     onPaidFeatureError: (String?) -> Unit = {},
@@ -192,20 +231,52 @@ internal fun PdfReaderScreen(
         return stringResolver.string(name, fallback, *args)
     }
     val zoomSpec = remember { DesktopPdfZoomSpec }
-    val restoredInitialViewport = remember(documentHandleId, initialViewport) {
-        initialViewport?.sanitized(document.pageCount, zoomSpec)
+    val initialDesktopPdfReaderSettings = remember(documentHandleId, initialReaderSettings) {
+        initialReaderSettings.toDesktopPdfReaderSettings()
+    }
+    val initialPdfDisplayMode = initialDesktopPdfReaderSettings.toDesktopPdfDisplayMode()
+    val restoredInitialViewport = remember(
+        documentHandleId,
+        initialViewport,
+        initialDesktopPdfReaderSettings,
+        initialPdfDisplayMode
+    ) {
+        initialViewport?.sanitized(document.pageCount, zoomSpec)?.let { viewport ->
+            viewport.copy(
+                pageIndex = desktopPdfInitialPageIndex(
+                    requestedPageIndex = viewport.pageIndex,
+                    pageCount = document.pageCount,
+                    displayMode = initialPdfDisplayMode,
+                    settings = initialDesktopPdfReaderSettings
+                )
+            )
+        }
+    }
+    val initialPdfPageIndex = remember(
+        documentHandleId,
+        initialPageIndex,
+        restoredInitialViewport,
+        initialPdfDisplayMode,
+        initialDesktopPdfReaderSettings
+    ) {
+        desktopPdfInitialPageIndex(
+            requestedPageIndex = restoredInitialViewport?.pageIndex ?: initialPageIndex,
+            pageCount = document.pageCount,
+            displayMode = initialPdfDisplayMode,
+            settings = initialDesktopPdfReaderSettings
+        )
     }
     var pdfReaderSettings by remember(documentHandleId) {
-        mutableStateOf(initialReaderSettings.toDesktopPdfReaderSettings())
+        mutableStateOf(initialDesktopPdfReaderSettings)
     }
     var pdfState by remember(documentHandleId) {
         mutableStateOf(
             SharedPdfReaderState.initial(
                 pageCount = document.pageCount,
-                initialPageIndex = restoredInitialViewport?.pageIndex ?: initialPageIndex,
+                initialPageIndex = initialPdfPageIndex,
                 zoomSpec = zoomSpec
             ).copy(
-                displayMode = restoredInitialViewport?.displayMode ?: DesktopDefaultPdfDisplayMode,
+                displayMode = initialPdfDisplayMode,
                 zoom = restoredInitialViewport?.zoom ?: zoomSpec.clamp(zoomSpec.default)
             )
         )
@@ -219,11 +290,19 @@ internal fun PdfReaderScreen(
     val zoomAnchorJob = remember(documentHandleId) { AtomicReference<Job?>(null) }
     val zoomCommitJob = remember(documentHandleId) { AtomicReference<Job?>(null) }
     var pdfZoomPreview by remember(documentHandleId) { mutableStateOf<DesktopPdfZoomPreview?>(null) }
+    var pdfZoomSettleSequence by remember(documentHandleId) { mutableIntStateOf(0) }
+    var pdfNavigationScrollRestoreSequence by remember(documentHandleId) { mutableIntStateOf(0) }
+    var pendingPdfNavigationScrollRestore by remember(documentHandleId) {
+        mutableStateOf<DesktopPdfPendingPaginatedScrollRestore?>(null)
+    }
     var activeTextDraft by remember(documentHandleId) { mutableStateOf<SharedPdfTextDraft?>(null) }
     var textStyleConfig by remember(documentHandleId) { mutableStateOf(SharedPdfTextStyleConfig()) }
     var pageCanvasSize by remember(documentHandleId) { mutableStateOf(IntSize.Zero) }
     var pdfZoomViewportRootOffset by remember(documentHandleId) { mutableStateOf(Offset.Zero) }
+    var pdfZoomViewportSize by remember(documentHandleId) { mutableStateOf(IntSize.Zero) }
     var paginatedPageRootOffset by remember(documentHandleId) { mutableStateOf(Offset.Zero) }
+    val paginatedPageRootOffsets = remember(documentHandleId) { mutableStateMapOf<Int, Offset>() }
+    val paginatedPageCanvasSizes = remember(documentHandleId) { mutableStateMapOf<Int, IntSize>() }
     val verticalPageRootOffsets = remember(documentHandleId) { mutableStateMapOf<Int, Offset>() }
     val paginatedRenderCache = remember(documentHandleId) { mutableStateMapOf<Int, DesktopPdfCachedPageRender>() }
     var activeStroke by remember(documentHandleId, pdfState.pageIndex) { mutableStateOf<List<PdfPagePoint>>(emptyList()) }
@@ -246,7 +325,7 @@ internal fun PdfReaderScreen(
         mutableStateOf(
             ReaderExtrasState(
                 cloudTts = ReaderCloudTtsState(
-                    isAvailable = aiByokSettings.isCloudTtsAvailable,
+                    isAvailable = cloudTtsControlsAvailable && aiByokSettings.isCloudTtsAvailable,
                     cacheSummary = ttsAdapter.cacheSummary(document.title, aiByokSettings.sanitized().ttsSpeakerId)
                 )
             )
@@ -258,7 +337,7 @@ internal fun PdfReaderScreen(
     var dismissedPdfAiResultRequestId by remember(documentHandleId) { mutableStateOf<Long?>(null) }
     var pdfHubSummaryResult by remember(documentHandleId) { mutableStateOf<SummarizationResult?>(null) }
     var isPdfHubSummaryLoading by remember(documentHandleId) { mutableStateOf(false) }
-    var showPdfCloudTtsSettings by remember(documentHandleId) { mutableStateOf(false) }
+    var isPdfTtsOverlayCollapsed by remember(documentHandleId) { mutableStateOf(false) }
     val annotationFile = remember(documentHandleId) { desktopPdfAnnotationFile(document.path) }
     val bookmarkFile = remember(documentHandleId) { desktopPdfBookmarkFile(document.path) }
     val richTextFile = remember(documentHandleId) { desktopPdfRichTextFile(document.path) }
@@ -330,15 +409,40 @@ internal fun PdfReaderScreen(
             ?: 0
     )
     val pdfReaderFocusRequester = remember(documentHandleId) { FocusRequester() }
+    var pdfReaderFocusRestoreRequest by remember(documentHandleId) { mutableIntStateOf(0) }
     val currentTextSelection by rememberUpdatedState(textSelection)
     val currentPdfAnnotations by rememberUpdatedState(pdfState.annotations)
     val currentPdfPageIndex by rememberUpdatedState(pdfState.pageIndex)
     val currentPdfScale by rememberUpdatedState(pdfState.zoom)
     val currentPdfDisplayMode by rememberUpdatedState(pdfState.displayMode)
+    val pdfSelectionSheetActive = pdfState.selectedAnnotationId?.let { selectedId ->
+        pdfState.annotations.any { it.id == selectedId && it.isDesktopTextSelectionHighlight }
+    } == true
+    val shouldRestorePdfReaderFocus =
+        !pdfState.isSearchActive &&
+            !pdfSelectionSheetActive &&
+            externalLinkDialogUrl == null &&
+            !pdfExtrasState.aiResult.hasContent &&
+            activeTextDraft == null &&
+            !isRichTextMode &&
+            (textSelection == null || selectionMenuOffset == null)
+    val currentShouldRestorePdfReaderFocus by rememberUpdatedState(shouldRestorePdfReaderFocus)
+    fun requestPdfReaderFocusRestore() {
+        pdfReaderFocusRestoreRequest += 1
+    }
 
     LaunchedEffect(isFullscreen, documentHandleId) {
-        repeat(if (isFullscreen) 4 else 1) { attempt ->
-            delay(if (attempt == 0) 80L else 120L)
+        for (delayMillis in DesktopPdfReaderFullscreenFocusRetryDelaysMillis) {
+            delay(delayMillis)
+            if (currentShouldRestorePdfReaderFocus) {
+                runCatching { pdfReaderFocusRequester.requestFocus() }
+            }
+        }
+    }
+
+    LaunchedEffect(shouldRestorePdfReaderFocus, documentHandleId) {
+        if (shouldRestorePdfReaderFocus) {
+            delay(120L)
             runCatching { pdfReaderFocusRequester.requestFocus() }
         }
     }
@@ -357,7 +461,17 @@ internal fun PdfReaderScreen(
 
     fun dispatchPdf(action: SharedPdfReaderAction) {
         val previousPage = pdfState.pageIndex
+        val previousAnnotationIds = pdfState.annotations.mapTo(mutableSetOf()) { it.id }
         val next = pdfState.reduce(action, zoomSpec)
+        val nextAnnotationIds = next.annotations.mapTo(mutableSetOf()) { it.id }
+        val removedAnnotationIds = previousAnnotationIds - nextAnnotationIds
+        if (removedAnnotationIds.isNotEmpty()) {
+            DesktopCloudSidecarSync.recordAnnotationDeletions(
+                documentPath = document.path,
+                logBookId = documentHandleId.toString(),
+                annotationIds = removedAnnotationIds
+            )
+        }
         pdfState = next
         if (next.pageIndex != previousPage) {
             clearPdfInteractionState()
@@ -503,19 +617,16 @@ internal fun PdfReaderScreen(
         if (previousTool != tool) {
             dispatchPdf(SharedPdfReaderAction.ToolSelected(tool))
         }
-        if (tool.isDesktopHighlighter && previousTool != tool) {
-            pdfHighlighterPalette.sanitized().colors.firstOrNull()?.let { colorArgb ->
-                dispatchPdf(SharedPdfReaderAction.ColorSelected(colorArgb))
-            }
-        }
     }
 
     val pageIndex = pdfState.pageIndex
     val scale = pdfState.zoom
     val displayMode = pdfState.displayMode
+    val rightToLeftPdfPaginationActive = displayMode == PdfDisplayMode.PAGINATION &&
+        pdfReaderSettings.rightToLeftPagination
     val isPdfTwoPageSpread = displayMode == PdfDisplayMode.PAGINATION &&
         PdfSpreadLayout.isTwoPageSpreadEnabled(pdfReaderSettings)
-    val paginatedVisiblePageIndices: List<Int> = remember(
+    val paginatedSpreadPageIndices: List<Int> = remember(
         pageIndex,
         document.pageCount,
         displayMode,
@@ -527,6 +638,12 @@ internal fun PdfReaderScreen(
         } else {
             listOf(pageIndex.coerceIn(0, (document.pageCount - 1).coerceAtLeast(0)))
         }
+    }
+    val paginatedVisiblePageIndices = remember(
+        paginatedSpreadPageIndices,
+        rightToLeftPdfPaginationActive
+    ) {
+        if (rightToLeftPdfPaginationActive) paginatedSpreadPageIndices.asReversed() else paginatedSpreadPageIndices
     }
     val pdfPageLabel = desktopPdfPageLabel(pageIndex, document.pageCount, displayMode, pdfReaderSettings)
     val pdfPageScrubPreviewLabel = pageScrubPreview?.let {
@@ -569,6 +686,20 @@ internal fun PdfReaderScreen(
         }
     }
 
+    LaunchedEffect(documentHandleId, displayMode) {
+        if (!DesktopDiagnosticsEnabled) return@LaunchedEffect
+        snapshotFlow {
+            "mode=$displayMode page=${currentPdfPageIndex + 1} scale=${currentPdfScale.formatLogFloat()} " +
+                "preview=${pdfZoomPreview != null} h=${pageHorizontalScrollState.value} " +
+                "v=${pageVerticalScrollState.value} list=${verticalListState.firstVisibleItemIndex}:" +
+                verticalListState.firstVisibleItemScrollOffset
+        }
+            .distinctUntilChanged()
+            .collect { summary ->
+                logPdfZoomSettle { "scroll_state seq=$pdfZoomSettleSequence $summary" }
+            }
+    }
+
     fun verticalZoomAnchorItem(anchor: Offset) = verticalListState.layoutInfo.visibleItemsInfo
         .firstOrNull { item ->
             anchor.y >= item.offset.toFloat() && anchor.y <= (item.offset + item.size).toFloat()
@@ -581,19 +712,61 @@ internal fun PdfReaderScreen(
             }
         }
 
-    LaunchedEffect(scale, displayMode, pageIndex) {
+    fun paginatedZoomPageRoot(page: Int?): Offset? {
+        if (page == null) return null
+        return paginatedPageRootOffsets[page]
+            ?: paginatedPageRootOffset.takeIf { page == currentPdfPageIndex }
+    }
+
+    fun paginatedZoomAnchorPageIndex(anchor: Offset?): Int {
+        val activePageIndex = currentPdfPageIndex
+        if (!isPdfTwoPageSpread) return activePageIndex
+        val rootOffsets = paginatedPageRootOffsets.toMutableMap()
+        paginatedSpreadPageIndices.firstOrNull()?.let { firstSpreadPage ->
+            rootOffsets.putIfAbsent(firstSpreadPage, paginatedPageRootOffset)
+        }
+        val pageSizes = paginatedPageCanvasSizes.toMutableMap()
+        if (pageCanvasSize.width > 0 && pageCanvasSize.height > 0) {
+            pageSizes.putIfAbsent(activePageIndex, pageCanvasSize)
+        }
+        return desktopPdfSpreadZoomAnchorPageIndex(
+            viewportRootOffset = pdfZoomViewportRootOffset,
+            anchor = anchor,
+            visiblePageIndices = paginatedVisiblePageIndices,
+            pageRootOffsets = rootOffsets,
+            pageSizes = pageSizes,
+            fallbackPageIndex = activePageIndex
+        )
+    }
+
+    LaunchedEffect(scale, displayMode, pageIndex, isPdfTwoPageSpread, paginatedSpreadPageIndices) {
         val preview = pdfZoomPreview ?: return@LaunchedEffect
+        val paginationPreviewPageVisible = if (isPdfTwoPageSpread) {
+            preview.pageIndex in paginatedSpreadPageIndices
+        } else {
+            preview.pageIndex == pageIndex
+        }
         if (
             preview.displayMode != displayMode ||
-            (preview.pageIndex != pageIndex && displayMode == PdfDisplayMode.PAGINATION) ||
-            abs(preview.baseZoom - scale) > 0.0001f
+            (!paginationPreviewPageVisible && displayMode == PdfDisplayMode.PAGINATION) ||
+            !desktopPdfZoomPreviewMatchesScale(preview, scale)
         ) {
+            logPdfZoomSettle {
+                "preview_cancel seq=$pdfZoomSettleSequence reason=state_mismatch mode=$displayMode " +
+                    "page=${pageIndex + 1} scale=${scale.formatLogFloat()} previewMode=${preview.displayMode} " +
+                    "previewPage=${preview.pageIndex?.plus(1) ?: "none"} base=${preview.baseZoom.formatLogFloat()} " +
+                    "zoom=${preview.zoom.formatLogFloat()}"
+            }
             pdfZoomPreview = null
             zoomCommitJob.getAndSet(null)?.cancel()
         }
     }
 
     fun applyAnchoredPdfZoom(oldZoom: Float, newZoom: Float, anchor: Offset?) {
+        if (pdfZoomSettleSequence == 0) {
+            pdfZoomSettleSequence = 1
+        }
+        val settleSequence = pdfZoomSettleSequence
         val activePageIndex = currentPdfPageIndex
         val activeDisplayMode = currentPdfDisplayMode
         logPdfZoomPerf {
@@ -603,14 +776,83 @@ internal fun PdfReaderScreen(
                 "renderScale=${renderedPageScale?.formatLogFloat() ?: "none"} " +
                 "renderJobActive=${renderJob?.isActive == true}"
         }
-        pdfZoomPreview = null
-        val viewportRootOffsetAtZoomStart = pdfZoomViewportRootOffset
-        val pageRootOffsetAtZoomStart = paginatedPageRootOffset
-        val targetHorizontalScroll = anchor?.let {
+        val committedPreview = pdfZoomPreview
+        val viewportRootOffsetAtZoomStart = committedPreview?.viewportRootOffset ?: pdfZoomViewportRootOffset
+        val committedPreviewPageIndex = committedPreview?.pageIndex ?: activePageIndex
+        val pageRootOffsetAtZoomStart = committedPreview?.pageRootOffset
+            ?: paginatedZoomPageRoot(committedPreviewPageIndex)
+            ?: paginatedPageRootOffset
+        val pageRootOffsetAtCommitStart = paginatedZoomPageRoot(committedPreviewPageIndex)
+            ?: paginatedPageRootOffset
+        logPdfZoomSettle {
+            "commit_start seq=$settleSequence mode=$activeDisplayMode page=${activePageIndex + 1} " +
+                "old=${oldZoom.formatLogFloat()} new=${newZoom.formatLogFloat()} anchor=${anchor.formatLogOffset()} " +
+                "preview=${committedPreview != null} previewPage=${committedPreview?.pageIndex?.plus(1) ?: "none"} " +
+                "previewBase=${committedPreview?.baseZoom?.formatLogFloat() ?: "none"} " +
+                "previewZoom=${committedPreview?.zoom?.formatLogFloat() ?: "none"} " +
+                "viewportStart=${viewportRootOffsetAtZoomStart.formatLogOffset()} " +
+                "pageStart=${pageRootOffsetAtZoomStart.formatLogOffset()} " +
+                "pageNow=${pageRootOffsetAtCommitStart.formatLogOffset()} h=${pageHorizontalScrollState.value} " +
+                "v=${pageVerticalScrollState.value} list=${verticalListState.firstVisibleItemIndex}:" +
+                "${verticalListState.firstVisibleItemScrollOffset} renderPage=${renderedPageIndex?.plus(1) ?: "none"} " +
+                "renderScale=${renderedPageScale?.formatLogFloat() ?: "none"} renderJob=${renderJob?.isActive == true}"
+        }
+        val rawTargetHorizontalScroll = anchor?.let {
             desktopPdfAnchoredScrollTarget(pageHorizontalScrollState.value, it.x, oldZoom, newZoom)
         }
-        val targetVerticalScroll = anchor?.let {
+        val rawTargetVerticalScroll = anchor?.let {
             desktopPdfAnchoredScrollTarget(pageVerticalScrollState.value, it.y, oldZoom, newZoom)
+        }
+        val paginationCommitPrediction: DesktopPdfLayoutScrollPrediction? = if (activeDisplayMode == PdfDisplayMode.PAGINATION) {
+            val predictedScale = zoomSpec.clamp(newZoom)
+            if (isPdfTwoPageSpread) {
+                val predictedSizes = paginatedVisiblePageIndices.mapNotNull { visiblePageIndex ->
+                    document.pageSizes.getOrNull(visiblePageIndex)?.let { pageSize ->
+                        visiblePageIndex to IntSize(
+                            width = (pageSize.width * predictedScale).roundToInt().coerceAtLeast(1),
+                            height = (pageSize.height * predictedScale).roundToInt().coerceAtLeast(1)
+                        )
+                    }
+                }.toMap()
+                desktopPdfSpreadLayoutPrediction(
+                    viewportRootOffset = pdfZoomViewportRootOffset,
+                    viewportSize = pdfZoomViewportSize,
+                    visiblePageIndices = paginatedVisiblePageIndices,
+                    pageCanvasSizes = predictedSizes,
+                    horizontalScroll = rawTargetHorizontalScroll ?: pageHorizontalScrollState.value,
+                    verticalScroll = rawTargetVerticalScroll ?: pageVerticalScrollState.value,
+                    paddingPx = with(density) { 24.dp.toPx() },
+                    pageGapPx = with(density) {
+                        desktopPdfSpreadPageGapDp(pdfReaderSettings.pdfVerticalPageGapVisible).toPx()
+                    }
+                )
+            } else {
+                document.pageSizes.getOrNull(committedPreviewPageIndex)?.let { pageSize ->
+                    desktopPdfSinglePageLayoutPrediction(
+                        viewportRootOffset = pdfZoomViewportRootOffset,
+                        viewportSize = pdfZoomViewportSize,
+                        pageCanvasSize = IntSize(
+                            width = (pageSize.width * predictedScale).roundToInt().coerceAtLeast(1),
+                            height = (pageSize.height * predictedScale).roundToInt().coerceAtLeast(1)
+                        ),
+                        horizontalScroll = rawTargetHorizontalScroll ?: pageHorizontalScrollState.value,
+                        verticalScroll = rawTargetVerticalScroll ?: pageVerticalScrollState.value,
+                        paddingPx = with(density) { 24.dp.toPx() }
+                    )
+                }
+            }
+        } else {
+            null
+        }
+        val targetHorizontalScroll = rawTargetHorizontalScroll?.let { target ->
+            paginationCommitPrediction?.maxHorizontalScroll?.let { maxScroll ->
+                target.coerceIn(0, maxScroll)
+            } ?: target
+        }
+        val targetVerticalScroll = rawTargetVerticalScroll?.let { target ->
+            paginationCommitPrediction?.maxVerticalScroll?.let { maxScroll ->
+                target.coerceIn(0, maxScroll)
+            } ?: target
         }
         val targetVerticalItem = if (activeDisplayMode == PdfDisplayMode.VERTICAL_SCROLL && anchor != null) {
             verticalZoomAnchorItem(anchor)
@@ -621,38 +863,118 @@ internal fun PdfReaderScreen(
                         oldZoom = oldZoom,
                         newZoom = newZoom
                     )
-                    val pageRootOffset = verticalPageRootOffsets[item.index]
+                    val pageRootOffset = if (committedPreview?.pageIndex == item.index) {
+                        committedPreview.pageRootOffset
+                    } else {
+                        verticalPageRootOffsets[item.index]
+                    }
                     Triple(item.index, fallbackOffset, pageRootOffset)
                 }
         } else {
             null
         }
+        logPdfZoomSettle {
+            "commit_targets seq=$settleSequence mode=$activeDisplayMode targetH=${targetHorizontalScroll ?: "none"} " +
+                "targetV=${targetVerticalScroll ?: "none"} rawH=${rawTargetHorizontalScroll ?: "none"} " +
+                "rawV=${rawTargetVerticalScroll ?: "none"} predictedMaxH=${paginationCommitPrediction?.maxHorizontalScroll ?: "none"} " +
+                "predictedMaxV=${paginationCommitPrediction?.maxVerticalScroll ?: "none"} " +
+                "targetItem=${targetVerticalItem?.first?.plus(1) ?: "none"} " +
+                "targetItemOffset=${targetVerticalItem?.second ?: "none"} targetItemRoot=${targetVerticalItem?.third.formatLogOffset()}"
+        }
+        var committedPreviewForClear = committedPreview
+        committedPreview?.let { preview ->
+            val previewWithCommitTargets = preview.copy(
+                commitTargetHorizontalScroll = targetHorizontalScroll,
+                commitTargetVerticalScroll = targetVerticalScroll.takeIf {
+                    activeDisplayMode == PdfDisplayMode.PAGINATION
+                }
+            )
+            if (pdfZoomPreview == preview) {
+                pdfZoomPreview = previewWithCommitTargets
+                committedPreviewForClear = previewWithCommitTargets
+                logPdfZoomSettle {
+                    "preview_commit_targets seq=$settleSequence targetH=${targetHorizontalScroll ?: "none"} " +
+                        "targetV=${targetVerticalScroll ?: "none"}"
+                }
+            }
+        }
         dispatchPdf(SharedPdfReaderAction.ZoomChanged(newZoom))
+        fun clearCommittedPreview() {
+            val matchesCommittedPreview = pdfZoomPreview == committedPreviewForClear
+            logPdfZoomSettle {
+                "preview_clear seq=$settleSequence match=$matchesCommittedPreview " +
+                    "current=${pdfZoomPreview != null} committed=${committedPreview != null}"
+            }
+            if (matchesCommittedPreview) {
+                pdfZoomPreview = null
+            }
+        }
+        logPdfZoomSettle {
+            "zoom_dispatched seq=$settleSequence new=${newZoom.formatLogFloat()} h=${pageHorizontalScrollState.value} " +
+                "v=${pageVerticalScrollState.value} list=${verticalListState.firstVisibleItemIndex}:" +
+                verticalListState.firstVisibleItemScrollOffset
+        }
         if (anchor != null) {
-            val nextAnchorJob = pdfScope.launch {
-                withFrameNanos { }
+            zoomAnchorJob.getAndSet(null)?.cancel()
+            val nextAnchorJob = pdfScope.launch(start = CoroutineStart.UNDISPATCHED) {
                 when (activeDisplayMode) {
                     PdfDisplayMode.PAGINATION -> {
-                        suspend fun correctPageAnchor() {
+                        if (targetHorizontalScroll != null || targetVerticalScroll != null) {
+                            val beforeH = pageHorizontalScrollState.value
+                            val beforeV = pageVerticalScrollState.value
+                            targetHorizontalScroll?.let { pageHorizontalScrollState.scrollTo(it) }
+                            targetVerticalScroll?.let { pageVerticalScrollState.scrollTo(it) }
+                            logPdfZoomSettle {
+                                "anchor_pre_scroll seq=$settleSequence mode=pagination beforeH=$beforeH beforeV=$beforeV " +
+                                    "targetH=${targetHorizontalScroll ?: "none"} targetV=${targetVerticalScroll ?: "none"} " +
+                                    "afterH=${pageHorizontalScrollState.value} afterV=${pageVerticalScrollState.value} " +
+                                    "maxH=${pageHorizontalScrollState.maxValue} maxV=${pageVerticalScrollState.maxValue}"
+                            }
+                        }
+                        withFrameNanos { }
+                        suspend fun correctPageAnchor(pass: Int) {
+                            val beforeH = pageHorizontalScrollState.value
+                            val beforeV = pageVerticalScrollState.value
+                            val currentRoot = paginatedZoomPageRoot(committedPreviewPageIndex)
+                                ?: paginatedPageRootOffset
                             val pageDelta = desktopPdfAnchoredPageScrollDelta(
                                 viewportRootOffset = viewportRootOffsetAtZoomStart,
                                 oldPageRootOffset = pageRootOffsetAtZoomStart,
-                                currentPageRootOffset = paginatedPageRootOffset,
+                                currentPageRootOffset = currentRoot,
                                 anchor = anchor,
                                 oldZoom = oldZoom,
                                 newZoom = newZoom
                             )
-                            if (pageDelta != null) {
-                                if (abs(pageDelta.x) > 1) {
+                            val reachableDelta = pageDelta?.let {
+                                desktopPdfReachableScrollDelta(
+                                    requestedDelta = it,
+                                    scrollBounds = DesktopPdfZoomScrollBounds(
+                                        currentHorizontalScroll = pageHorizontalScrollState.value,
+                                        maxHorizontalScroll = pageHorizontalScrollState.maxValue,
+                                        currentVerticalScroll = pageVerticalScrollState.value,
+                                        maxVerticalScroll = pageVerticalScrollState.maxValue
+                                    )
+                                )
+                            }
+                            logPdfZoomSettle {
+                                "anchor_pass seq=$settleSequence pass=$pass mode=pagination beforeH=$beforeH " +
+                                    "beforeV=$beforeV delta=${pageDelta.formatLogIntOffset()} " +
+                                    "reachable=${reachableDelta.formatLogIntOffset()} " +
+                                    "maxH=${pageHorizontalScrollState.maxValue} maxV=${pageVerticalScrollState.maxValue} " +
+                                    "rootStart=${pageRootOffsetAtZoomStart.formatLogOffset()} " +
+                                    "rootNow=${currentRoot.formatLogOffset()} viewport=${viewportRootOffsetAtZoomStart.formatLogOffset()}"
+                            }
+                            if (reachableDelta != null) {
+                                if (abs(reachableDelta.x) > 1) {
                                     pageHorizontalScrollState.scrollTo(
-                                        (pageHorizontalScrollState.value + pageDelta.x).coerceAtLeast(
+                                        (pageHorizontalScrollState.value + reachableDelta.x).coerceAtLeast(
                                             0
                                         )
                                     )
                                 }
-                                if (abs(pageDelta.y) > 1) {
+                                if (abs(reachableDelta.y) > 1) {
                                     pageVerticalScrollState.scrollTo(
-                                        (pageVerticalScrollState.value + pageDelta.y).coerceAtLeast(
+                                        (pageVerticalScrollState.value + reachableDelta.y).coerceAtLeast(
                                             0
                                         )
                                     )
@@ -661,14 +983,23 @@ internal fun PdfReaderScreen(
                                 pageHorizontalScrollState.scrollTo(targetHorizontalScroll)
                                 pageVerticalScrollState.scrollTo(targetVerticalScroll)
                             }
+                            logPdfZoomSettle {
+                                "anchor_pass_end seq=$settleSequence pass=$pass mode=pagination afterH=${pageHorizontalScrollState.value} " +
+                                    "afterV=${pageVerticalScrollState.value} delta=${pageDelta.formatLogIntOffset()} " +
+                                    "reachable=${reachableDelta.formatLogIntOffset()}"
+                            }
                         }
-                        correctPageAnchor()
+                        correctPageAnchor(pass = 1)
                         withFrameNanos { }
-                        correctPageAnchor()
+                        correctPageAnchor(pass = 2)
                     }
 
                     PdfDisplayMode.VERTICAL_SCROLL -> {
-                        suspend fun correctVerticalAnchor() {
+                        withFrameNanos { }
+                        suspend fun correctVerticalAnchor(pass: Int) {
+                            val beforeH = pageHorizontalScrollState.value
+                            val beforeItem = verticalListState.firstVisibleItemIndex
+                            val beforeItemOffset = verticalListState.firstVisibleItemScrollOffset
                             val oldPageRootOffset = targetVerticalItem?.third
                             val currentPageRootOffset =
                                 targetVerticalItem?.first?.let { verticalPageRootOffsets[it] }
@@ -685,6 +1016,14 @@ internal fun PdfReaderScreen(
                                 } else {
                                     null
                                 }
+                            logPdfZoomSettle {
+                                "anchor_pass seq=$settleSequence pass=$pass mode=vertical beforeH=$beforeH " +
+                                    "beforeList=$beforeItem:$beforeItemOffset delta=${pageDelta.formatLogIntOffset()} " +
+                                    "targetItem=${targetVerticalItem?.first?.plus(1) ?: "none"} " +
+                                    "oldRoot=${oldPageRootOffset.formatLogOffset()} " +
+                                    "currentRoot=${currentPageRootOffset.formatLogOffset()} " +
+                                    "viewport=${viewportRootOffsetAtZoomStart.formatLogOffset()}"
+                            }
                             if (pageDelta != null) {
                                 if (abs(pageDelta.x) > 1) {
                                     pageHorizontalScrollState.scrollTo(
@@ -702,12 +1041,29 @@ internal fun PdfReaderScreen(
                                     verticalListState.scrollToItem(itemIndex, scrollOffset)
                                 }
                             }
+                            logPdfZoomSettle {
+                                "anchor_pass_end seq=$settleSequence pass=$pass mode=vertical afterH=${pageHorizontalScrollState.value} " +
+                                    "afterList=${verticalListState.firstVisibleItemIndex}:${verticalListState.firstVisibleItemScrollOffset} " +
+                                    "delta=${pageDelta.formatLogIntOffset()}"
+                            }
                         }
-                        correctVerticalAnchor()
+                        correctVerticalAnchor(pass = 1)
                         withFrameNanos { }
-                        correctVerticalAnchor()
+                        correctVerticalAnchor(pass = 2)
                     }
                 }
+                clearCommittedPreview()
+            }
+            zoomAnchorJob.set(nextAnchorJob)
+        } else {
+            val nextAnchorJob = pdfScope.launch {
+                withFrameNanos { }
+                logPdfZoomSettle {
+                    "anchor_skip seq=$settleSequence reason=no_anchor mode=$activeDisplayMode h=${pageHorizontalScrollState.value} " +
+                        "v=${pageVerticalScrollState.value} list=${verticalListState.firstVisibleItemIndex}:" +
+                        verticalListState.firstVisibleItemScrollOffset
+                }
+                clearCommittedPreview()
             }
             zoomAnchorJob.getAndSet(nextAnchorJob)?.cancel()
         }
@@ -724,27 +1080,60 @@ internal fun PdfReaderScreen(
                 "renderScale=${renderedPageScale?.formatLogFloat() ?: "none"} " +
                 "renderJobActive=${renderJob?.isActive == true} cacheKeys=${paginatedRenderCache.keys.sorted().map { it + 1 }}"
         }
-        val existingPreview = pdfZoomPreview
+        val previewPageIndex = when (activeDisplayMode) {
+            PdfDisplayMode.PAGINATION -> paginatedZoomAnchorPageIndex(anchor)
+            PdfDisplayMode.VERTICAL_SCROLL -> anchor?.let(::verticalZoomAnchorItem)?.index ?: activePageIndex
+        }
+        val existingPreview = pdfZoomPreview?.takeIf {
+            it.displayMode == activeDisplayMode &&
+                it.pageIndex == previewPageIndex &&
+                it.baseZoom.isFinite() &&
+                it.baseZoom > 0f &&
+                abs(it.baseZoom - activeScale) <= 0.0001f
+        }
+        if (existingPreview == null && currentShouldRestorePdfReaderFocus) {
+            runCatching { pdfReaderFocusRequester.requestFocus() }
+        }
+        if (existingPreview == null) {
+            pdfZoomSettleSequence += 1
+        }
+        val settleSequence = pdfZoomSettleSequence
         val baseZoom = existingPreview
-            ?.takeIf { it.displayMode == activeDisplayMode && it.baseZoom.isFinite() && it.baseZoom > 0f }
             ?.baseZoom
             ?: oldZoom.takeIf { it.isFinite() && it > 0f }
             ?: activeScale
-        val previewPageIndex = when (activeDisplayMode) {
-            PdfDisplayMode.PAGINATION -> activePageIndex
-            PdfDisplayMode.VERTICAL_SCROLL -> anchor?.let(::verticalZoomAnchorItem)?.index ?: activePageIndex
+        val previewPageRootOffset = existingPreview?.pageRootOffset ?: when (activeDisplayMode) {
+            PdfDisplayMode.PAGINATION -> paginatedZoomPageRoot(previewPageIndex)
+            PdfDisplayMode.VERTICAL_SCROLL -> verticalPageRootOffsets[previewPageIndex]
         }
         pdfZoomPreview = DesktopPdfZoomPreview(
             baseZoom = baseZoom,
             zoom = newZoom,
             anchor = anchor,
             displayMode = activeDisplayMode,
-            pageIndex = previewPageIndex
+            pageIndex = previewPageIndex,
+            viewportRootOffset = existingPreview?.viewportRootOffset ?: pdfZoomViewportRootOffset,
+            pageRootOffset = previewPageRootOffset,
+            diagnosticSequence = settleSequence
         )
+        logPdfZoomSettle {
+            "preview_update seq=$settleSequence mode=$activeDisplayMode page=${activePageIndex + 1} " +
+                "previewPage=${previewPageIndex + 1} oldEvent=${oldZoom.formatLogFloat()} " +
+                "activeScale=${activeScale.formatLogFloat()} base=${baseZoom.formatLogFloat()} " +
+                "new=${newZoom.formatLogFloat()} anchor=${anchor.formatLogOffset()} existing=${existingPreview != null} " +
+                "viewport=${pdfZoomViewportRootOffset.formatLogOffset()} pageRoot=${previewPageRootOffset.formatLogOffset()} " +
+                "h=${pageHorizontalScrollState.value} v=${pageVerticalScrollState.value} " +
+                "list=${verticalListState.firstVisibleItemIndex}:${verticalListState.firstVisibleItemScrollOffset} " +
+                "renderPage=${renderedPageIndex?.plus(1) ?: "none"} renderScale=${renderedPageScale?.formatLogFloat() ?: "none"}"
+        }
         val nextCommitJob = pdfScope.launch {
             delay(DesktopPdfZoomCommitDebounceMillis)
             val preview = pdfZoomPreview ?: return@launch
-            pdfZoomPreview = null
+            logPdfZoomSettle {
+                "commit_debounce_fire seq=$settleSequence base=${preview.baseZoom.formatLogFloat()} " +
+                    "zoom=${preview.zoom.formatLogFloat()} page=${preview.pageIndex?.plus(1) ?: "none"} " +
+                    "anchor=${preview.anchor.formatLogOffset()}"
+            }
             applyAnchoredPdfZoom(preview.baseZoom, preview.zoom, preview.anchor)
         }
         zoomCommitJob.getAndSet(nextCommitJob)?.cancel()
@@ -758,8 +1147,43 @@ internal fun PdfReaderScreen(
     }
 
     fun cancelPendingPdfZoomPreview() {
+        logPdfZoomSettle {
+            "preview_cancel seq=$pdfZoomSettleSequence reason=explicit pending=${pdfZoomPreview != null}"
+        }
         pdfZoomPreview = null
         zoomCommitJob.getAndSet(null)?.cancel()
+    }
+
+    fun commitPendingPdfZoomPreviewForNavigation(targetPageIndex: Int) {
+        val snapshot = desktopPdfNavigationZoomSnapshot(
+            preview = pdfZoomPreview,
+            currentHorizontalScroll = pageHorizontalScrollState.value,
+            currentVerticalScroll = pageVerticalScrollState.value
+        ) ?: return
+        val committedZoom = zoomSpec.clamp(snapshot.zoom)
+        logPdfZoomSettle {
+            "preview_navigation_commit seq=$pdfZoomSettleSequence page=${pageIndex + 1} " +
+                "target=${targetPageIndex + 1} zoom=${committedZoom.formatLogFloat()} " +
+                "h=${snapshot.horizontalScroll} v=${snapshot.verticalScroll}"
+        }
+        zoomCommitJob.getAndSet(null)?.cancel()
+        zoomAnchorJob.getAndSet(null)?.cancel()
+        pdfZoomPreview = null
+        dispatchPdf(SharedPdfReaderAction.ZoomChanged(committedZoom))
+        if (displayMode == PdfDisplayMode.PAGINATION) {
+            pdfNavigationScrollRestoreSequence += 1
+            pendingPdfNavigationScrollRestore = DesktopPdfPendingPaginatedScrollRestore(
+                requestId = pdfNavigationScrollRestoreSequence,
+                pageIndex = targetPageIndex.coerceIn(0, (document.pageCount - 1).coerceAtLeast(0)),
+                zoom = committedZoom,
+                horizontalScroll = snapshot.horizontalScroll,
+                verticalScroll = snapshot.verticalScroll
+            )
+        } else {
+            pdfScope.launch {
+                pageHorizontalScrollState.scrollTo(snapshot.horizontalScroll)
+            }
+        }
     }
 
     fun cachePaginatedRender(page: Int, renderScale: Float, render: DesktopPdfPageRender) {
@@ -775,10 +1199,17 @@ internal fun PdfReaderScreen(
                 "bitmap=${render.width}x${render.height} current=${activePageIndex + 1} " +
                 "keys=${paginatedRenderCache.keys.sorted().map { it + 1 }} evicted=${evictedPages.map { it + 1 }}"
         }
+        logPdfZoomSettle {
+            "cache_put seq=$pdfZoomSettleSequence page=${page + 1} scale=${renderScale.formatLogFloat()} " +
+                "bitmap=${render.width}x${render.height} current=${activePageIndex + 1} " +
+                "keys=${paginatedRenderCache.keys.sorted().map { it + 1 }} evicted=${evictedPages.map { it + 1 }}"
+        }
     }
 
-    LaunchedEffect(documentHandleId, pageIndex, displayMode) {
-        runCatching { pdfReaderFocusRequester.requestFocus() }
+    LaunchedEffect(documentHandleId, pageIndex, displayMode, scale) {
+        if (currentShouldRestorePdfReaderFocus) {
+            runCatching { pdfReaderFocusRequester.requestFocus() }
+        }
     }
 
     val searchQuery = pdfState.searchQuery
@@ -859,8 +1290,8 @@ internal fun PdfReaderScreen(
         annotations.firstOrNull { it.id == selectedAnnotationId }
     }
     val selectedTextHighlight = selectedAnnotation?.takeIf { it.isDesktopTextSelectionHighlight }
-    val sortedAnnotations = remember(annotations) {
-        annotations.sortedWith(compareBy<SharedPdfAnnotation> { it.pageIndex }.thenBy { it.createdAt })
+    val sortedSidebarHighlights = remember(annotations) {
+        desktopPdfSidebarHighlights(annotations)
     }
     val sortedEmbeddedAnnotations = remember(document.embeddedAnnotations) {
         document.embeddedAnnotations.sortedWith(compareBy<SharedPdfEmbeddedAnnotation> { it.pageIndex }.thenBy { it.index })
@@ -983,10 +1414,12 @@ internal fun PdfReaderScreen(
     }
 
     fun updatePdfHighlighterPalette(nextPalette: SharedPdfHighlighterPalette) {
-        val previousSlot = pdfHighlighterPalette.sanitized().colors.indexOf(selectedColor)
+        fun sameRgb(left: Int, right: Int): Boolean = (left and 0x00FFFFFF) == (right and 0x00FFFFFF)
+
+        val previousSlot = pdfHighlighterPalette.sanitized().colors.indexOfFirst { sameRgb(it, selectedColor) }
         val sanitizedPalette = nextPalette.sanitized()
         onPdfHighlighterPaletteChange(sanitizedPalette)
-        if (selectedTool.isDesktopHighlighter && selectedColor !in sanitizedPalette.colors) {
+        if (selectedTool.isDesktopHighlighter && sanitizedPalette.colors.none { sameRgb(it, selectedColor) }) {
             val colorArgb = sanitizedPalette.colors.getOrNull(previousSlot)
                 ?: sanitizedPalette.colors.firstOrNull()
             colorArgb?.let { nextSelectedColor ->
@@ -1005,6 +1438,10 @@ internal fun PdfReaderScreen(
 
     val pdfPopupActive =
         externalLinkDialogUrl != null ||
+            showPdfAiHub ||
+            showPdfSaveDialog ||
+            pdfFileActionNotice != null ||
+            isPdfFileActionLoading ||
             selectedTextHighlight != null ||
             selectedEmbeddedAnnotation != null ||
             pdfExtrasState.aiResult.hasContent ||
@@ -1016,10 +1453,19 @@ internal fun PdfReaderScreen(
         }
     }
 
-    LaunchedEffect(aiByokSettings) {
+    LaunchedEffect(pdfReaderFocusRestoreRequest, documentHandleId) {
+        if (pdfReaderFocusRestoreRequest > 0) {
+            delay(140L)
+            if (currentShouldRestorePdfReaderFocus && !pdfPopupActive) {
+                runCatching { pdfReaderFocusRequester.requestFocus() }
+            }
+        }
+    }
+
+    LaunchedEffect(aiByokSettings, cloudTtsControlsAvailable) {
         pdfExtrasState = pdfExtrasState.copy(
             cloudTts = pdfExtrasState.cloudTts.copy(
-                isAvailable = aiByokSettings.isCloudTtsAvailable,
+                isAvailable = cloudTtsControlsAvailable && aiByokSettings.isCloudTtsAvailable,
                 errorMessage = null,
                 cacheSummary = currentPdfTtsCacheSummary()
             )
@@ -1077,7 +1523,8 @@ internal fun PdfReaderScreen(
         target: Int,
         scrollVertical: Boolean = true,
         recordJump: Boolean = false,
-        saveRichTextBeforePageChange: Boolean = true
+        saveRichTextBeforePageChange: Boolean = true,
+        commitPendingZoomPreview: Boolean = true
     ) {
         val boundedTarget = target.coerceIn(0, (document.pageCount - 1).coerceAtLeast(0))
         val clampedTarget = if (displayMode == PdfDisplayMode.PAGINATION) {
@@ -1107,6 +1554,9 @@ internal fun PdfReaderScreen(
                 pageCount = document.pageCount
             )
         }
+        if (commitPendingZoomPreview) {
+            commitPendingPdfZoomPreviewForNavigation(clampedTarget)
+        }
         dispatchPdf(SharedPdfReaderAction.GoToPage(clampedTarget))
         if (scrollVertical && displayMode == PdfDisplayMode.VERTICAL_SCROLL) {
             pdfScope.launch {
@@ -1119,18 +1569,24 @@ internal fun PdfReaderScreen(
         if (pageScrubStartPage == null) {
             pageScrubStartPage = pdfState.pageIndex
         }
-        val targetPage = if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.normalizePageIndex(value.roundToInt(), document.pageCount, pdfReaderSettings)
-        } else {
-            value.roundToInt().coerceIn(0, (document.pageCount - 1).coerceAtLeast(0))
-        }
+        val targetPage = desktopPdfPageScrubTarget(
+            value = value,
+            pageCount = document.pageCount,
+            displayMode = displayMode,
+            settings = pdfReaderSettings
+        )
         pageScrubPreview = targetPage
-        goToPage(targetPage)
     }
 
     fun finishPdfPageScrub() {
         val startPage = pageScrubStartPage
-        val targetPage = pdfState.pageIndex
+        val targetPage = desktopPdfPageScrubCommitTarget(
+            previewPage = pageScrubPreview,
+            currentPage = pdfState.pageIndex,
+            pageCount = document.pageCount
+        )
+        pageScrubStartPage = null
+        pageScrubPreview = null
         if (startPage != null) {
             jumpHistory = jumpHistory.record(
                 currentPageIndex = startPage,
@@ -1138,8 +1594,7 @@ internal fun PdfReaderScreen(
                 pageCount = document.pageCount
             )
         }
-        pageScrubStartPage = null
-        pageScrubPreview = null
+        goToPage(targetPage)
     }
 
     fun previousPdfPageTarget(): Int {
@@ -1249,24 +1704,21 @@ internal fun PdfReaderScreen(
                     "right=${bounds.right.formatLogFloat()} bottom=${bounds.bottom.formatLogFloat()}"
             )
         }
-        dispatchPdf(
-            SharedPdfReaderAction.AnnotationAdded(
-                SharedPdfAnnotation(
-                    id = "highlight_${now}",
-                    pageIndex = pageIndex,
-                    kind = PdfAnnotationKind.HIGHLIGHT,
-                    tool = PdfInkTool.HIGHLIGHTER,
-                    bounds = highlightBounds.firstOrNull(),
-                    boundsList = highlightBounds,
-                    text = selection.text,
-                    colorArgb = SharedPdfAndroidHighlightColors.nearestArgb(colorArgb),
-                    rangeStartIndex = selection.startIndex,
-                    rangeEndIndex = selection.endIndex,
-                    createdAt = now
-                )
-            )
+        val annotation = SharedPdfAnnotation(
+            id = "highlight_${now}",
+            pageIndex = pageIndex,
+            kind = PdfAnnotationKind.HIGHLIGHT,
+            tool = PdfInkTool.HIGHLIGHTER,
+            bounds = highlightBounds.firstOrNull(),
+            boundsList = highlightBounds,
+            text = selection.text,
+            colorArgb = SharedPdfHighlighterPalette(listOf(colorArgb)).sanitized().colors.first(),
+            rangeStartIndex = selection.startIndex,
+            rangeEndIndex = selection.endIndex,
+            createdAt = now
         )
-        dispatchPdf(SharedPdfReaderAction.AnnotationSelected(null))
+        pdfState = pdfState.withDesktopPdfTextSelectionHighlightAdded(annotation, zoomSpec)
+        clearPdfInteractionState()
     }
 
     fun clearSelection() {
@@ -1315,12 +1767,8 @@ internal fun PdfReaderScreen(
         }
     }
 
-    fun updatePdfAutoScroll(autoScroll: ReaderAutoScrollState) {
-        pdfExtrasState = pdfExtrasState.copy(autoScroll = autoScroll.sanitized())
-    }
-
     fun pdfCloudTtsStoppedState(statusMessage: String? = null, errorMessage: String? = null) = ReaderCloudTtsState(
-        isAvailable = aiByokSettings.sanitized().isCloudTtsAvailable,
+        isAvailable = cloudTtsControlsAvailable && aiByokSettings.sanitized().isCloudTtsAvailable,
         statusMessage = statusMessage,
         errorMessage = errorMessage,
         cacheSummary = currentPdfTtsCacheSummary()
@@ -1547,17 +1995,10 @@ internal fun PdfReaderScreen(
     }
 
     fun pdfCloudTtsUnavailableMessage(): String {
-        return if (aiByokSettings.serverBackedReaderAiFeatures || aiByokSettings.serverBackedCloudTts) {
-            pdfString(
-                "desktop_cloud_tts_signed_in_credits_required_desc",
-                "Cloud TTS needs a signed-in account with credits. Pro and credits can only be purchased from the Android app."
-            )
-        } else {
-            pdfString(
-                "desktop_cloud_tts_needs_gemini_key_desc",
-                "Add a Gemini key and select Gemini cloud TTS in AI keys and models."
-            )
-        }
+        return pdfString(
+            "desktop_cloud_tts_signed_in_credits_required_desc",
+            "Cloud TTS needs a signed-in account with credits. Pro and credits can only be purchased from the Android app."
+        )
     }
 
     fun pdfReadScopeLabel(readScope: ReaderTtsReadScope): String {
@@ -1568,7 +2009,12 @@ internal fun PdfReaderScreen(
         }
     }
 
-    fun startPdfCloudTts(readScope: ReaderTtsReadScope) {
+    fun startPdfCloudTts(
+        readScope: ReaderTtsReadScope,
+        startChunkIndex: Int = 0,
+        chunksOverride: List<ReaderTtsChunk>? = null,
+        restartActive: Boolean = false
+    ) {
         val settings = aiByokSettings.sanitized()
         logDesktopTts(
             "pdf_sequence_toggle scope=${readScope.name} startPage=${pageIndex + 1} " +
@@ -1576,9 +2022,14 @@ internal fun PdfReaderScreen(
                 "keyPresent=${settings.geminiKey.isNotBlank()} ttsModel=\"${settings.ttsModel.desktopTtsPreview()}\" " +
                 "available=${ttsAdapter.isAvailable}"
         )
-        if (pdfExtrasState.cloudTts.isPlaying || pdfExtrasState.cloudTts.isLoading || pdfExtrasState.cloudTts.isPaused) {
+        val ttsActive = pdfExtrasState.cloudTts.isPlaying || pdfExtrasState.cloudTts.isLoading || pdfExtrasState.cloudTts.isPaused
+        if (ttsActive && !restartActive) {
             stopPdfCloudTts()
             return
+        }
+        if (ttsActive) {
+            pdfTtsJob?.cancel()
+            pdfTtsJob = null
         }
         if (!ttsAdapter.isAvailable) {
             logDesktopTts("pdf_sequence_blocked reason=adapter_unavailable")
@@ -1602,45 +2053,69 @@ internal fun PdfReaderScreen(
                     "Preparing %1\$s",
                     pdfReadScopeLabel(readScope)
                 ),
+                progress = ReaderTtsProgress(sessionId = ttsSessionId, scope = readScope),
                 cacheSummary = currentPdfTtsCacheSummary()
             )
         )
+        fun updatePdfTtsSession(transform: (ReaderExtrasState) -> ReaderExtrasState) {
+            if (pdfExtrasState.cloudTts.progress.sessionId == ttsSessionId) {
+                pdfExtrasState = transform(pdfExtrasState)
+            }
+        }
         val noTextMessage = pdfString("desktop_no_text_here_to_read", "There is no text here to read.")
         pdfTtsJob = pdfScope.launch {
             var completedChunkCount = 0
             runCatching {
-                val ttsChunks = withContext(Dispatchers.IO) {
-                    pdfTtsChunksForScope(readScope, pageIndex)
-                        .filter { it.text.isNotBlank() }
-                        .withTtsReplacements(ttsReplacementPreferences, document.path)
-                }
+                val ttsChunks = chunksOverride
+                    ?.filter { it.text.isNotBlank() }
+                    ?: withContext(Dispatchers.IO) {
+                        pdfTtsChunksForScope(readScope, pageIndex)
+                            .filter { it.text.isNotBlank() }
+                            .withTtsReplacements(ttsReplacementPreferences, document.path)
+                    }
                 if (ttsChunks.isEmpty()) {
                     logDesktopTts("pdf_sequence_ignored reason=blank_text scope=${readScope.name}")
                     throw IllegalStateException(noTextMessage)
                 }
+                val boundedStartChunkIndex = startChunkIndex.coerceIn(0, ttsChunks.lastIndex)
+                val playbackChunks = ttsChunks.drop(boundedStartChunkIndex)
                 val initialProgress = ReaderTtsProgress(
                     sessionId = ttsSessionId,
                     scope = readScope,
                     chunks = ttsChunks,
-                    currentChunkIndex = -1
+                    currentChunkIndex = boundedStartChunkIndex - 1
                 )
-                logDesktopTts("pdf_sequence_start scope=${readScope.name} chunks=${ttsChunks.size}")
-                ttsAdapter.speakChunks(document.title, readScope, ttsChunks) { index ->
+                updatePdfTtsSession { extras ->
+                    extras.copy(
+                        cloudTts = extras.cloudTts.copy(
+                            progress = initialProgress,
+                            cacheSummary = currentPdfTtsCacheSummary()
+                        )
+                    )
+                }
+                logDesktopTts(
+                    "pdf_sequence_start scope=${readScope.name} chunks=${ttsChunks.size} " +
+                        "startChunk=${boundedStartChunkIndex + 1}"
+                )
+                ttsAdapter.speakChunks(document.title, readScope, playbackChunks) { relativeIndex ->
                     if (!isActive) throw kotlinx.coroutines.CancellationException("PDF cloud TTS stopped")
+                    val index = boundedStartChunkIndex + relativeIndex
                     val chunk = ttsChunks[index]
                     val progress = initialProgress.copy(currentChunkIndex = index)
                     if (chunk.pageIndex != pdfState.pageIndex) {
                         goToPage(chunk.pageIndex, recordJump = false)
                     }
-                    pdfExtrasState = pdfExtrasState.copy(
-                        cloudTts = ReaderCloudTtsState(
-                            isAvailable = true,
-                            isPlaying = true,
-                            statusMessage = progress.currentPositionLabel ?: pdfString("label_reading", "Reading"),
-                            progress = progress,
-                            cacheSummary = currentPdfTtsCacheSummary()
+                    updatePdfTtsSession { extras ->
+                        extras.copy(
+                            cloudTts = ReaderCloudTtsState(
+                                isAvailable = true,
+                                isPlaying = true,
+                                statusMessage = progress.currentPositionLabel ?: pdfString("label_reading", "Reading"),
+                                progress = progress,
+                                cacheSummary = currentPdfTtsCacheSummary()
+                            )
                         )
-                    )
+                    }
                     logDesktopTts(
                         "pdf_chunk_start scope=${readScope.name} index=${index + 1}/${ttsChunks.size} " +
                             "page=${chunk.pageIndex + 1} offsets=${chunk.startOffset}..${chunk.endOffset} chars=${chunk.text.length}"
@@ -1649,26 +2124,48 @@ internal fun PdfReaderScreen(
                 }
             }.onFailure { error ->
                 logDesktopTts("pdf_sequence_failed error=\"${error.desktopTtsSummary()}\"")
-                if (error !is kotlinx.coroutines.CancellationException && error.message != noTextMessage) error.printStackTrace()
-                pdfExtrasState = if (error is kotlinx.coroutines.CancellationException) {
-                    pdfExtrasState.copy(
-                        cloudTts = pdfCloudTtsStoppedState(statusMessage = pdfString("desktop_stopped", "Stopped"))
-                    )
-                } else {
-                    onPaidFeatureError(error.message)
-                    pdfExtrasState.copy(
-                        cloudTts = pdfCloudTtsStoppedState(
-                            errorMessage = error.message ?: pdfString("desktop_cloud_tts_failed", "Cloud TTS failed.")
+                updatePdfTtsSession { extras ->
+                    if (error is kotlinx.coroutines.CancellationException) {
+                        extras.copy(
+                            cloudTts = pdfCloudTtsStoppedState(statusMessage = pdfString("desktop_stopped", "Stopped"))
                         )
-                    )
+                    } else {
+                        onPaidFeatureError(error.message)
+                        extras.copy(
+                            cloudTts = pdfCloudTtsStoppedState(
+                                errorMessage = error.message ?: pdfString("desktop_cloud_tts_failed", "Cloud TTS failed.")
+                            )
+                        )
+                    }
                 }
             }.onSuccess {
                 logDesktopTts("pdf_sequence_success chunks=$completedChunkCount")
-                pdfExtrasState = pdfExtrasState.copy(
-                    cloudTts = pdfCloudTtsStoppedState(statusMessage = pdfString("desktop_finished", "Finished"))
-                )
+                updatePdfTtsSession { extras ->
+                    extras.copy(
+                        cloudTts = pdfCloudTtsStoppedState(statusMessage = pdfString("desktop_finished", "Finished"))
+                    )
+                }
             }
         }
+    }
+
+    fun skipPdfCloudTtsChunk(delta: Int) {
+        val progress = pdfExtrasState.cloudTts.progress
+        if (progress.chunks.isEmpty()) return
+        val currentIndex = progress.currentChunkIndex.takeIf { it >= 0 } ?: return
+        val targetIndex = (currentIndex + delta).coerceIn(0, progress.chunks.lastIndex)
+        if (targetIndex == currentIndex) return
+        startPdfCloudTts(
+            readScope = progress.scope,
+            startChunkIndex = targetIndex,
+            chunksOverride = progress.chunks,
+            restartActive = true
+        )
+    }
+
+    fun locatePdfCloudTtsChunk() {
+        val chunk = pdfExtrasState.cloudTts.progress.currentChunk ?: return
+        goToPage(chunk.pageIndex, recordJump = false)
     }
 
     fun togglePdfCloudTts(text: String) {
@@ -1720,59 +2217,10 @@ internal fun PdfReaderScreen(
             )
             return
         }
-        pdfTtsJob = null
-        pdfExtrasState = pdfExtrasState.copy(
-            cloudTts = pdfExtrasState.cloudTts.copy(cacheSummary = currentPdfTtsCacheSummary())
+        startPdfCloudTts(
+            readScope = ReaderTtsReadScope.PAGE,
+            chunksOverride = selectionChunks
         )
-        pdfTtsJob = pdfScope.launch {
-            val initialProgress = ReaderTtsProgress(
-                sessionId = System.currentTimeMillis(),
-                scope = ReaderTtsReadScope.PAGE,
-                chunks = selectionChunks,
-                currentChunkIndex = -1
-            )
-            runCatching {
-                pdfExtrasState = pdfExtrasState.copy(
-                    cloudTts = ReaderCloudTtsState(
-                        isAvailable = true,
-                        isLoading = true,
-                        statusMessage = pdfString("desktop_preparing_selection", "Preparing selection"),
-                        progress = initialProgress,
-                        cacheSummary = currentPdfTtsCacheSummary()
-                    )
-                )
-                ttsAdapter.speakChunks(document.title, ReaderTtsReadScope.PAGE, selectionChunks) { index ->
-                    val progress = initialProgress.copy(currentChunkIndex = index)
-                    pdfExtrasState = pdfExtrasState.copy(
-                        cloudTts = ReaderCloudTtsState(
-                            isAvailable = true,
-                            isPlaying = true,
-                            statusMessage = progress.currentPositionLabel ?: pdfString("label_reading", "Reading"),
-                            progress = progress,
-                            cacheSummary = currentPdfTtsCacheSummary()
-                        )
-                    )
-                }
-            }.onFailure { error ->
-                logDesktopTts("pdf_job_failed error=\"${error.desktopTtsSummary()}\"")
-                if (error !is kotlinx.coroutines.CancellationException) error.printStackTrace()
-                pdfExtrasState = pdfExtrasState.copy(
-                    cloudTts = if (error is kotlinx.coroutines.CancellationException) {
-                        pdfCloudTtsStoppedState(statusMessage = pdfString("desktop_stopped", "Stopped"))
-                    } else {
-                        onPaidFeatureError(error.message)
-                        pdfCloudTtsStoppedState(
-                            errorMessage = error.message ?: pdfString("desktop_cloud_tts_failed", "Cloud TTS failed.")
-                        )
-                    }
-                )
-            }.onSuccess {
-                logDesktopTts("pdf_job_success")
-                pdfExtrasState = pdfExtrasState.copy(
-                    cloudTts = pdfCloudTtsStoppedState(statusMessage = pdfString("desktop_finished", "Finished"))
-                )
-            }
-        }
     }
 
     fun updateAnnotation(annotation: SharedPdfAnnotation) {
@@ -1803,6 +2251,19 @@ internal fun PdfReaderScreen(
     fun selectEmbeddedAnnotation(annotation: SharedPdfEmbeddedAnnotation?) {
         selectedEmbeddedAnnotationId = annotation?.id
         annotation?.let { goToPage(it.pageIndex, recordJump = true) }
+    }
+
+    fun dismissSelectedTextHighlightSheet() {
+        clearPdfInteractionState()
+        pdfState = pdfState.withDesktopPdfTextHighlightSheetDismissed(zoomSpec)
+        requestPdfReaderFocusRestore()
+    }
+
+    fun deleteSelectedTextHighlight(annotation: SharedPdfAnnotation) {
+        clearPdfInteractionState()
+        pdfState = pdfState.withDesktopPdfTextHighlightSheetDismissed(zoomSpec)
+        dispatchPdf(SharedPdfReaderAction.AnnotationDeleted(annotation.id))
+        requestPdfReaderFocusRestore()
     }
 
     fun goToSearchResult(targetIndex: Int) {
@@ -1898,6 +2359,37 @@ internal fun PdfReaderScreen(
         }
     }
 
+    LaunchedEffect(
+        documentHandleId,
+        pendingPdfNavigationScrollRestore?.requestId,
+        pageIndex,
+        scale,
+        displayMode
+    ) {
+        val restore = pendingPdfNavigationScrollRestore ?: return@LaunchedEffect
+        if (
+            displayMode != PdfDisplayMode.PAGINATION ||
+            restore.pageIndex != pageIndex ||
+            abs(restore.zoom - scale) > 0.001f
+        ) {
+            return@LaunchedEffect
+        }
+        withFrameNanos { }
+        pageHorizontalScrollState.scrollTo(restore.horizontalScroll)
+        pageVerticalScrollState.scrollTo(restore.verticalScroll)
+        withFrameNanos { }
+        pageHorizontalScrollState.scrollTo(restore.horizontalScroll)
+        pageVerticalScrollState.scrollTo(restore.verticalScroll)
+        logPdfZoomSettle {
+            "preview_navigation_restore request=${restore.requestId} page=${pageIndex + 1} " +
+                "zoom=${scale.formatLogFloat()} h=${pageHorizontalScrollState.value} " +
+                "v=${pageVerticalScrollState.value}"
+        }
+        if (pendingPdfNavigationScrollRestore == restore) {
+            pendingPdfNavigationScrollRestore = null
+        }
+    }
+
     fun selectPdfPanMode() {
         SharedPdfRichTextLog.d(
             "desktop.tool.select tool=${PdfInkTool.NONE} richMode=$isRichTextMode page=${pdfState.pageIndex}"
@@ -1911,16 +2403,57 @@ internal fun PdfReaderScreen(
         dispatchPdf(SharedPdfReaderAction.ToolSelected(PdfInkTool.NONE))
     }
 
-    LaunchedEffect(pdfExtrasState.autoScroll.sanitized(), pageIndex, canGoNext, displayMode) {
-        val autoScroll = pdfExtrasState.autoScroll.sanitized()
-        if (!autoScroll.enabled) return@LaunchedEffect
-        if (!canGoNext) {
-            updatePdfAutoScroll(autoScroll.copy(enabled = false))
-            return@LaunchedEffect
+    fun togglePdfTextSelectionMode() {
+        val enabled = !isTextSelectionMode
+        if (enabled) {
+            deactivateRichTextMode()
+            commitActiveTextDraft()
         }
-        val delayMs = (180_000f / autoScroll.speed).roundToInt().coerceIn(1_200, 12_000)
-        delay(delayMs.toLong())
-        goToPage(nextPdfPageTarget())
+        dispatchPdf(SharedPdfReaderAction.TextSelectionModeChanged(enabled))
+        if (!enabled) {
+            clearPdfInteractionState()
+        }
+    }
+
+    @Composable
+    fun DesktopPdfBottomMarkupDock(modifier: Modifier = Modifier) {
+        SharedPdfInteractionDock(
+            isTextSelectionMode = isTextSelectionMode,
+            selectedTool = selectedTool,
+            selectedColor = selectedColor,
+            strokeWidth = strokeWidth,
+            toolConfigs = pdfState.toolConfigs,
+            penPalette = pdfState.penPalette,
+            highlighterPalette = pdfHighlighterColors,
+            lastActivePenTool = pdfState.lastActivePenTool,
+            lastActiveHighlighterTool = pdfState.lastActiveHighlighterTool,
+            onPanSelected = ::selectPdfPanMode,
+            onTextSelectionSelected = ::togglePdfTextSelectionMode,
+            onToolSelected = ::selectPdfAnnotationTool,
+            onColorSelected = { dispatchPdf(SharedPdfReaderAction.ColorSelected(it)) },
+            onStrokeWidthChange = { dispatchPdf(SharedPdfReaderAction.StrokeWidthChanged(it)) },
+            onUndo = { dispatchPdf(SharedPdfReaderAction.UndoAnnotationEdit) },
+            onRedo = { dispatchPdf(SharedPdfReaderAction.RedoAnnotationEdit) },
+            onClearPage = { dispatchPdf(SharedPdfReaderAction.ClearPageAnnotations(pageIndex)) },
+            modifier = modifier,
+            allowExpandedSettings = !isPdfSearchActive &&
+                activeTextDraft == null &&
+                !isRichTextMode &&
+                textSelection == null &&
+                selectionMenuOffset == null &&
+                !pdfSelectionSheetActive &&
+                externalLinkDialogUrl == null &&
+                !pdfExtrasState.aiResult.hasContent,
+            canUndo = pdfState.canUndoAnnotationEdit,
+            canRedo = pdfState.canRedoAnnotationEdit,
+            canClearPage = annotations.any { it.pageIndex == pageIndex },
+            isHighlighterSnapEnabled = isHighlighterSnapEnabled,
+            onHighlighterSnapChange = { isHighlighterSnapEnabled = it },
+            onHighlighterPaletteChange = { colors ->
+                onPdfHighlighterPaletteChange(SharedPdfHighlighterPalette(colors).sanitized())
+            },
+            onPenPaletteChange = { colors -> dispatchPdf(SharedPdfReaderAction.PenPaletteChanged(colors)) }
+        )
     }
 
     LaunchedEffect(documentHandleId, displayMode, verticalListState) {
@@ -1948,7 +2481,7 @@ internal fun PdfReaderScreen(
             .distinctUntilChanged()
             .collect { visiblePage ->
                 if (visiblePage in 0 until document.pageCount && visiblePage != currentPdfPageIndex) {
-                    goToPage(visiblePage, scrollVertical = false)
+                    goToPage(visiblePage, scrollVertical = false, commitPendingZoomPreview = false)
                 }
             }
     }
@@ -1970,11 +2503,22 @@ internal fun PdfReaderScreen(
                 "searchIndexing=$isSearchIndexing indexed=$indexedSearchPageCount/${document.pageCount} " +
                 "cacheKeys=${paginatedRenderCache.keys.sorted().map { it + 1 }}"
         }
+        logPdfZoomSettle {
+            "render_effect seq=$pdfZoomSettleSequence page=${pageIndex + 1} scale=${scale.formatLogFloat()} " +
+                "existingPage=${renderedPageIndex?.plus(1) ?: "none"} " +
+                "existingScale=${renderedPageScale?.formatLogFloat() ?: "none"} " +
+                "preview=${pdfZoomPreview != null} h=${pageHorizontalScrollState.value} v=${pageVerticalScrollState.value} " +
+                "pageRoot=${paginatedPageRootOffset.formatLogOffset()} canvas=${pageCanvasSize.formatLogSize()}"
+        }
         if (renderedPageIndex != pageIndex) {
             paginatedRenderCache[pageIndex]?.let { cached ->
                 logPdfZoomPerf {
                     "cache_hit page=${pageIndex + 1} scale=${cached.scale.formatLogFloat()} " +
                         "bitmap=${cached.render.width}x${cached.render.height}"
+                }
+                logPdfZoomSettle {
+                    "cache_hit seq=$pdfZoomSettleSequence page=${pageIndex + 1} " +
+                        "scale=${cached.scale.formatLogFloat()} bitmap=${cached.render.width}x${cached.render.height}"
                 }
                 renderedPage = cached.render
                 renderedPageIndex = pageIndex
@@ -1983,9 +2527,15 @@ internal fun PdfReaderScreen(
                 isRendering = false
             }
         }
-        val hasPageRender = renderedPage != null && renderedPageIndex == pageIndex
+        val hasPageRender = renderedPage != null && desktopPdfRenderBelongsToPage(renderedPageIndex, pageIndex)
         if (!hasPageRender) {
-            logPdfZoomPerf { "cache_miss page=${pageIndex + 1}; showing spinner until first render" }
+            logPdfZoomPerf {
+                "cache_miss page=${pageIndex + 1}; stale=${renderedPageIndex?.let { it + 1 } ?: "none"}"
+            }
+            logPdfZoomSettle {
+                "cache_miss seq=$pdfZoomSettleSequence page=${pageIndex + 1} " +
+                    "stale=${renderedPageIndex?.plus(1) ?: "none"}"
+            }
             renderedPage = null
             renderedPageIndex = null
             renderedPageScale = null
@@ -2016,12 +2566,22 @@ internal fun PdfReaderScreen(
                     "safeScale=${safeScale.formatLogFloat()} firstScale=${firstRenderScale.formatLogFloat()} " +
                     "hasRender=$hasPageRender opening=$isOpeningRender"
             }
+            logPdfZoomSettle {
+                "render_plan seq=$pdfZoomSettleSequence page=${pageIndex + 1} requestedScale=${scale.formatLogFloat()} " +
+                    "safeScale=${safeScale.formatLogFloat()} firstScale=${firstRenderScale.formatLogFloat()} " +
+                    "hasRender=$hasPageRender opening=$isOpeningRender existingScale=${renderedPageScale?.formatLogFloat() ?: "none"}"
+            }
 
             suspend fun renderAt(renderScale: Float, delayMillis: Long, showSpinner: Boolean): Boolean {
                 logPdfZoomPerf {
                     "render_scheduled page=${pageIndex + 1} renderScale=${renderScale.formatLogFloat()} " +
                         "requestedScale=${scale.formatLogFloat()} delayMs=$delayMillis showSpinner=$showSpinner " +
                         "hasPageRender=$hasPageRender"
+                }
+                logPdfZoomSettle {
+                    "render_scheduled seq=$pdfZoomSettleSequence page=${pageIndex + 1} " +
+                        "renderScale=${renderScale.formatLogFloat()} requestedScale=${scale.formatLogFloat()} " +
+                        "delayMs=$delayMillis showSpinner=$showSpinner preview=${pdfZoomPreview != null}"
                 }
                 delay(delayMillis)
                 if (showSpinner) {
@@ -2043,6 +2603,12 @@ internal fun PdfReaderScreen(
                             "elapsedMs=$elapsedMs currentPage=${currentPdfPageIndex + 1} " +
                             "currentScale=${currentPdfScale.formatLogFloat()} mode=$currentPdfDisplayMode"
                     }
+                    logPdfZoomSettle {
+                        "render_stale seq=$pdfZoomSettleSequence page=${pageIndex + 1} " +
+                            "renderScale=${renderScale.formatLogFloat()} elapsedMs=$elapsedMs " +
+                            "currentPage=${currentPdfPageIndex + 1} currentScale=${currentPdfScale.formatLogFloat()} " +
+                            "mode=$currentPdfDisplayMode"
+                    }
                     return false
                 }
                 result.getOrNull()?.let { render ->
@@ -2061,6 +2627,13 @@ internal fun PdfReaderScreen(
                     "render_end page=${pageIndex + 1} renderScale=${renderScale.formatLogFloat()} " +
                         "requestedScale=${scale.formatLogFloat()} elapsedMs=$elapsedMs success=${result.isSuccess} " +
                         "error=${result.exceptionOrNull()?.message?.logPreview() ?: "none"}"
+                }
+                logPdfZoomSettle {
+                    "render_end seq=$pdfZoomSettleSequence page=${pageIndex + 1} " +
+                        "renderScale=${renderScale.formatLogFloat()} requestedScale=${scale.formatLogFloat()} " +
+                        "elapsedMs=$elapsedMs success=${result.isSuccess} bitmap=${renderedPage?.width ?: 0}x${renderedPage?.height ?: 0} " +
+                        "h=${pageHorizontalScrollState.value} v=${pageVerticalScrollState.value} " +
+                        "pageRoot=${paginatedPageRootOffset.formatLogOffset()} canvas=${pageCanvasSize.formatLogSize()}"
                 }
                 renderedPage?.let { render ->
                     logPdfSelection(
@@ -2129,14 +2702,18 @@ internal fun PdfReaderScreen(
 
             val existingScale = renderedPageScale
             val needsFirstRender = !hasPageRender ||
-                existingScale == null ||
-                abs(existingScale - firstRenderScale) > DesktopPdfRenderScaleTolerance
+                desktopPdfRenderScaleNeedsUpgrade(existingScale, firstRenderScale)
             if (needsFirstRender) {
                 renderAt(
                     renderScale = firstRenderScale,
                     delayMillis = if (hasPageRender) DesktopPdfZoomRenderDebounceMillis else 45L,
                     showSpinner = !hasPageRender
                 )
+            } else {
+                logPdfZoomSettle {
+                    "render_skip seq=$pdfZoomSettleSequence page=${pageIndex + 1} reason=no_scale_upgrade " +
+                        "existingScale=${existingScale?.formatLogFloat() ?: "none"} firstScale=${firstRenderScale.formatLogFloat()}"
+                }
             }
             delay(DesktopPdfPaginationPrefetchDelayMillis)
             if (currentPdfPageIndex == pageIndex && currentPdfScale == scale &&
@@ -2154,19 +2731,18 @@ internal fun PdfReaderScreen(
         displayMode = displayMode,
         hasContents = document.toc.isNotEmpty(),
         hasBookmarks = bookmarks.isNotEmpty(),
-        hasAnnotations = sortedAnnotations.isNotEmpty(),
+        hasAnnotations = sortedSidebarHighlights.isNotEmpty(),
         hasEmbeddedComments = sortedEmbeddedAnnotations.isNotEmpty(),
         searchActive = isPdfSearchActive || searchQuery.isNotBlank(),
         annotationEditing = activeTextDraft != null ||
             selectedAnnotation != null ||
-            selectedTool != PdfInkTool.NONE ||
-            isTextSelectionMode,
+            selectedTool != PdfInkTool.NONE,
         richTextEditing = isRichTextMode,
         loading = isRendering || isSearchIndexing || isPdfFileActionLoading || isReflowingThisBook,
         errorMessage = renderError,
         extrasState = pdfExtrasState,
         aiAvailable = featurePolicy.aiAndCloud && aiByokSettings.sanitized().areReaderAiFeaturesAvailable,
-        cloudTtsAvailable = featurePolicy.aiAndCloud && aiByokSettings.sanitized().isCloudTtsAvailable,
+        cloudTtsAvailable = cloudTtsControlsAvailable && aiByokSettings.sanitized().isCloudTtsAvailable,
         externalLookupAvailable = featurePolicy.externalLookup
     )
 
@@ -2231,7 +2807,8 @@ internal fun PdfReaderScreen(
     fun handlePdfReaderKeyEvent(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
         val command = event.desktopPdfKeyCommandOrNull(
             fullscreen = isFullscreen,
-            editingText = isPdfTextEditingActive()
+            editingText = isPdfTextEditingActive(),
+            rightToLeftPagination = rightToLeftPdfPaginationActive
         ) ?: return false
         return runPdfKeyCommand(command)
     }
@@ -2239,14 +2816,46 @@ internal fun PdfReaderScreen(
     fun handlePdfReaderAwtKeyEvent(event: AwtKeyEvent): Boolean {
         val command = event.desktopPdfKeyCommandOrNull(
             fullscreen = isFullscreen,
-            editingText = isPdfTextEditingActive()
+            editingText = isPdfTextEditingActive(),
+            rightToLeftPagination = rightToLeftPdfPaginationActive
         ) ?: return false
         return runPdfKeyCommand(command)
     }
 
+    fun handlePdfReaderFullscreenAwtKeyEvent(event: AwtKeyEvent): Boolean {
+        if (isPdfSearchActive) {
+            if (event.id == AwtKeyEvent.KEY_PRESSED && isFullscreen && event.keyCode == AwtKeyEvent.VK_ESCAPE) {
+                return runPdfKeyCommand(DesktopPdfKeyCommand.EXIT_FULLSCREEN)
+            }
+            return false
+        }
+        return handlePdfReaderAwtKeyEvent(event)
+    }
+
+    fun handlePdfReaderGlobalShortcutAwtKeyEvent(event: AwtKeyEvent): Boolean {
+        if (event.id != AwtKeyEvent.KEY_PRESSED || !event.isControlDown) return false
+        return when (event.keyCode) {
+            AwtKeyEvent.VK_F -> runPdfKeyCommand(DesktopPdfKeyCommand.SEARCH)
+            else -> false
+        }
+    }
+
+    DesktopReaderKeyDispatcherEffect(
+        enabled = !pdfPopupActive,
+        allowChromeModalWindows = true,
+        onKeyPressed = { event -> handlePdfReaderGlobalShortcutAwtKeyEvent(event) }
+    )
+
+    DesktopReaderKeyDispatcherEffect(
+        enabled = !pdfPopupActive && !isPdfSearchActive,
+        allowPanelModalWindows = true,
+        dispatchWhenOwnerWindowActive = false,
+        onKeyPressed = { event -> handlePdfReaderAwtKeyEvent(event) }
+    )
+
     DesktopReaderFullscreenKeyEffect(
         enabled = isFullscreen && !pdfPopupActive,
-        onKeyPressed = { event -> handlePdfReaderAwtKeyEvent(event) }
+        onKeyPressed = { event -> handlePdfReaderFullscreenAwtKeyEvent(event) }
     )
 
     ReaderWorkspaceShell(
@@ -2265,6 +2874,16 @@ internal fun PdfReaderScreen(
         isBookmarked = bookmarks.any { it.pageIndex == pageIndex },
         onToggleBookmark = { toggleBookmark(pageIndex) },
         onSearchAction = { dispatchPdf(SharedPdfReaderAction.SearchOpened) },
+        onReadAloudAction = if (cloudTtsControlsAvailable && aiByokSettings.sanitized().isCloudTtsAvailable) {
+            { startPdfCloudTts(ReaderTtsReadScope.BOOK) }
+        } else {
+            null
+        },
+        onAiHubAction = if (aiByokSettings.sanitized().areReaderAiFeaturesAvailable) {
+            { showPdfAiHub = true }
+        } else {
+            null
+        },
         fileActions = pdfFileActions,
         onSaveCopyAction = requestSaveCopy,
         onPrintAction = requestPrint,
@@ -2286,79 +2905,46 @@ internal fun PdfReaderScreen(
             .focusRequester(pdfReaderFocusRequester)
             .onPreviewKeyEvent(::handlePdfReaderKeyEvent)
             .focusable(),
+        closeRightPanelOnReaderTap = true,
+        onReaderFocusRestoreRequest = ::requestPdfReaderFocusRestore,
         leftSidebar = { _ ->
             DesktopPdfNavigationSidebar(
                 document = document,
                 pageIndex = pageIndex,
-                sortedAnnotations = sortedAnnotations,
-                sortedEmbeddedAnnotations = sortedEmbeddedAnnotations,
+                sortedHighlights = sortedSidebarHighlights,
                 bookmarks = bookmarks,
-                selectedAnnotationId = selectedAnnotationId,
-                selectedEmbeddedAnnotationId = selectedEmbeddedAnnotationId,
                 onPageSelected = { page -> goToPage(page, recordJump = true) },
                 onAnnotationOpened = ::goToAnnotation,
                 onAnnotationSelected = ::selectAnnotation,
-                onAnnotationDeleted = { annotation -> deleteAnnotation(annotation.id) },
-                onEmbeddedAnnotationOpened = ::goToEmbeddedAnnotation,
-                onEmbeddedAnnotationSelected = ::selectEmbeddedAnnotation
+                onAnnotationDeleted = { annotation -> deleteAnnotation(annotation.id) }
             )
         },
         rightInspector = {
             DesktopPdfInspectorPanel(
                 document = document,
-                pageIndex = pageIndex,
                 displayMode = displayMode,
                 pdfReaderSettings = pdfReaderSettings,
+                appThemeControls = appThemeControls,
+                customReaderThemes = customReaderThemes,
+                onCustomReaderThemesChange = onCustomReaderThemesChange,
                 customTextureIds = customTextureIds,
                 onImportTexture = onImportTexture,
                 onReaderSettingsChange = ::updatePdfReaderSettings,
-                zoomControlScale = zoomControlScale,
-                zoomSpec = zoomSpec,
-                isTextSelectionMode = isTextSelectionMode,
                 selectedTool = selectedTool,
                 isRichTextMode = isRichTextMode,
-                selectedColor = selectedColor,
-                strokeWidth = strokeWidth,
-                pdfHighlighterColors = pdfHighlighterColors,
                 pdfHighlighterPalette = pdfHighlighterPalette,
-                isHighlighterSnapEnabled = isHighlighterSnapEnabled,
                 effectiveTextStyleConfig = effectiveTextStyleConfig,
                 richTextController = richTextController,
                 pdfExtrasState = pdfExtrasState,
                 aiByokSettings = aiByokSettings,
-                externalLookupAvailable = featurePolicy.externalLookup,
-                cloudTtsFeatureAvailable = featurePolicy.aiAndCloud,
+                cloudTtsFeatureAvailable = cloudTtsControlsAvailable,
                 ttsReplacementPreferences = ttsReplacementPreferences,
-                pageText = { currentPdfPageText() },
                 onDisplayModeSelected = { mode ->
                     commitActiveTextDraft()
+                    updatePdfReaderSettings(
+                        pdfReaderSettings.copy(readingMode = mode.toDesktopReaderReadingMode())
+                    )
                     dispatchPdf(SharedPdfReaderAction.DisplayModeChanged(mode))
-                },
-                onPageScrub = ::updatePdfPageScrub,
-                onPageScrubFinished = ::finishPdfPageScrub,
-                onZoomOut = {
-                    cancelPendingPdfZoomPreview()
-                    dispatchPdf(SharedPdfReaderAction.ZoomBy(-0.15f))
-                },
-                onZoomIn = {
-                    cancelPendingPdfZoomPreview()
-                    dispatchPdf(SharedPdfReaderAction.ZoomBy(0.15f))
-                },
-                onZoomChange = { zoom ->
-                    cancelPendingPdfZoomPreview()
-                    dispatchPdf(SharedPdfReaderAction.ZoomChanged(zoom))
-                },
-                onSelectPanMode = ::selectPdfPanMode,
-                onTextSelectionModeToggle = {
-                    val enabled = !isTextSelectionMode
-                    if (enabled) {
-                        deactivateRichTextMode()
-                        commitActiveTextDraft()
-                    }
-                    dispatchPdf(SharedPdfReaderAction.TextSelectionModeChanged(enabled))
-                    if (!enabled) {
-                        clearPdfInteractionState()
-                    }
                 },
                 onRichTextModeToggle = {
                     if (isRichTextMode) {
@@ -2367,21 +2953,12 @@ internal fun PdfReaderScreen(
                         activateRichTextMode()
                     }
                 },
-                onToolSelected = ::selectPdfAnnotationTool,
-                onColorSelected = { dispatchPdf(SharedPdfReaderAction.ColorSelected(it)) },
-                onStrokeWidthChange = { dispatchPdf(SharedPdfReaderAction.StrokeWidthChanged(it)) },
-                onUndoPage = { dispatchPdf(SharedPdfReaderAction.UndoLastAnnotationOnPage(pageIndex)) },
-                onClearPage = { dispatchPdf(SharedPdfReaderAction.ClearPageAnnotations(pageIndex)) },
-                onHighlighterSnapChange = { isHighlighterSnapEnabled = it },
                 onHighlighterPaletteChange = ::updatePdfHighlighterPalette,
                 onTextStyleChange = ::updateTextStyleConfig,
-                onExternalLookup = ::openPdfExternalLookup,
-                onOpenAiHub = { showPdfAiHub = true },
-                onCloudTtsStart = ::startPdfCloudTts,
-                onCloudTtsPauseResume = ::pauseResumePdfCloudTts,
-                onCloudTtsStop = ::stopPdfCloudTts,
                 onCloudTtsClearCache = ::clearPdfCloudTtsCache,
-                onAutoScrollChange = ::updatePdfAutoScroll,
+                onCloudTtsVoiceChange = { voiceId ->
+                    onAiByokSettingsChange(aiByokSettings.sanitized().copy(ttsSpeakerId = voiceId))
+                },
                 onTtsReplacementPreferencesChange = onTtsReplacementPreferencesChange
             )
         },
@@ -2404,38 +2981,30 @@ internal fun PdfReaderScreen(
                 onJumpForward = ::goForwardInJumpHistory,
                 onClearJumpHistory = { jumpHistory = jumpHistory.clear() },
                 extraContent = {
-                    if (featurePolicy.aiAndCloud) {
-                        val ttsActive = pdfExtrasState.cloudTts.isLoading ||
-                            pdfExtrasState.cloudTts.isPlaying ||
-                            pdfExtrasState.cloudTts.isPaused
-                        if (showPdfCloudTtsSettings) {
-                            DesktopCloudTtsSettingsOverlay(
+                    if (cloudTtsControlsAvailable) {
+                        val ttsControls = readerCloudTtsControlsModel(pdfExtrasState.cloudTts)
+                        if (ttsControls.isVisible) {
+                            SharedReaderTtsOverlayControls(
                                 settings = aiByokSettings,
-                                isTtsActive = ttsActive,
-                                showCredits = showPaidCredits,
+                                cloudTts = pdfExtrasState.cloudTts,
                                 credits = credits,
-                                cacheSummary = pdfExtrasState.cloudTts.cacheSummary,
-                                onClearCache = ::clearPdfCloudTtsCache,
-                                onSettingsChange = { next ->
-                                    onAiByokSettingsChange(
-                                        aiByokSettings.sanitized().copy(
-                                            ttsSpeakerId = next.sanitized().ttsSpeakerId
-                                        )
-                                    )
-                                }
+                                showCredits = showPaidCredits,
+                                isCollapsed = isPdfTtsOverlayCollapsed,
+                                onCollapseChange = { isPdfTtsOverlayCollapsed = it },
+                                onPauseResume = ::pauseResumePdfCloudTts,
+                                onSkipPrevious = { skipPdfCloudTtsChunk(-1) },
+                                onSkipNext = { skipPdfCloudTtsChunk(1) },
+                                onLocateCurrentChunk = ::locatePdfCloudTtsChunk,
+                                onClose = ::stopPdfCloudTts,
+                                modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 4.dp)
                             )
                         }
-                        DesktopCloudTtsChromeControls(
-                            settings = aiByokSettings,
-                            cloudTts = pdfExtrasState.cloudTts,
-                            credits = credits,
-                            showCredits = showPaidCredits,
-                            onRead = { startPdfCloudTts(ReaderTtsReadScope.BOOK) },
-                            onPauseResume = ::pauseResumePdfCloudTts,
-                            onStop = ::stopPdfCloudTts,
-                            onOpenSettings = { showPdfCloudTtsSettings = !showPdfCloudTtsSettings }
-                        )
                     }
+                    DesktopPdfBottomMarkupDock(
+                        modifier = Modifier
+                            .align(Alignment.CenterHorizontally)
+                            .padding(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 4.dp)
+                    )
                 }
             )
         },
@@ -2457,38 +3026,30 @@ internal fun PdfReaderScreen(
                 onJumpForward = ::goForwardInJumpHistory,
                 onClearJumpHistory = { jumpHistory = jumpHistory.clear() },
                 extraContent = {
-                    if (featurePolicy.aiAndCloud) {
-                        val ttsActive = pdfExtrasState.cloudTts.isLoading ||
-                            pdfExtrasState.cloudTts.isPlaying ||
-                            pdfExtrasState.cloudTts.isPaused
-                        if (showPdfCloudTtsSettings) {
-                            DesktopCloudTtsSettingsOverlay(
+                    if (cloudTtsControlsAvailable) {
+                        val ttsControls = readerCloudTtsControlsModel(pdfExtrasState.cloudTts)
+                        if (ttsControls.isVisible) {
+                            SharedReaderTtsOverlayControls(
                                 settings = aiByokSettings,
-                                isTtsActive = ttsActive,
-                                showCredits = showPaidCredits,
+                                cloudTts = pdfExtrasState.cloudTts,
                                 credits = credits,
-                                cacheSummary = pdfExtrasState.cloudTts.cacheSummary,
-                                onClearCache = ::clearPdfCloudTtsCache,
-                                onSettingsChange = { next ->
-                                    onAiByokSettingsChange(
-                                        aiByokSettings.sanitized().copy(
-                                            ttsSpeakerId = next.sanitized().ttsSpeakerId
-                                        )
-                                    )
-                                }
+                                showCredits = showPaidCredits,
+                                isCollapsed = isPdfTtsOverlayCollapsed,
+                                onCollapseChange = { isPdfTtsOverlayCollapsed = it },
+                                onPauseResume = ::pauseResumePdfCloudTts,
+                                onSkipPrevious = { skipPdfCloudTtsChunk(-1) },
+                                onSkipNext = { skipPdfCloudTtsChunk(1) },
+                                onLocateCurrentChunk = ::locatePdfCloudTtsChunk,
+                                onClose = ::stopPdfCloudTts,
+                                modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 4.dp)
                             )
                         }
-                        DesktopCloudTtsChromeControls(
-                            settings = aiByokSettings,
-                            cloudTts = pdfExtrasState.cloudTts,
-                            credits = credits,
-                            showCredits = showPaidCredits,
-                            onRead = { startPdfCloudTts(ReaderTtsReadScope.BOOK) },
-                            onPauseResume = ::pauseResumePdfCloudTts,
-                            onStop = ::stopPdfCloudTts,
-                            onOpenSettings = { showPdfCloudTtsSettings = !showPdfCloudTtsSettings }
-                        )
                     }
+                    DesktopPdfBottomMarkupDock(
+                        modifier = Modifier
+                            .align(Alignment.CenterHorizontally)
+                            .padding(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 4.dp)
+                    )
                 }
             )
         }
@@ -2520,22 +3081,32 @@ internal fun PdfReaderScreen(
             onNext = { goToSearchResult(activeSearchIndex + 1) },
             onToggleHighlightMode = { dispatchPdf(SharedPdfReaderAction.SearchHighlightModeToggled) }
         )
+        val pdfViewportBackground = desktopPdfViewportBackgroundColor(
+            displayMode = displayMode,
+            pageBackgroundColor = pdfThemeStyle.pageBackgroundColor,
+            appBackgroundColor = MaterialTheme.colorScheme.surfaceVariant,
+            isVerticalPageGapVisible = pdfReaderSettings.pdfVerticalPageGapVisible
+        )
         if (displayMode == PdfDisplayMode.VERTICAL_SCROLL) {
             val verticalPageGap = pdfVerticalPageGapDp(
                 isPageGapVisible = pdfReaderSettings.pdfVerticalPageGapVisible,
                 defaultGap = DesktopDefaultPdfVerticalPageGap
             )
-            val verticalViewportBackground = desktopPdfVerticalViewportBackgroundColor(
-                pageBackgroundColor = pdfThemeStyle.pageBackgroundColor,
-                gapBackgroundColor = MaterialTheme.colorScheme.surfaceVariant,
-                isPageGapVisible = pdfReaderSettings.pdfVerticalPageGapVisible
-            )
             Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .background(verticalViewportBackground, RoundedCornerShape(if (isFullscreen) 0.dp else 4.dp))
-                    .onGloballyPositioned { coordinates ->
-                        pdfZoomViewportRootOffset = coordinates.positionInRoot()
+                            .fillMaxSize()
+                            .background(pdfViewportBackground, RoundedCornerShape(if (isFullscreen) 0.dp else 4.dp))
+                            .onSizeChanged { size -> pdfZoomViewportSize = size }
+                            .onGloballyPositioned { coordinates ->
+                        val rootOffset = coordinates.positionInRoot()
+                        if (rootOffset != pdfZoomViewportRootOffset) {
+                            logPdfZoomSettle {
+                                "viewport_layout seq=$pdfZoomSettleSequence mode=vertical " +
+                                    "prev=${pdfZoomViewportRootOffset.formatLogOffset()} next=${rootOffset.formatLogOffset()} " +
+                                    "scale=${scale.formatLogFloat()} preview=${pdfZoomPreview != null}"
+                            }
+                        }
+                        pdfZoomViewportRootOffset = rootOffset
                     }
                     .desktopPdfZoomGestures(
                         currentZoom = scale,
@@ -2553,6 +3124,9 @@ internal fun PdfReaderScreen(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         items((0 until document.pageCount).toList(), key = { it }) { verticalPageIndex ->
+                            val verticalZoomPreview = pdfZoomPreview?.takeIf {
+                                it.displayMode == PdfDisplayMode.VERTICAL_SCROLL
+                            }
                             DesktopVerticalPdfPage(
                                 document = document,
                                 pageIndex = verticalPageIndex,
@@ -2576,12 +3150,20 @@ internal fun PdfReaderScreen(
                                 richTextController = richTextController,
                                 isRichTextMode = isRichTextMode,
                                 readerAiFeaturesAvailable = aiByokSettings.sanitized().areReaderAiFeaturesAvailable,
-                                cloudTtsAvailable = aiByokSettings.sanitized().isCloudTtsAvailable,
+                                cloudTtsAvailable = cloudTtsControlsAvailable && aiByokSettings.sanitized().isCloudTtsAvailable,
                                 externalLookupAvailable = featurePolicy.externalLookup,
                                 themeStyle = pdfThemeStyle,
                                 shouldRender = verticalPageIndex in verticalRenderWindow,
-                                zoomPreview = pdfZoomPreview?.takeIf {
-                                    it.displayMode == PdfDisplayMode.VERTICAL_SCROLL
+                                zoomPreview = verticalZoomPreview,
+                                zoomPreviewAnchorPageRootOffset = verticalZoomPreview
+                                    ?.pageIndex
+                                    ?.let { verticalPageRootOffsets[it] },
+                                zoomPreviewScrollBounds = verticalZoomPreview?.let {
+                                    desktopPdfZoomScrollBoundsWithCommitTargets(
+                                        preview = it,
+                                        currentHorizontalScroll = pageHorizontalScrollState.value,
+                                        maxHorizontalScroll = pageHorizontalScrollState.maxValue
+                                    )
                                 },
                                 zoomViewportRootOffset = pdfZoomViewportRootOffset,
                                 showPageNumberOverlay = pdfReaderSettings.pdfPageNumberOverlayVisible,
@@ -2615,6 +3197,16 @@ internal fun PdfReaderScreen(
                                     }
                                 },
                                 onPagePositioned = { page, offset ->
+                                    val previousOffset = verticalPageRootOffsets[page]
+                                    if (previousOffset != offset) {
+                                        logPdfZoomSettle {
+                                            "page_layout seq=$pdfZoomSettleSequence mode=vertical page=${page + 1} " +
+                                                "prevRoot=${previousOffset.formatLogOffset()} nextRoot=${offset.formatLogOffset()} " +
+                                                "scale=${scale.formatLogFloat()} preview=${verticalZoomPreview != null} " +
+                                                "h=${pageHorizontalScrollState.value} list=${verticalListState.firstVisibleItemIndex}:" +
+                                                verticalListState.firstVisibleItemScrollOffset
+                                        }
+                                    }
                                     verticalPageRootOffsets[page] = offset
                                 }
                             )
@@ -2624,7 +3216,7 @@ internal fun PdfReaderScreen(
                         listState = verticalListState,
                         pageCount = document.pageCount,
                         currentPage = pageIndex,
-                        isDarkMode = verticalViewportBackground.luminance() < 0.5f,
+                        isDarkMode = pdfViewportBackground.luminance() < 0.5f,
                         modifier = Modifier.align(Alignment.CenterEnd)
                     )
                     DesktopPdfPageScrubOverlay(
@@ -2638,9 +3230,18 @@ internal fun PdfReaderScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(pdfThemeStyle.viewerBackgroundColor, RoundedCornerShape(if (isFullscreen) 0.dp else 4.dp))
+                            .background(pdfViewportBackground, RoundedCornerShape(if (isFullscreen) 0.dp else 4.dp))
+                            .onSizeChanged { size -> pdfZoomViewportSize = size }
                             .onGloballyPositioned { coordinates ->
-                                pdfZoomViewportRootOffset = coordinates.positionInRoot()
+                                val rootOffset = coordinates.positionInRoot()
+                                if (rootOffset != pdfZoomViewportRootOffset) {
+                                    logPdfZoomSettle {
+                                        "viewport_layout seq=$pdfZoomSettleSequence mode=spread " +
+                                            "prev=${pdfZoomViewportRootOffset.formatLogOffset()} next=${rootOffset.formatLogOffset()} " +
+                                            "scale=${scale.formatLogFloat()} preview=${pdfZoomPreview != null}"
+                                    }
+                                }
+                                pdfZoomViewportRootOffset = rootOffset
                             }
                             .desktopPdfZoomGestures(
                                 currentZoom = scale,
@@ -2652,10 +3253,50 @@ internal fun PdfReaderScreen(
                             .padding(24.dp),
                         contentAlignment = Alignment.TopCenter
                     ) {
+                        val spreadPageGap = desktopPdfSpreadPageGapDp(
+                            isPageGapVisible = pdfReaderSettings.pdfVerticalPageGapVisible
+                        )
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterHorizontally),
+                            horizontalArrangement = Arrangement.spacedBy(spreadPageGap, Alignment.CenterHorizontally),
                             verticalAlignment = Alignment.Top
                         ) {
+                            val spreadZoomPreview = pdfZoomPreview?.takeIf {
+                                it.displayMode == PdfDisplayMode.PAGINATION
+                            }
+                            val spreadPredictedPageCanvasSizes = paginatedVisiblePageIndices.mapNotNull { visiblePageIndex ->
+                                document.pageSizes.getOrNull(visiblePageIndex)?.let { pageSize ->
+                                    val pageDisplayScale = zoomSpec.clamp(scale)
+                                    visiblePageIndex to IntSize(
+                                        width = (pageSize.width * pageDisplayScale).roundToInt().coerceAtLeast(1),
+                                        height = (pageSize.height * pageDisplayScale).roundToInt().coerceAtLeast(1)
+                                    )
+                                }
+                            }.toMap()
+                            val spreadLayoutPrediction = spreadZoomPreview?.let {
+                                desktopPdfSpreadLayoutPrediction(
+                                    viewportRootOffset = pdfZoomViewportRootOffset,
+                                    viewportSize = pdfZoomViewportSize,
+                                    visiblePageIndices = paginatedVisiblePageIndices,
+                                    pageCanvasSizes = spreadPredictedPageCanvasSizes,
+                                    horizontalScroll = pageHorizontalScrollState.value,
+                                    verticalScroll = pageVerticalScrollState.value,
+                                    paddingPx = with(density) { 24.dp.toPx() },
+                                    pageGapPx = with(density) { spreadPageGap.toPx() }
+                                )
+                            }
+                            val spreadZoomAnchorPageRootOffset = spreadZoomPreview
+                                ?.pageIndex
+                                ?.let { spreadLayoutPrediction?.pageRootOffsets?.get(it) ?: paginatedZoomPageRoot(it) }
+                            val spreadZoomScrollBounds = spreadZoomPreview?.let {
+                                DesktopPdfZoomScrollBounds(
+                                    currentHorizontalScroll = pageHorizontalScrollState.value,
+                                    maxHorizontalScroll = spreadLayoutPrediction?.maxHorizontalScroll
+                                        ?: pageHorizontalScrollState.maxValue,
+                                    currentVerticalScroll = pageVerticalScrollState.value,
+                                    maxVerticalScroll = spreadLayoutPrediction?.maxVerticalScroll
+                                        ?: pageVerticalScrollState.maxValue
+                                )
+                            }
                             paginatedVisiblePageIndices.forEach { spreadPageIndex ->
                                 DesktopVerticalPdfPage(
                                     document = document,
@@ -2680,13 +3321,13 @@ internal fun PdfReaderScreen(
                                     richTextController = richTextController,
                                     isRichTextMode = isRichTextMode,
                                     readerAiFeaturesAvailable = aiByokSettings.sanitized().areReaderAiFeaturesAvailable,
-                                    cloudTtsAvailable = aiByokSettings.sanitized().isCloudTtsAvailable,
+                                    cloudTtsAvailable = cloudTtsControlsAvailable && aiByokSettings.sanitized().isCloudTtsAvailable,
                                     externalLookupAvailable = featurePolicy.externalLookup,
                                     themeStyle = pdfThemeStyle,
                                     shouldRender = true,
-                                    zoomPreview = pdfZoomPreview?.takeIf {
-                                        it.displayMode == PdfDisplayMode.PAGINATION
-                                    },
+                                    zoomPreview = spreadZoomPreview,
+                                    zoomPreviewAnchorPageRootOffset = spreadZoomAnchorPageRootOffset,
+                                    zoomPreviewScrollBounds = spreadZoomScrollBounds,
                                     zoomViewportRootOffset = pdfZoomViewportRootOffset,
                                     showPageNumberOverlay = pdfReaderSettings.pdfPageNumberOverlayVisible,
                                     onSelectPage = {
@@ -2719,8 +3360,21 @@ internal fun PdfReaderScreen(
                                             pageVerticalScrollState.scrollBy(-delta.y)
                                         }
                                     },
+                                    onPageSizeChanged = { page, size ->
+                                        paginatedPageCanvasSizes[page] = size
+                                    },
                                     onPagePositioned = { page, offset ->
-                                        if (page == paginatedVisiblePageIndices.firstOrNull()) {
+                                        paginatedPageRootOffsets[page] = offset
+                                        if (page == paginatedSpreadPageIndices.firstOrNull()) {
+                                            if (offset != paginatedPageRootOffset) {
+                                                logPdfZoomSettle {
+                                                    "page_layout seq=$pdfZoomSettleSequence mode=spread page=${page + 1} " +
+                                                        "prevRoot=${paginatedPageRootOffset.formatLogOffset()} " +
+                                                        "nextRoot=${offset.formatLogOffset()} scale=${scale.formatLogFloat()} " +
+                                                        "preview=${spreadZoomPreview != null} h=${pageHorizontalScrollState.value} " +
+                                                        "v=${pageVerticalScrollState.value}"
+                                                }
+                                            }
                                             paginatedPageRootOffset = offset
                                         }
                                     }
@@ -2737,9 +3391,18 @@ internal fun PdfReaderScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(pdfThemeStyle.viewerBackgroundColor, RoundedCornerShape(if (isFullscreen) 0.dp else 4.dp))
+                        .background(pdfViewportBackground, RoundedCornerShape(if (isFullscreen) 0.dp else 4.dp))
+                        .onSizeChanged { size -> pdfZoomViewportSize = size }
                         .onGloballyPositioned { coordinates ->
-                            pdfZoomViewportRootOffset = coordinates.positionInRoot()
+                            val rootOffset = coordinates.positionInRoot()
+                            if (rootOffset != pdfZoomViewportRootOffset) {
+                                logPdfZoomSettle {
+                                    "viewport_layout seq=$pdfZoomSettleSequence mode=pagination " +
+                                        "prev=${pdfZoomViewportRootOffset.formatLogOffset()} next=${rootOffset.formatLogOffset()} " +
+                                        "scale=${scale.formatLogFloat()} preview=${pdfZoomPreview != null}"
+                                }
+                            }
+                            pdfZoomViewportRootOffset = rootOffset
                         }
                         .desktopPdfZoomGestures(
                             currentZoom = scale,
@@ -2751,17 +3414,48 @@ internal fun PdfReaderScreen(
                         .padding(24.dp),
                     contentAlignment = Alignment.TopCenter
                 ) {
-                    val currentPageRender = renderedPage.takeIf { renderedPageIndex == pageIndex }
+                    val paginatedPageDisplay = renderedPageIndex
+                        ?.takeIf { displayPageIndex ->
+                            renderedPage != null && desktopPdfRenderBelongsToPage(displayPageIndex, pageIndex)
+                        }
+                        ?.let { displayPageIndex ->
+                        renderedPage?.let { render ->
+                            DesktopPdfPaginatedPageDisplay(
+                                pageIndex = displayPageIndex,
+                                render = render
+                            )
+                        }
+                    }
                     when {
-                    currentPageRender != null -> {
+                    renderError != null && paginatedPageDisplay?.pageIndex != pageIndex -> Text(
+                        renderError ?: readerString("desktop_failed_render_page", "Failed to render page."),
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    paginatedPageDisplay != null -> {
+                        Crossfade(
+                            targetState = paginatedPageDisplay.pageIndex,
+                            animationSpec = tween(DesktopPdfPaginationPageTurnAnimationMillis),
+                            label = "DesktopPdfPaginatedPage"
+                        ) { displayPageIndex ->
+                        val displayPageIsCurrent = displayPageIndex == currentPdfPageIndex
+                        val pageIndex = displayPageIndex
+                        val currentPageRender = if (displayPageIndex == paginatedPageDisplay.pageIndex) {
+                            paginatedPageDisplay.render
+                        } else {
+                            paginatedRenderCache[displayPageIndex]?.render ?: paginatedPageDisplay.render
+                        }
                         val pageSize = document.pageSizes.getOrNull(pageIndex)
                         if (pageSize == null) {
                             Text(readerString("desktop_failed_render_page", "Failed to render page."), color = MaterialTheme.colorScheme.error)
-                            return@Box
+                            return@Crossfade
                         }
                         val pageDisplayScale = zoomSpec.clamp(scale)
                         val pageWidthDp = with(density) { (pageSize.width * pageDisplayScale).toDp() }
                         val pageHeightDp = with(density) { (pageSize.height * pageDisplayScale).toDp() }
+                        val predictedPageCanvasSize = IntSize(
+                            width = (pageSize.width * pageDisplayScale).roundToInt().coerceAtLeast(1),
+                            height = (pageSize.height * pageDisplayScale).roundToInt().coerceAtLeast(1)
+                        )
                         val pageRenderScale = currentPageRender.width / pageSize.width
                         val pageAnnotations = remember(annotations, pageIndex, pageCanvasSize) {
                             annotations
@@ -2843,14 +3537,41 @@ internal fun PdfReaderScreen(
                             it.displayMode == PdfDisplayMode.PAGINATION &&
                                 it.pageIndex == pageIndex
                         }
+                        val pageLayoutPrediction = pageZoomPreview?.let {
+                            desktopPdfSinglePageLayoutPrediction(
+                                viewportRootOffset = pdfZoomViewportRootOffset,
+                                viewportSize = pdfZoomViewportSize,
+                                pageCanvasSize = predictedPageCanvasSize,
+                                horizontalScroll = pageHorizontalScrollState.value,
+                                verticalScroll = pageVerticalScrollState.value,
+                                paddingPx = with(density) { 24.dp.toPx() }
+                            )
+                        }
                         Box(
                             modifier = Modifier
                                 .size(pageWidthDp, pageHeightDp)
                                 .onGloballyPositioned { coordinates ->
-                                    paginatedPageRootOffset = coordinates.positionInRoot()
+                                    val rootOffset = coordinates.positionInRoot()
+                                    if (rootOffset != paginatedPageRootOffset) {
+                                        logPdfZoomSettle {
+                                            "page_layout seq=$pdfZoomSettleSequence mode=pagination page=${pageIndex + 1} " +
+                                                "prevRoot=${paginatedPageRootOffset.formatLogOffset()} " +
+                                                "nextRoot=${rootOffset.formatLogOffset()} scale=${scale.formatLogFloat()} " +
+                                                "preview=${pageZoomPreview != null} h=${pageHorizontalScrollState.value} " +
+                                                "v=${pageVerticalScrollState.value} canvas=${pageCanvasSize.formatLogSize()}"
+                                        }
+                                    }
+                                    paginatedPageRootOffset = rootOffset
+                                    paginatedPageRootOffsets[pageIndex] = rootOffset
                                 }
                                 .onSizeChanged { size ->
                                     if (pageCanvasSize != size) {
+                                        logPdfZoomSettle {
+                                            "page_size seq=$pdfZoomSettleSequence mode=pagination page=${pageIndex + 1} " +
+                                                "prev=${pageCanvasSize.formatLogSize()} next=${size.formatLogSize()} " +
+                                                "scale=${scale.formatLogFloat()} preview=${pageZoomPreview != null} " +
+                                                "bitmap=${currentPageRender.width}x${currentPageRender.height}"
+                                        }
                                         logPdfSelection(
                                             "layout page=${pageIndex + 1} " +
                                                 "canvas=${size.formatLogSize()} bitmap=${currentPageRender.width}x${currentPageRender.height} " +
@@ -2859,22 +3580,51 @@ internal fun PdfReaderScreen(
                                         )
                                     }
                                     pageCanvasSize = size
+                                    paginatedPageCanvasSizes[pageIndex] = size
                                 }
                                 .desktopPdfZoomPreviewLayer(
                                     preview = pageZoomPreview,
                                     currentZoom = scale,
                                     viewportRootOffset = pdfZoomViewportRootOffset,
                                     pageRootOffset = paginatedPageRootOffset,
-                                    pageCanvasSize = pageCanvasSize
+                                    pageCanvasSize = pageCanvasSize,
+                                    commitPageRootOffset = pageLayoutPrediction?.rootOffset,
+                                    scrollBounds = pageZoomPreview?.let {
+                                        DesktopPdfZoomScrollBounds(
+                                            currentHorizontalScroll = pageHorizontalScrollState.value,
+                                            maxHorizontalScroll = pageLayoutPrediction?.maxHorizontalScroll
+                                                ?: pageHorizontalScrollState.maxValue,
+                                            currentVerticalScroll = pageVerticalScrollState.value,
+                                            maxVerticalScroll = pageLayoutPrediction?.maxVerticalScroll
+                                                ?: pageVerticalScrollState.maxValue
+                                        )
+                                    }
                                 )
                                 .background(pdfThemeStyle.pageBackgroundColor, RoundedCornerShape(2.dp))
-                                .pointerInput(pageIndex, pageCanvasSize, isTextSelectionMode, selectedTool, isRichTextMode) {
-                                    if (isRichTextMode) return@pointerInput
+                                .pointerInput(
+                                    pageIndex,
+                                    pageCanvasSize,
+                                    isTextSelectionMode,
+                                    selectedTool,
+                                    isRichTextMode,
+                                    displayPageIsCurrent
+                                ) {
+                                    if (!displayPageIsCurrent || isRichTextMode) return@pointerInput
                                     awaitPointerEventScope {
                                         while (true) {
                                             val event = awaitPointerEvent()
                                             val point = event.changes.firstOrNull()?.position ?: continue
                                             if (event.type == PointerEventType.Press && event.buttons.isPrimaryPressed) {
+                                                if (isTextSelectionMode) {
+                                                    logPdfChromeTap {
+                                                        "page_press source=paginated_inline_page page=${pageIndex + 1} " +
+                                                            "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
+                                                            "consumedBefore=${event.changes.any { it.isConsumed }} " +
+                                                            "selectionActive=${currentTextSelection != null} " +
+                                                            "selectionMenuOpen=${selectionMenuOffset != null} " +
+                                                            "selectedTool=$selectedTool richText=$isRichTextMode"
+                                                    }
+                                                }
                                                 val highlightHit = if (selectedTool != PdfInkTool.TEXT && selectedTool != PdfInkTool.ERASER) {
                                                     currentPdfAnnotations.asReversed().firstOrNull {
                                                         it.isDesktopTextSelectionHighlight &&
@@ -2885,6 +3635,10 @@ internal fun PdfReaderScreen(
                                                     null
                                                 }
                                                 if (highlightHit != null) {
+                                                    logPdfChromeTap {
+                                                        "page_press_consume source=paginated_inline_page page=${pageIndex + 1} " +
+                                                            "reason=text_selection_highlight annotation=${highlightHit.id}"
+                                                    }
                                                     selectAnnotation(highlightHit)
                                                     clearPdfInteractionState()
                                                     event.changes.forEach { it.consume() }
@@ -2893,6 +3647,10 @@ internal fun PdfReaderScreen(
                                                 if (selectedTool != PdfInkTool.TEXT) {
                                                     val linkTarget = document.linkAt(pageIndex, point, pageCanvasSize)
                                                     if (linkTarget != null) {
+                                                        logPdfChromeTap {
+                                                            "page_press_consume source=paginated_inline_page page=${pageIndex + 1} " +
+                                                                "reason=link target=${linkTarget.formatLogTarget()}"
+                                                        }
                                                         logPdfLink(
                                                             "tap_hit mode=page page=${pageIndex + 1} " +
                                                                 "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
@@ -2907,6 +3665,10 @@ internal fun PdfReaderScreen(
                                                     it.sharedPdfEmbeddedHitTest(point, pageCanvasSize)
                                                 }
                                                 if (embeddedHit != null) {
+                                                    logPdfChromeTap {
+                                                        "page_press_consume source=paginated_inline_page page=${pageIndex + 1} " +
+                                                            "reason=embedded_annotation annotation=${embeddedHit.id}"
+                                                    }
                                                     selectEmbeddedAnnotation(embeddedHit)
                                                     clearPdfInteractionState()
                                                     event.changes.forEach { it.consume() }
@@ -2914,10 +3676,19 @@ internal fun PdfReaderScreen(
                                                     currentTextSelection != null &&
                                                     selectionMenuOffset == null
                                                 ) {
+                                                    logPdfChromeTap {
+                                                        "page_press_passthrough source=paginated_inline_page page=${pageIndex + 1} " +
+                                                            "action=clear_selection consumed=false"
+                                                    }
                                                     selectionMenuOffset = null
                                                     textSelection = null
                                                     selectionStartHit = null
                                                     selectionEndHit = null
+                                                } else if (isTextSelectionMode) {
+                                                    logPdfChromeTap {
+                                                        "page_press_passthrough source=paginated_inline_page page=${pageIndex + 1} " +
+                                                            "action=none consumed=false"
+                                                    }
                                                 }
                                             } else if (event.type == PointerEventType.Press && event.buttons.isSecondaryPressed) {
                                                 val selection = currentTextSelection
@@ -2935,32 +3706,50 @@ internal fun PdfReaderScreen(
                                         }
                                     }
                                 }
-                                .pointerInput(pageIndex, pageCanvasSize, isTextSelectionMode, isRichTextMode) {
-                                    if (isRichTextMode || !isTextSelectionMode) return@pointerInput
-                                    detectTapGestures(
-                                        onLongPress = { point ->
-                                            val selection = document.wordSelectionAt(pageIndex, point, pageCanvasSize)
-                                            if (selection != null) {
-                                                selectionStartIndex = null
-                                                selectionEndIndex = null
-                                                selectionStartHit = null
-                                                selectionEndHit = null
-                                                activeSelectionHandle = null
-                                                textSelection = selection
-                                                selectionMenuOffset = selection.menuAnchor(pageCanvasSize, point)
-                                                logPdfSelection(
-                                                    "long_press page=${pageIndex + 1} " +
-                                                        "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
-                                                        "range=${selection.startIndex}..${selection.endIndex} " +
-                                                        "chars=${selection.text.length} " +
-                                                        "text=\"${selection.text.logPreview()}\""
-                                                )
-                                            }
+                                .pointerInput(
+                                    pageIndex,
+                                    pageCanvasSize,
+                                    isTextSelectionMode,
+                                    isRichTextMode,
+                                    displayPageIsCurrent
+                                ) {
+                                    if (!displayPageIsCurrent || isRichTextMode || !isTextSelectionMode) return@pointerInput
+                                    detectDesktopPdfTextSelectionLongPress(
+                                        source = "paginated_inline_page",
+                                        pageIndex = pageIndex
+                                    ) { point ->
+                                        val selection = document.wordSelectionAt(pageIndex, point, pageCanvasSize)
+                                        logPdfChromeTap {
+                                            "long_press_selection source=paginated_inline_page page=${pageIndex + 1} " +
+                                                "selectionFound=${selection != null} " +
+                                                "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()}"
                                         }
-                                    )
+                                        if (selection != null) {
+                                            selectionStartIndex = null
+                                            selectionEndIndex = null
+                                            selectionStartHit = null
+                                            selectionEndHit = null
+                                            activeSelectionHandle = null
+                                            textSelection = selection
+                                            selectionMenuOffset = selection.menuAnchor(pageCanvasSize, point)
+                                            logPdfSelection(
+                                                "long_press page=${pageIndex + 1} " +
+                                                    "x=${point.x.formatLogFloat()} y=${point.y.formatLogFloat()} " +
+                                                    "range=${selection.startIndex}..${selection.endIndex} " +
+                                                    "chars=${selection.text.length} " +
+                                                    "text=\"${selection.text.logPreview()}\""
+                                            )
+                                        }
+                                    }
                                 }
-                                .pointerInput(pageIndex, selectedTool, isTextSelectionMode, isRichTextMode) {
-                                    if (isRichTextMode || isTextSelectionMode || selectedTool != PdfInkTool.NONE) return@pointerInput
+                                .pointerInput(
+                                    pageIndex,
+                                    selectedTool,
+                                    isTextSelectionMode,
+                                    isRichTextMode,
+                                    displayPageIsCurrent
+                                ) {
+                                    if (!displayPageIsCurrent || isRichTextMode || isTextSelectionMode || selectedTool != PdfInkTool.NONE) return@pointerInput
                                     awaitEachGesture {
                                         val down = awaitFirstDown(requireUnconsumed = false)
                                         if (!currentEvent.buttons.isPrimaryPressed) return@awaitEachGesture
@@ -3003,10 +3792,11 @@ internal fun PdfReaderScreen(
                                     textStyleConfig,
                                     activeTextDraft?.id,
                                     isRichTextMode,
+                                    displayPageIsCurrent,
                                     pageCanvasSize, currentPageRender.width,
                                     currentPageRender.height
                                 ) {
-                                    if (isRichTextMode) return@pointerInput
+                                    if (!displayPageIsCurrent || isRichTextMode) return@pointerInput
                                     if (isTextSelectionMode) {
                                         var latestSelectionDragPoint: Offset? = null
                                         var lastSelectionPreviewAt = 0L
@@ -3344,6 +4134,10 @@ internal fun PdfReaderScreen(
                                         .matchParentSize()
                                         .pointerInput(pageIndex, selectionMenuOffset) {
                                             detectTapGestures {
+                                                logPdfChromeTap {
+                                                    "selection_menu_scrim_tap source=paginated_inline_page page=${pageIndex + 1} " +
+                                                        "consumedByScrim=true"
+                                                }
                                                 selectionMenuOffset = null
                                                 textSelection = null
                                                 selectionStartHit = null
@@ -3381,10 +4175,11 @@ internal fun PdfReaderScreen(
                                     clearSelection()
                                 },
                                 showDefine = aiByokSettings.sanitized().areReaderAiFeaturesAvailable,
-                                showSpeak = aiByokSettings.sanitized().isCloudTtsAvailable,
+                                showSpeak = cloudTtsControlsAvailable && aiByokSettings.sanitized().isCloudTtsAvailable,
                                 showSearch = featurePolicy.externalLookup,
                                 onClear = ::clearSelection
                             )
+                        }
                         }
                     }
                     isRendering -> CircularProgressIndicator(modifier = Modifier.padding(48.dp))
@@ -3442,23 +4237,23 @@ internal fun PdfReaderScreen(
             selectedTextHighlight != null -> {
                 DesktopReaderBottomSheet(
                     title = selectedTextHighlight.desktopSheetTitle(),
-                    onDismiss = { dispatchPdf(SharedPdfReaderAction.AnnotationSelected(null)) }
+                    onDismiss = ::dismissSelectedTextHighlightSheet
                 ) {
                     DesktopPdfAnnotationEditor(
                         annotation = selectedTextHighlight,
                         onUpdate = ::updateAnnotation,
-                        onDelete = { deleteAnnotation(selectedTextHighlight.id) },
-                        onClose = { dispatchPdf(SharedPdfReaderAction.AnnotationSelected(null)) },
+                        onDelete = { deleteSelectedTextHighlight(selectedTextHighlight) },
+                        onClose = ::dismissSelectedTextHighlightSheet,
                         onCopy = {
                             clipboardManager.setText(AnnotatedString(selectedTextHighlight.text))
-                            dispatchPdf(SharedPdfReaderAction.AnnotationSelected(null))
+                            dismissSelectedTextHighlightSheet()
                         },
                         showSearch = featurePolicy.externalLookup,
                         highlighterPalette = pdfHighlighterColors,
                         onHighlighterPaletteChange = ::updatePdfHighlighterPalette,
                         onSearch = {
                             openPdfExternalLookup(ReaderExternalLookupAction.SEARCH, selectedTextHighlight.text)
-                            dispatchPdf(SharedPdfReaderAction.AnnotationSelected(null))
+                            dismissSelectedTextHighlightSheet()
                         }
                     )
                 }

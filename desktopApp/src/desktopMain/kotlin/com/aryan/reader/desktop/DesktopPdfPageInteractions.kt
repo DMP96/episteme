@@ -1,6 +1,11 @@
 package com.aryan.reader.desktop
 
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.unit.IntSize
 import com.aryan.reader.shared.pdf.PdfAnnotationKind
 import com.aryan.reader.shared.pdf.PdfInkTool
@@ -9,11 +14,17 @@ import com.aryan.reader.shared.pdf.PdfPageBounds
 import com.aryan.reader.shared.pdf.PdfPagePoint
 import com.aryan.reader.shared.pdf.PdfSelectionGeometry
 import com.aryan.reader.shared.pdf.PdfTextCharBounds
+import com.aryan.reader.shared.pdf.PdfZoomSpec
 import com.aryan.reader.shared.pdf.SharedPdfAnnotation
 import com.aryan.reader.shared.pdf.SharedPdfInkRenderer
+import com.aryan.reader.shared.pdf.SharedPdfReaderAction
+import com.aryan.reader.shared.pdf.SharedPdfReaderState
 import com.aryan.reader.shared.pdf.SharedPdfTextDraft
+import com.aryan.reader.shared.pdf.reduce
 import com.aryan.reader.shared.ui.sharedPdfHitTest
 import com.aryan.reader.shared.ui.toSharedPdfPoint
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 
 internal val PdfInkTool.isDesktopHighlighter: Boolean
     get() = this == PdfInkTool.HIGHLIGHTER || this == PdfInkTool.HIGHLIGHTER_ROUND
@@ -23,6 +34,24 @@ internal val SharedPdfAnnotation.isDesktopTextSelectionHighlight: Boolean
         text.isNotBlank() &&
         rangeStartIndex != null &&
         rangeEndIndex != null
+
+internal fun SharedPdfReaderState.withDesktopPdfTextSelectionHighlightAdded(
+    annotation: SharedPdfAnnotation,
+    zoomSpec: PdfZoomSpec = PdfZoomSpec()
+): SharedPdfReaderState {
+    val next = reduce(SharedPdfReaderAction.AnnotationAdded(annotation), zoomSpec)
+    return if (annotation.isDesktopTextSelectionHighlight) {
+        next.reduce(SharedPdfReaderAction.AnnotationSelected(null), zoomSpec)
+    } else {
+        next
+    }
+}
+
+internal fun SharedPdfReaderState.withDesktopPdfTextHighlightSheetDismissed(
+    zoomSpec: PdfZoomSpec = PdfZoomSpec()
+): SharedPdfReaderState {
+    return reduce(SharedPdfReaderAction.AnnotationSelected(null), zoomSpec)
+}
 
 internal fun List<PdfPagePoint>.withDesktopPdfDragPoint(
     point: Offset,
@@ -44,6 +73,95 @@ internal fun List<PdfPagePoint>.withDesktopPdfDragPoint(
         )
     }
     return this + nextPoint
+}
+
+internal suspend fun PointerInputScope.detectDesktopPdfTextSelectionLongPress(
+    source: String,
+    pageIndex: Int,
+    onLongPress: (Offset) -> Unit
+) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val secondaryDown = currentEvent.buttons.isSecondaryPressed
+        logPdfChromeTap {
+            "long_press_down source=$source page=${pageIndex + 1} " +
+                "x=${down.position.x.formatLogFloat()} y=${down.position.y.formatLogFloat()} " +
+                "downConsumed=${down.isConsumed} secondary=$secondaryDown"
+        }
+        if (down.isConsumed || secondaryDown) {
+            logPdfChromeTap {
+                "long_press_skip source=$source page=${pageIndex + 1} " +
+                    "reason=${if (down.isConsumed) "down_consumed" else "secondary_button"}"
+            }
+            return@awaitEachGesture
+        }
+        val pointerId = down.id
+        val start = down.position
+        var latestPosition = start
+        var canceledBeforeLongPress = false
+        var longPressReached = false
+        var cancelReason = ""
+
+        try {
+            withTimeout(viewConfiguration.longPressTimeoutMillis) {
+                while (true) {
+                    val event = awaitPointerEvent()
+                    if (event.buttons.isSecondaryPressed) {
+                        canceledBeforeLongPress = true
+                        cancelReason = "secondary_button"
+                        return@withTimeout
+                    }
+                    val change = event.changes.firstOrNull { it.id == pointerId }
+                    if (change == null) {
+                        canceledBeforeLongPress = true
+                        cancelReason = "pointer_lost"
+                        return@withTimeout
+                    }
+                    latestPosition = change.position
+                    val distance = (latestPosition - start).getDistance()
+                    when {
+                        change.isConsumed -> {
+                            canceledBeforeLongPress = true
+                            cancelReason = "change_consumed"
+                            return@withTimeout
+                        }
+                        change.changedToUp() || !change.pressed -> {
+                            canceledBeforeLongPress = true
+                            cancelReason = "up_before_long_press"
+                            return@withTimeout
+                        }
+                        distance > viewConfiguration.touchSlop -> {
+                            canceledBeforeLongPress = true
+                            cancelReason = "moved distance=${distance.formatLogFloat()}"
+                            return@withTimeout
+                        }
+                    }
+                }
+            }
+        } catch (_: TimeoutCancellationException) {
+            longPressReached = !canceledBeforeLongPress
+        }
+
+        if (!longPressReached) {
+            logPdfChromeTap {
+                "long_press_cancel source=$source page=${pageIndex + 1} " +
+                    "reason=${cancelReason.ifBlank { "unknown" }} " +
+                    "x=${latestPosition.x.formatLogFloat()} y=${latestPosition.y.formatLogFloat()}"
+            }
+            return@awaitEachGesture
+        }
+        logPdfChromeTap {
+            "long_press_reached source=$source page=${pageIndex + 1} " +
+                "x=${latestPosition.x.formatLogFloat()} y=${latestPosition.y.formatLogFloat()}"
+        }
+        onLongPress(latestPosition)
+        while (true) {
+            val event = awaitPointerEvent()
+            val change = event.changes.firstOrNull { it.id == pointerId } ?: return@awaitEachGesture
+            change.consume()
+            if (change.changedToUp() || !change.pressed) return@awaitEachGesture
+        }
+    }
 }
 
 internal data class DesktopPdfCharHit(
@@ -318,7 +436,7 @@ private fun DesktopPdfTextChar.toPdfTextCharBounds(): PdfTextCharBounds {
 }
 
 internal const val DesktopPdfSelectionPreviewThrottleMillis = 32L
-internal const val DesktopPdfZoomCommitDebounceMillis = 180L
+internal const val DesktopPdfZoomCommitDebounceMillis = 260L
 internal const val DesktopPdfZoomRenderDebounceMillis = 300L
 internal const val DesktopPdfViewportPersistDebounceMillis = 300L
 internal const val DesktopPdfPaginationPrefetchDelayMillis = 450L

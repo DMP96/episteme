@@ -3,6 +3,7 @@ package com.aryan.reader.desktop
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -23,7 +24,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowPlacement
@@ -41,13 +41,13 @@ import com.aryan.reader.shared.LibraryAction
 import com.aryan.reader.shared.ReaderAiByokSettings
 import com.aryan.reader.shared.ReaderAiFeature
 import com.aryan.reader.shared.ReaderAiResultState
-import com.aryan.reader.shared.ReaderAutoScrollState
 import com.aryan.reader.shared.ReaderCloudTtsState
 import com.aryan.reader.shared.ReaderContextExtractor
 import com.aryan.reader.shared.RecapResult
 import com.aryan.reader.shared.ReaderExternalLookupAction
 import com.aryan.reader.shared.ReaderExtrasState
 import com.aryan.reader.shared.ReaderFeatureSurface
+import com.aryan.reader.shared.ReaderLocator
 import com.aryan.reader.shared.ReaderPlatform
 import com.aryan.reader.shared.ReaderTtsCacheSummary
 import com.aryan.reader.shared.ReaderTtsChunk
@@ -86,29 +86,36 @@ import com.aryan.reader.shared.reader.ReaderSettings
 import com.aryan.reader.shared.reader.SharedEpubMetadataEditor
 import com.aryan.reader.shared.reader.SharedEpubMetadataUpdate
 import com.aryan.reader.shared.reader.SharedEpubPaginationCache
+import com.aryan.reader.shared.reader.SharedJvmBookLoadSemanticMode
 import com.aryan.reader.shared.reader.SharedJvmBookLoader
+import com.aryan.reader.shared.readerCloudTtsControlsModel
 import com.aryan.reader.shared.reduce
 import com.aryan.reader.shared.sharedSettingsHubModel
+import com.aryan.reader.shared.shouldApplyRemoteCloudBookMetadataUpdate
+import com.aryan.reader.shared.shouldUploadLocalCloudBookContent
+import com.aryan.reader.shared.shouldUploadLocalCloudBookMetadataUpdate
 import com.aryan.reader.shared.ui.NonReaderLibraryTab
 import com.aryan.reader.shared.ui.SharedAboutScreen
 import com.aryan.reader.shared.ui.SharedAddToShelfDialog
 import com.aryan.reader.shared.ui.SharedAppShell
 import com.aryan.reader.shared.ui.SharedAppTab
 import com.aryan.reader.shared.ui.SharedAppTheme
+import com.aryan.reader.shared.ui.SharedAppThemeControls
 import com.aryan.reader.shared.ui.SharedAppThemeSettingsDialog
 import com.aryan.reader.shared.ui.SharedBookInfoDialog
 import com.aryan.reader.shared.ui.SharedConfirmDialog
 import com.aryan.reader.shared.ui.SharedCustomFontsScreen
 import com.aryan.reader.shared.ui.SharedHelpFeedbackScreen
 import com.aryan.reader.shared.ui.LocalSharedStringResolver
+import com.aryan.reader.shared.ui.SharedManageShelfBooksDialog
 import com.aryan.reader.shared.ui.SharedOpdsScreen
 import com.aryan.reader.shared.ui.SharedReaderModalOwnerWindowProvider
+import com.aryan.reader.shared.ui.SharedReaderTtsOverlayControls
 import com.aryan.reader.shared.ui.SharedSettingsHub
 import com.aryan.reader.shared.ui.SharedSupportProjectScreen
 import com.aryan.reader.shared.ui.SharedTextInputDialog
 import com.aryan.reader.shared.ui.readerString
 import com.aryan.reader.shared.withTtsReplacements
-import dev.datlag.kcef.KCEF
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -121,7 +128,15 @@ import java.io.File
 import java.net.URI
 import java.util.Base64
 import java.util.UUID
-import kotlin.math.max
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
+
+private const val DesktopReaderCloseDisposeSyncDelayMillis = 350L
+private const val DesktopVerticalInitialPreparedHtmlChapterRadius = 2
+private const val DesktopLibraryOpenPersistDebounceMillis = 300L
+private const val DesktopCloudContentRetryDelayMillis = 10_000L
+private const val DesktopReaderPositionPersistDebounceMillis = 650L
+private const val DesktopProgressEpsilon = 0.001f
 
 private enum class DesktopFeatureNoticeAction {
     SIGN_IN,
@@ -136,6 +151,11 @@ private data class DesktopFeatureNotice(
     val confirmKey: String = "action_ok",
     val confirmFallback: String = "OK",
     val action: DesktopFeatureNoticeAction? = null
+)
+
+private data class DesktopFeatureNoticeState(
+    val notice: DesktopFeatureNotice,
+    val placement: DesktopFeatureNoticePlacement
 )
 
 private data class DesktopCloudSyncCredentials(
@@ -171,6 +191,7 @@ internal fun EpistemeDesktopApp(
         return desktopStringResolver.quantityString(name, quantity, fallbackOne, fallbackOther, *args)
     }
     val featurePolicy = desktopBuildProfile.featurePolicy
+    val desktopAiKeySettingsAvailable = desktopBuildProfile.aiKeySettingsAvailable
     val libraryProjector = remember { SharedLibraryStateProjector(DesktopFolderPathResolver) }
     val readerEngine = remember { ReaderEngine() }
     val libraryDatabase = remember { DesktopLibraryDatabase() }
@@ -192,6 +213,16 @@ internal fun EpistemeDesktopApp(
     val desktopAccountProfileRepository = remember { DesktopAccountProfileRepository(desktopCloudConfig) }
     val desktopCloudSyncSettingsStore = remember { DesktopCloudSyncSettingsStore() }
     val initialDesktopCloudSyncSettings = remember { desktopCloudSyncSettingsStore.load() }
+    val initialDesktopAccountSession = remember(desktopBuildProfile, featurePolicy) {
+        if (featurePolicy.aiAndCloud && featurePolicy.networkAccess && !desktopBuildProfile.byokAiAvailable) {
+            desktopAuthRepository.currentSession()
+        } else {
+            null
+        }
+    }
+    val initialDesktopAccountProfile = remember(initialDesktopAccountSession?.user?.uid) {
+        initialDesktopAccountSession?.user?.uid?.let(desktopAccountProfileRepository::cachedProfile)
+    }
     val desktopInstallationIdStore = remember { DesktopInstallationIdStore() }
     val desktopFirestoreRepository = remember { DesktopFirestoreRepository(desktopCloudConfig) }
     val desktopGoogleDriveRepository = remember { DesktopGoogleDriveRepository() }
@@ -207,10 +238,19 @@ internal fun EpistemeDesktopApp(
     var aiByokSettings by remember {
         mutableStateOf(aiByokStore.load())
     }
+    val sanitizedAiByokSettings = aiByokSettings.toDesktopPersistableAiSettings()
+    val desktopByokCloudTtsAvailable = featurePolicy.aiAndCloud &&
+        featurePolicy.networkAccess &&
+        sanitizedAiByokSettings.isByokCloudTtsAvailable
+    val desktopCreditCloudTtsControlsAvailable =
+        desktopBuildProfile.creditBackedCloudTtsControlsAvailable && desktopCloudConfig.isTtsWorkerConfigured
+    val desktopCloudTtsControlsAvailable = desktopByokCloudTtsAvailable || desktopCreditCloudTtsControlsAvailable
+    val desktopCloudTtsUsesCredits = desktopCreditCloudTtsControlsAvailable && !desktopByokCloudTtsAvailable
     val initialLibrarySnapshot = remember { libraryDatabase.load().withDesktopDefaults() }
     val scope = rememberCoroutineScope()
-    var webViewRuntimeState by remember { mutableStateOf(DesktopWebViewRuntimeState()) }
-    var webViewRuntimeRequested by remember { mutableStateOf(false) }
+    val webViewRuntimeState = remember {
+        DesktopWebViewRuntimeState(initialized = desktopEpubWebViewUsesNativeSwtBrowser())
+    }
     var readerCustomTextureIds by remember { mutableStateOf(DesktopReaderTextures.importedTextureIds()) }
     val appWindowFullscreen = appWindowPlacement == WindowPlacement.Fullscreen
 
@@ -223,16 +263,13 @@ internal fun EpistemeDesktopApp(
         enabled = readerFullscreen && !appWindowFullscreen
     )
 
-    DisposableEffect(Unit) {
-        onDispose {
-            KCEF.disposeBlocking()
-        }
-    }
-
     var shelfRecords by remember { mutableStateOf(initialLibrarySnapshot.shelfRecords) }
     var shelfRefs by remember { mutableStateOf(initialLibrarySnapshot.shelfRefs) }
     var state by remember {
         val initialState = initialLibrarySnapshot.toDesktopReaderScreenState().copy(
+            currentUser = initialDesktopAccountSession?.user,
+            isProUser = initialDesktopAccountProfile?.isProUser == true,
+            credits = initialDesktopAccountProfile?.credits ?: 0,
             isSyncEnabled = initialDesktopCloudSyncSettings.isSyncEnabled,
             isFolderSyncEnabled = initialDesktopCloudSyncSettings.isFolderSyncEnabled
         )
@@ -247,20 +284,45 @@ internal fun EpistemeDesktopApp(
     var accountStatusMessage by remember { mutableStateOf<String?>(null) }
     var accountBusy by remember { mutableStateOf(false) }
     var accountRefreshRequestCount by remember { mutableStateOf(0) }
+    var desktopAccountProfileRefreshCompleted by remember {
+        mutableStateOf(
+            !featurePolicy.aiAndCloud ||
+                desktopBuildProfile.byokAiAvailable ||
+                initialDesktopAccountSession == null
+        )
+    }
+    fun requestDesktopAccountRefreshAfterUsage(usage: DesktopPaidAiUsage = DesktopPaidAiUsage()) {
+        if (!featurePolicy.aiAndCloud || desktopBuildProfile.byokAiAvailable) return
+        scope.launch {
+            val nextCredits = desktopCreditsAfterPaidAiUsage(state.credits, usage.cost)
+            if (nextCredits != state.credits) {
+                state = libraryProjector.projectDesktopLibraryState(
+                    state = state.copy(credits = nextCredits),
+                    shelfRecords = shelfRecords,
+                    shelfRefs = shelfRefs
+                )
+            }
+            accountRefreshRequestCount++
+        }
+    }
     fun effectiveAiSettings(): ReaderAiByokSettings {
-        val hidden = aiByokSettings.hideReaderAiFeatures
+        val sanitized = aiByokSettings.toDesktopPersistableAiSettings()
+        val byokCloudTtsAvailable = featurePolicy.aiAndCloud &&
+            featurePolicy.networkAccess &&
+            sanitized.isByokCloudTtsAvailable
         return if (desktopBuildProfile.byokAiAvailable) {
             aiByokSettings.withDesktopFeaturePolicy(featurePolicy)
         } else {
             ReaderAiByokSettings(
-                hideReaderAiFeatures = hidden,
-                ttsSpeakerId = aiByokSettings.sanitized().ttsSpeakerId,
+                geminiKey = if (featurePolicy.aiAndCloud && featurePolicy.networkAccess) sanitized.geminiKey else "",
+                hideReaderAiFeatures = false,
+                ttsModel = if (featurePolicy.aiAndCloud && featurePolicy.networkAccess) sanitized.ttsModel else "",
+                ttsSpeakerId = sanitized.ttsSpeakerId,
                 serverBackedReaderAiFeatures = featurePolicy.aiAndCloud && featurePolicy.networkAccess,
-                serverBackedCloudTts = featurePolicy.aiAndCloud &&
-                    featurePolicy.networkAccess &&
+                serverBackedCloudTts = !byokCloudTtsAvailable &&
+                    desktopCreditCloudTtsControlsAvailable &&
                     state.currentUser != null &&
-                    state.credits > 0 &&
-                    desktopCloudConfig.isTtsWorkerConfigured
+                    state.credits > 0
             )
         }
     }
@@ -279,10 +341,7 @@ internal fun EpistemeDesktopApp(
                 currentSignedIn = { state.currentUser != null },
                 currentIsProUser = { state.isProUser },
                 currentCredits = { state.credits },
-                onUsageCompleted = {
-                    scope.launch { accountRefreshRequestCount++ }
-                    Unit
-                }
+                onUsageReported = ::requestDesktopAccountRefreshAfterUsage
             )
         }
     }
@@ -292,15 +351,15 @@ internal fun EpistemeDesktopApp(
             networkAccess = { featurePolicy.networkAccess },
             workerUrlProvider = { desktopCloudConfig.ttsWorkerUrl },
             authTokenProvider = { desktopAuthRepository.freshIdToken() },
-            useWorkerProvider = { !desktopBuildProfile.byokAiAvailable },
+            useWorkerProvider = { true },
             onWorkerUsageCompleted = {
-                scope.launch { accountRefreshRequestCount++ }
+                requestDesktopAccountRefreshAfterUsage()
                 Unit
             }
         )
     }
     val desktopSummaryCacheStore = remember { DesktopSummaryCacheStore() }
-    var selectedTab by remember { mutableStateOf(SharedAppTab.HOME) }
+    var selectedTab by remember { mutableStateOf(DesktopInitialAppTab) }
     var selectedLibraryTab by remember { mutableStateOf(NonReaderLibraryTab.BOOKS) }
     var customFonts by remember {
         mutableStateOf(initialLibrarySnapshot.customFonts.filterNot { it.isDeleted }.sortedBy { it.displayName.lowercase() })
@@ -309,75 +368,23 @@ internal fun EpistemeDesktopApp(
     var reflowingPdfBookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     val desktopEpubPaginationCache = remember { SharedEpubPaginationCache() }
     var epubPaginationCacheGeneration by remember { mutableStateOf(0) }
-    LaunchedEffect(webViewRuntimeRequested) {
-        if (!shouldStartDesktopWebViewRuntime(webViewRuntimeRequested, webViewRuntimeState)) {
-            return@LaunchedEffect
-        }
-
-        val webViewBundleDir = withContext(Dispatchers.IO) { bundledDesktopWebViewDir() }
-        val webViewBundlePresent = withContext(Dispatchers.IO) {
-            isBundledDesktopWebViewPresent(webViewBundleDir)
-        }
-        if (!webViewBundlePresent) {
-            webViewRuntimeState = webViewRuntimeState.copy(
-                errorMessage = "Bundled embedded webview is missing from ${webViewBundleDir.absolutePath}."
-            )
-            return@LaunchedEffect
-        }
-
-        runCatching {
-            withContext(Dispatchers.IO) {
-                KCEF.init(
-                    builder = {
-                        installDir(webViewBundleDir)
-                        progress {
-                            onDownloading {
-                                webViewRuntimeState = webViewRuntimeState.copy(downloadProgress = max(it, 0f))
-                            }
-                            onInitialized {
-                                webViewRuntimeState = webViewRuntimeState.copy(initialized = true, errorMessage = null)
-                            }
-                        }
-                        settings {
-                            cachePath = File(desktopUserCacheRoot(), "kcef").absolutePath
-                        }
-                    },
-                    onError = { error ->
-                        webViewRuntimeState = webViewRuntimeState.copy(errorMessage = error?.message ?: error.toString())
-                    },
-                    onRestartRequired = {
-                        webViewRuntimeState = webViewRuntimeState.copy(restartRequired = true)
-                    }
-                )
-            }
-        }.onFailure { error ->
-            webViewRuntimeState = webViewRuntimeState.copy(errorMessage = error.message ?: error.toString())
-        }
-    }
-    LaunchedEffect(readerWindows) {
-        if (readerWindows.any { window ->
-                val content = window.content
-                content is DesktopReaderWindowContent.Text &&
-                    content.session.reader.book.chapters.isNotEmpty() &&
-                    content.session.reader.settings.readingMode == ReaderReadingMode.VERTICAL
-            }
-        ) {
-            webViewRuntimeRequested = true
-        }
-    }
     var nextReaderOpenRequestId by remember { mutableStateOf(0L) }
     var showCreateShelfDialog by remember { mutableStateOf(false) }
+    var createShelfBookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var createShelfClearsSelection by remember { mutableStateOf(false) }
     var showCreateSmartShelfDialog by remember { mutableStateOf(false) }
     var shelfToRename by remember { mutableStateOf<Shelf?>(null) }
     var shelfToDelete by remember { mutableStateOf<Shelf?>(null) }
     var folderToRemove by remember { mutableStateOf<Shelf?>(null) }
-    var showAddToShelfDialog by remember { mutableStateOf(false) }
+    var addToShelfBookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var addToShelfClearsSelection by remember { mutableStateOf(false) }
+    var shelfToManageBooks by remember { mutableStateOf<Shelf?>(null) }
     var showTagSelectionDialog by remember { mutableStateOf(false) }
     var showAiByokSettingsDialog by remember { mutableStateOf(false) }
     var showDesktopAppThemeSettingsDialog by remember { mutableStateOf(false) }
     var showDesktopLanguageDialog by remember { mutableStateOf(false) }
     var showClearBookCacheDialog by remember { mutableStateOf(false) }
-    var desktopFeatureNotice by remember { mutableStateOf<DesktopFeatureNotice?>(null) }
+    var desktopFeatureNoticeState by remember { mutableStateOf<DesktopFeatureNoticeState?>(null) }
     var settingsQuery by remember { mutableStateOf("") }
     var settingsDestination by remember { mutableStateOf(SharedSettingsDestination.ROOT) }
     var bookInfoDialogFor by remember { mutableStateOf<BookItem?>(null) }
@@ -386,10 +393,38 @@ internal fun EpistemeDesktopApp(
     var dropImportState by remember { mutableStateOf(DesktopDropImportState()) }
     var opdsState by remember { mutableStateOf(opdsController.state) }
     var desktopCloudSyncJob by remember { mutableStateOf<Job?>(null) }
+    var desktopCloudContentRetryJob by remember { mutableStateOf<Job?>(null) }
     var pendingDesktopCloudSyncAfterActive by remember { mutableStateOf(false) }
     val desktopBookCloudSyncJobs = remember { mutableMapOf<String, Job>() }
+    val pendingLibraryPersistJob = remember { AtomicReference<Job?>(null) }
+    val desktopBookSidecarSaveJobs = remember { ConcurrentHashMap<String, Job>() }
+    var readerCloudDirtyBookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var readerCloudDirtyBaseTimestamps by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
+    var readerCloudDirtySidecarBookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var readerCloudStalePositionGuards by remember { mutableStateOf<Map<String, BookItem>>(emptyMap()) }
+    var closingReaderBookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var initialDesktopCloudSyncDone by remember { mutableStateOf(false) }
     val readerWindowDefaults = remember(desktopBuildProfile) { epistemeDesktopWindowDefaults(desktopBuildProfile) }
+    val readerWindowStateStore = remember {
+        DesktopWindowStateStore(DesktopWindowStateStore.defaultReaderWindowStateFile())
+    }
+    var savedReaderWindowState by remember {
+        mutableStateOf(readerWindowStateStore.load()?.toPersistableReaderWindowSnapshot())
+    }
+
+    fun showDesktopFeatureNotice(
+        notice: DesktopFeatureNotice,
+        readerWindowId: String? = null
+    ) {
+        desktopFeatureNoticeState = DesktopFeatureNoticeState(
+            notice = notice,
+            placement = desktopFeatureNoticePlacement(readerWindowId)
+        )
+    }
+
+    fun dismissDesktopFeatureNotice() {
+        desktopFeatureNoticeState = null
+    }
 
     fun projectState(
         next: SharedReaderScreenState,
@@ -407,18 +442,26 @@ internal fun EpistemeDesktopApp(
         projected: SharedReaderScreenState,
         records: List<ShelfRecord> = shelfRecords,
         refs: List<BookShelfRef> = shelfRefs,
-        fonts: List<CustomFontItem> = customFonts
+        fonts: List<CustomFontItem> = customFonts,
+        persistDebounceMillis: Long = 0L
     ) {
-        scope.launch(Dispatchers.IO) {
+        val snapshot = projected.toDesktopLibrarySnapshot(
+            shelfRecords = records,
+            shelfRefs = refs,
+            customFonts = fonts
+        )
+        pendingLibraryPersistJob.getAndSet(null)?.cancel()
+        val persistJob = scope.launch(Dispatchers.IO) {
             runCatching {
-                libraryDatabase.save(
-                    projected.toDesktopLibrarySnapshot(
-                        shelfRecords = records,
-                        shelfRefs = refs,
-                        customFonts = fonts
-                    )
-                )
+                if (persistDebounceMillis > 0L) {
+                    delay(persistDebounceMillis)
+                }
+                libraryDatabase.save(snapshot)
             }
+        }
+        pendingLibraryPersistJob.set(persistJob)
+        persistJob.invokeOnCompletion {
+            pendingLibraryPersistJob.compareAndSet(persistJob, null)
         }
     }
 
@@ -426,27 +469,99 @@ internal fun EpistemeDesktopApp(
         next: SharedReaderScreenState,
         records: List<ShelfRecord> = shelfRecords,
         refs: List<BookShelfRef> = shelfRefs,
-        fonts: List<CustomFontItem> = customFonts
+        fonts: List<CustomFontItem> = customFonts,
+        persistDebounceMillis: Long = 0L
     ) {
         shelfRecords = records
         shelfRefs = refs
         val projected = projectState(next, records, refs)
         state = projected
-        persistSnapshot(projected, records, refs, fonts)
+        persistSnapshot(projected, records, refs, fonts, persistDebounceMillis)
     }
 
-    fun updateState(next: SharedReaderScreenState) {
+    fun updateState(next: SharedReaderScreenState, persistDebounceMillis: Long = 0L) {
         val projected = projectState(next)
         state = projected
-        persistSnapshot(projected)
+        persistSnapshot(projected, persistDebounceMillis = persistDebounceMillis)
+    }
+
+    fun flushDesktopPersistenceBeforeDispose(
+        projected: SharedReaderScreenState,
+        records: List<ShelfRecord>,
+        refs: List<BookShelfRef>,
+        fonts: List<CustomFontItem>
+    ) {
+        pendingLibraryPersistJob.getAndSet(null)?.cancel()
+        runCatching {
+            libraryDatabase.save(
+                projected.toDesktopLibrarySnapshot(
+                    shelfRecords = records,
+                    shelfRefs = refs,
+                    customFonts = fonts
+                )
+            )
+        }
+
+        val pendingSidecarBookIds = desktopBookSidecarSaveJobs.keys.toList()
+        if (pendingSidecarBookIds.isEmpty()) return
+
+        desktopBookSidecarSaveJobs.values.forEach { it.cancel() }
+        desktopBookSidecarSaveJobs.clear()
+        val booksById = projected.rawLibraryBooks.associateBy { it.id }
+        pendingSidecarBookIds
+            .mapNotNull(booksById::get)
+            .filter { book ->
+                val sourceFolder = book.sourceFolder ?: return@filter false
+                projected.syncedFolders.firstOrNull { it.uriString == sourceFolder }?.localSyncEnabled ?: true
+            }
+            .forEach { book ->
+                runCatching { DesktopLocalFolderSync.saveBookSidecars(book) }
+            }
+    }
+
+    fun DesktopReaderWindowState.cancelReaderWork() {
+        when (val content = content) {
+            DesktopReaderWindowContent.Opening,
+            is DesktopReaderWindowContent.PasswordRequired,
+            is DesktopReaderWindowContent.Pdf -> Unit
+            is DesktopReaderWindowContent.Text -> content.ttsJob?.cancel()
+        }
+    }
+
+    fun DesktopReaderWindowState.readerCloseContentLabel(): String {
+        return when (content) {
+            DesktopReaderWindowContent.Opening -> "opening"
+            is DesktopReaderWindowContent.PasswordRequired -> "password_required"
+            is DesktopReaderWindowContent.Pdf -> "pdf"
+            is DesktopReaderWindowContent.Text -> "text"
+        }
     }
 
     fun DesktopReaderWindowState.closeReaderResources() {
-        when (val content = content) {
-            DesktopReaderWindowContent.Opening,
-            is DesktopReaderWindowContent.PasswordRequired -> Unit
-            is DesktopReaderWindowContent.Pdf -> content.document.close()
-            is DesktopReaderWindowContent.Text -> content.ttsJob?.cancel()
+        logDesktopReaderClose(
+            "close_resources_begin windowId=${id.logPreview(80)} bookId=${bookId.logPreview(80)} " +
+                "content=${readerCloseContentLabel()} fullscreen=$fullscreen"
+        )
+        cancelReaderWork()
+        runCatching {
+            when (val content = content) {
+                DesktopReaderWindowContent.Opening,
+                is DesktopReaderWindowContent.PasswordRequired -> Unit
+                is DesktopReaderWindowContent.Pdf -> content.document.close()
+                is DesktopReaderWindowContent.Text -> Unit
+            }
+        }.onSuccess {
+            logDesktopReaderClose(
+                "close_resources_end windowId=${id.logPreview(80)} bookId=${bookId.logPreview(80)} " +
+                    "content=${readerCloseContentLabel()}"
+            )
+        }.onFailure { error ->
+            logDesktopReaderClose(
+                "close_resources_fail windowId=${id.logPreview(80)} bookId=${bookId.logPreview(80)} " +
+                    "content=${readerCloseContentLabel()} error=\"${error.message.orEmpty().logPreview(240)}\" " +
+                    "type=${error.javaClass.simpleName}"
+            )
+            throw error
         }
     }
 
@@ -470,46 +585,46 @@ internal fun EpistemeDesktopApp(
         return readerWindows.firstOrNull { it.id == windowId }?.content as? DesktopReaderWindowContent.Text
     }
 
-    fun closeReaderWindow(windowId: String) {
-        val closing = readerWindows.firstOrNull { it.id == windowId } ?: return
-        val shouldStopTts = (closing.content as? DesktopReaderWindowContent.Text)?.extrasState?.cloudTts?.let {
-            it.isLoading || it.isPlaying || it.isPaused
-        } == true
-        closing.closeReaderResources()
-        if (shouldStopTts) {
-            scope.launch { desktopTtsAdapter.stop() }
+    fun saveReaderWindowStateSnapshot(snapshot: DesktopWindowStateSnapshot?) {
+        val persistable = snapshot?.toPersistableReaderWindowSnapshot() ?: return
+        savedReaderWindowState = persistable
+        scope.launch(Dispatchers.IO) {
+            runCatching { readerWindowStateStore.save(persistable) }
         }
-        readerWindows = readerWindows.withoutDesktopReaderWindow(windowId)
-        updateState(state.reduce(AppAction.BookTabClosed(closing.bookId)))
     }
 
-    fun closeReaderWindowsForBookIds(bookIds: Set<String>) {
+    fun markReaderCloudDirty(
+        bookId: String,
+        baseTimestamp: Long? = null,
+        sidecarsDirty: Boolean = false
+    ) {
+        if (bookId.isBlank()) return
+        if (bookId !in readerCloudDirtyBookIds) {
+            val resolvedBaseTimestamp = baseTimestamp
+                ?: state.rawLibraryBooks.firstOrNull { it.id == bookId }?.timestamp
+                ?: 0L
+            readerCloudDirtyBaseTimestamps = readerCloudDirtyBaseTimestamps + (bookId to resolvedBaseTimestamp)
+            logDesktopCloudSync {
+                "desktop.reader.dirty_start book=$bookId baseTs=$resolvedBaseTimestamp sidecarsDirty=$sidecarsDirty"
+            }
+        }
+        if (sidecarsDirty) {
+            readerCloudDirtySidecarBookIds = readerCloudDirtySidecarBookIds + bookId
+        }
+        readerCloudDirtyBookIds = readerCloudDirtyBookIds + bookId
+    }
+
+    fun clearReaderCloudDirty(bookIds: Set<String>) {
         if (bookIds.isEmpty()) return
-        val closing = readerWindows.filter { it.bookId in bookIds }
-        val shouldStopTts = closing.any { window ->
-            (window.content as? DesktopReaderWindowContent.Text)?.extrasState?.cloudTts?.let {
-                it.isLoading || it.isPlaying || it.isPaused
-            } == true
-        }
-        closing.forEach { it.closeReaderResources() }
-        if (shouldStopTts) {
-            scope.launch { desktopTtsAdapter.stop() }
-        }
-        readerWindows = readerWindows.withoutDesktopReaderBookIds(bookIds)
+        readerCloudDirtyBookIds = readerCloudDirtyBookIds - bookIds
+        readerCloudDirtyBaseTimestamps = readerCloudDirtyBaseTimestamps - bookIds
+        readerCloudDirtySidecarBookIds = readerCloudDirtySidecarBookIds - bookIds
     }
 
-    fun closeAllReaderWindows() {
-        val shouldStopTts = readerWindows.any { window ->
-            (window.content as? DesktopReaderWindowContent.Text)?.extrasState?.cloudTts?.let {
-                it.isLoading || it.isPlaying || it.isPaused
-            } == true
-        }
-        readerWindows.forEach { it.closeReaderResources() }
-        if (shouldStopTts) {
-            scope.launch { desktopTtsAdapter.stop() }
-        }
-        readerWindows = emptyList()
-        updateState(state.reduce(AppAction.AllTabsClosed))
+    fun markReaderBooksClosing(bookIds: Set<String>) {
+        if (bookIds.isEmpty()) return
+        closingReaderBookIds = closingReaderBookIds + bookIds
+        readerCloudStalePositionGuards = readerCloudStalePositionGuards - bookIds
     }
 
     fun downloadReaderImage(image: ReaderImageReference) {
@@ -542,6 +657,12 @@ internal fun EpistemeDesktopApp(
             desktopCloudConfig.isAuthConfigured
     }
 
+    fun desktopAccountAvailable(): Boolean {
+        return featurePolicy.aiAndCloud &&
+            featurePolicy.networkAccess &&
+            !desktopBuildProfile.byokAiAvailable
+    }
+
     fun saveDesktopCloudSyncSettings(
         syncEnabled: Boolean = state.isSyncEnabled,
         folderSyncEnabled: Boolean = state.isFolderSyncEnabled
@@ -555,44 +676,55 @@ internal fun EpistemeDesktopApp(
     }
 
     suspend fun refreshDesktopAccountProfile(showBanner: Boolean = false) {
-        if (!featurePolicy.aiAndCloud || desktopBuildProfile.byokAiAvailable) return
+        if (!featurePolicy.aiAndCloud || desktopBuildProfile.byokAiAvailable) {
+            desktopAccountProfileRefreshCompleted = true
+            return
+        }
         val session = desktopAuthRepository.restoreSavedSession()
         if (session == null) {
             if (state.isSyncEnabled) saveDesktopCloudSyncSettings(syncEnabled = false)
             updateState(state.copy(currentUser = null, isProUser = false, credits = 0, isSyncEnabled = false))
+            desktopAccountProfileRefreshCompleted = true
             return
         }
         val token = desktopAuthRepository.freshIdToken()
         if (token.isNullOrBlank()) {
             if (state.isSyncEnabled) saveDesktopCloudSyncSettings(syncEnabled = false)
             updateState(state.copy(currentUser = null, isProUser = false, credits = 0, isSyncEnabled = false))
+            desktopAccountProfileRefreshCompleted = true
             return
         }
         runCatching {
             desktopAccountProfileRepository.fetchProfile(session.user.uid, token)
         }.onSuccess { profile ->
-            val nextSyncEnabled = state.isSyncEnabled && profile.isProUser
-            if (!nextSyncEnabled && state.isSyncEnabled) {
-                saveDesktopCloudSyncSettings(syncEnabled = false)
-            }
-            updateState(
-                state.copy(
-                    currentUser = session.user,
-                    isProUser = profile.isProUser,
-                    credits = profile.credits,
-                    isSyncEnabled = nextSyncEnabled
+            if (desktopAuthRepository.currentSession()?.user?.uid == session.user.uid) {
+                desktopAccountProfileRepository.saveFetchedProfile(session.user.uid, profile)
+                val nextSyncEnabled = state.isSyncEnabled && profile.isProUser
+                if (!nextSyncEnabled && state.isSyncEnabled) {
+                    saveDesktopCloudSyncSettings(syncEnabled = false)
+                }
+                updateState(
+                    state.copy(
+                        currentUser = session.user,
+                        isProUser = profile.isProUser,
+                        credits = profile.credits,
+                        isSyncEnabled = nextSyncEnabled
+                    )
                 )
-            )
-            accountStatusMessage = if (profile.isProUser) {
-                "Account checked. Pro is unlocked."
-            } else {
-                "Account checked. Pro is not unlocked."
+                accountStatusMessage = if (profile.isProUser) {
+                    "Account checked. Pro is unlocked."
+                } else {
+                    "Account checked. Pro is not unlocked."
+                }
+                if (showBanner) updateState(state.withBanner("Account status refreshed."))
             }
-            if (showBanner) updateState(state.withBanner("Account status refreshed."))
         }.onFailure { error ->
-            accountStatusMessage = error.message ?: "Could not check account status."
-            if (showBanner) updateState(state.withBanner(accountStatusMessage.orEmpty(), isError = true))
+            if (desktopAuthRepository.currentSession()?.user?.uid == session.user.uid) {
+                accountStatusMessage = error.message ?: "Could not check account status."
+                if (showBanner) updateState(state.withBanner(accountStatusMessage.orEmpty(), isError = true))
+            }
         }
+        desktopAccountProfileRefreshCompleted = true
     }
 
     fun signInDesktopAccount() {
@@ -607,7 +739,8 @@ internal fun EpistemeDesktopApp(
                 desktopAuthRepository.signIn(::openExternalUrl)
             }.onSuccess { session ->
                 updateState(state.copy(currentUser = session.user, isProUser = false, credits = 0))
-                accountStatusMessage = "Signed in. Checking Pro and credits..."
+                accountStatusMessage = "Signed in. Checking account and credits..."
+                desktopAccountProfileRefreshCompleted = false
                 refreshDesktopAccountProfile()
             }.onFailure { error ->
                 accountStatusMessage = error.message ?: "Google sign-in failed."
@@ -663,6 +796,7 @@ internal fun EpistemeDesktopApp(
         val details = buildList {
             if (result.uploadedBooks > 0) add("Uploaded ${result.uploadedBooks}.")
             if (result.downloadedBooks > 0) add("Downloaded ${result.downloadedBooks}.")
+            if (result.pendingContentDownloads > 0) add("Waiting for ${result.pendingContentDownloads} upload(s) to finish.")
         }
         return if (details.isEmpty()) {
             "Cloud sync complete."
@@ -672,14 +806,27 @@ internal fun EpistemeDesktopApp(
     }
 
     fun syncDesktopCloud(showBanner: Boolean = false): Job {
-        desktopCloudSyncJob?.takeIf { it.isActive }?.let { return it }
+        desktopCloudSyncJob?.takeIf { it.isActive }?.let {
+            logDesktopCloudSync { "desktop.full_sync.reuse_active showBanner=$showBanner" }
+            return it
+        }
         val job = scope.launch {
-            if (!state.isSyncEnabled) return@launch
-            val credentials = desktopCloudSyncCredentials(showBanner) ?: return@launch
+            if (!state.isSyncEnabled) {
+                logDesktopCloudSync { "desktop.full_sync.skip reason=sync_disabled showBanner=$showBanner" }
+                return@launch
+            }
+            val credentials = desktopCloudSyncCredentials(showBanner) ?: run {
+                logDesktopCloudSync { "desktop.full_sync.skip reason=missing_credentials showBanner=$showBanner" }
+                return@launch
+            }
             val snapshotState = state
             val snapshotShelfRecords = shelfRecords
             val snapshotShelfRefs = shelfRefs
             val snapshotFonts = customFonts
+            logDesktopCloudSync {
+                "desktop.full_sync.start user=${credentials.userId} device=${credentials.deviceId} showBanner=$showBanner " +
+                    "books=${snapshotState.rawLibraryBooks.size} shelves=${snapshotShelfRecords.size} folderSync=${snapshotState.isFolderSyncEnabled}"
+            }
 
             if (showBanner) {
                 updateState(state.copy(isRefreshing = true).withBanner("Cloud sync: checking library..."))
@@ -702,6 +849,43 @@ internal fun EpistemeDesktopApp(
                     )
                 }
             }.onSuccess { result ->
+                val openBookIds = readerWindows.mapTo(mutableSetOf()) { it.bookId }
+                val snapshotBooksById = snapshotState.rawLibraryBooks.associateBy { it.id }
+                val syncedBooksById = result.state.rawLibraryBooks.associateBy { it.id }
+                val staleGuards = openBookIds.mapNotNull { bookId ->
+                    val before = snapshotBooksById[bookId] ?: return@mapNotNull null
+                    val after = syncedBooksById[bookId] ?: return@mapNotNull null
+                    if (after.timestamp > before.timestamp && !before.hasSameCloudReaderPosition(after)) {
+                        bookId to before
+                    } else {
+                        null
+                    }
+                }.toMap()
+                if (staleGuards.isNotEmpty()) {
+                    readerCloudStalePositionGuards = readerCloudStalePositionGuards + staleGuards
+                    clearReaderCloudDirty(staleGuards.keys)
+                    logDesktopCloudSync {
+                        "desktop.full_sync.open_reader_guard books=${staleGuards.keys.joinToString()} " +
+                            "reason=remote_advanced_while_reader_open"
+                    }
+                }
+                logDesktopCloudSync {
+                    "desktop.full_sync.success user=${credentials.userId} uploaded=${result.uploadedBooks} " +
+                        "downloaded=${result.downloadedBooks} pendingContent=${result.pendingContentDownloads} " +
+                        "books=${result.state.rawLibraryBooks.size}"
+                }
+                if (result.pendingContentDownloads <= 0) {
+                    desktopCloudContentRetryJob?.cancel()
+                    desktopCloudContentRetryJob = null
+                } else if (desktopCloudContentRetryJob?.isActive != true) {
+                    desktopCloudContentRetryJob = scope.launch {
+                        delay(DesktopCloudContentRetryDelayMillis)
+                        if (state.isSyncEnabled) {
+                            logDesktopCloudSync { "desktop.full_sync.content_retry pending=${result.pendingContentDownloads}" }
+                            syncDesktopCloud(showBanner = false).join()
+                        }
+                    }
+                }
                 customFonts = result.customFonts
                 val syncedState = result.state.copy(
                     isSyncEnabled = state.isSyncEnabled,
@@ -715,6 +899,7 @@ internal fun EpistemeDesktopApp(
                     fonts = result.customFonts
                 )
             }.onFailure { error ->
+                logDesktopCloudSync { "desktop.full_sync.failed user=${credentials.userId} error=${error.message.orEmpty()}" }
                 val failed = state.copy(isRefreshing = false)
                 if (showBanner) {
                     updateState(failed.withBanner(error.message ?: "Cloud sync failed.", isError = true))
@@ -761,26 +946,176 @@ internal fun EpistemeDesktopApp(
         }
     }
 
-    fun queueCloudBookMetadataSync(book: BookItem, uploadContent: Boolean = false) {
+    fun queueCloudBookMetadataSync(
+        book: BookItem,
+        uploadContent: Boolean = false,
+        debounce: Boolean = true,
+        dirtyBaseTimestamp: Long? = null,
+        forceUploadAnnotations: Boolean = false
+    ) {
         if (!state.isSyncEnabled) return
         if (isDesktopPdfReflowBookId(book.id)) return
         if (book.sourceFolder != null) return
         if (book.path?.startsWith("opds-pse") == true) return
         if (SharedFileCapabilities.isManualOnlyReaderFileName(book.displayName)) return
 
+        logDesktopCloudSync {
+            "desktop.book_queue.request uploadContent=$uploadContent debounce=$debounce dirtyBaseTs=$dirtyBaseTimestamp " +
+                "forceAnnotations=$forceUploadAnnotations ${book.desktopCloudSyncSummary()}"
+        }
         desktopBookCloudSyncJobs.remove(book.id)?.cancel()
         val job = scope.launch {
-            if (!uploadContent) delay(1_200L)
-            val credentials = desktopCloudSyncCredentials(showBanner = false) ?: return@launch
-            val latestBook = state.rawLibraryBooks.firstOrNull { it.id == book.id } ?: return@launch
+            if (!uploadContent && debounce) delay(1_200L)
+            val credentials = desktopCloudSyncCredentials(showBanner = false) ?: run {
+                logDesktopCloudSync { "desktop.book_queue.skip reason=missing_credentials book=${book.id}" }
+                return@launch
+            }
+            val latestBook = state.rawLibraryBooks.firstOrNull { it.id == book.id } ?: run {
+                logDesktopCloudSync { "desktop.book_queue.skip reason=missing_local book=${book.id}" }
+                return@launch
+            }
             if (isDesktopPdfReflowBookId(latestBook.id)) return@launch
             if (latestBook.sourceFolder != null) return@launch
+            if (latestBook.path?.startsWith("opds-pse") == true) return@launch
+            if (SharedFileCapabilities.isManualOnlyReaderFileName(latestBook.displayName)) return@launch
 
             if (uploadContent) {
                 updateState(state.copy(uploadingBookIds = state.uploadingBookIds + latestBook.id))
             }
 
             try {
+                val remoteBook = withContext(Dispatchers.IO) {
+                    desktopFirestoreRepository.getBookMetadata(
+                        userId = credentials.userId,
+                        bookId = latestBook.id,
+                        idToken = credentials.idToken
+                    )
+                }
+                val localSidecarTimestamp = withContext(Dispatchers.IO) {
+                    DesktopCloudSidecarSync.localAnnotationTimestamp(latestBook)
+                }
+                val hasLocalAnnotations = withContext(Dispatchers.IO) {
+                    DesktopCloudSidecarSync.hasLocalAnnotationData(latestBook)
+                }
+                val remoteAnnotationDriveTimestamp = if (remoteBook?.hasAnnotations == true) {
+                    withContext(Dispatchers.IO) {
+                        desktopGoogleDriveRepository.getFileByName(
+                            credentials.driveAccessToken,
+                            desktopCloudAnnotationDriveFileName(latestBook.id)
+                        )?.modifiedTimeMillis ?: 0L
+                    }
+                } else {
+                    0L
+                }
+                val localReadingTimestamp = latestBook.effectiveCloudReadingPositionModifiedTimestamp()
+                val remoteReadingTimestamp = remoteBook?.effectiveCloudReadingPositionModifiedTimestamp() ?: 0L
+                val remoteAnnotationTimestamp = remoteBook?.effectiveCloudAnnotationModifiedTimestamp(
+                    remoteAnnotationDriveTimestamp
+                ) ?: 0L
+                val latestBookForMetadata = if (remoteBook != null && remoteReadingTimestamp > localReadingTimestamp) {
+                    latestBook.withCloudReadingPosition(remoteBook)
+                } else {
+                    latestBook
+                }
+                val localFile = latestBook.path?.let(::File)
+                val localFileAvailable = localFile?.isFile == true
+                val localContentTimestamp = latestBook.fileContentModifiedTimestamp.takeIf { it > 0L }
+                    ?: localFile?.takeIf { it.isFile }?.lastModified()
+                    ?: 0L
+                val remoteChangedSinceDirtyStart = dirtyBaseTimestamp != null &&
+                    remoteBook != null &&
+                    remoteBook.lastModifiedTimestamp != dirtyBaseTimestamp
+                logDesktopCloudSync {
+                    "desktop.book_queue.preflight book=${latestBook.id} dirtyBaseTs=$dirtyBaseTimestamp " +
+                        "remoteChangedSinceDirtyStart=$remoteChangedSinceDirtyStart " +
+                        latestBook.desktopCloudSyncSummary() + " " +
+                        (remoteBook?.desktopCloudSyncSummary() ?: "remote=null") +
+                        " localSidecarTs=$localSidecarTimestamp localContentTs=$localContentTimestamp"
+                }
+                logDesktopCloudAnnotations {
+                    "desktop.queue.inspect book=${latestBook.id} dirtyBaseTs=$dirtyBaseTimestamp " +
+                        "remoteChangedSinceDirtyStart=$remoteChangedSinceDirtyStart " +
+                        "remoteHas=${remoteBook?.hasAnnotations} remoteTs=${remoteBook?.lastModifiedTimestamp ?: 0L} " +
+                        "remoteAnnTs=$remoteAnnotationTimestamp remoteDriveAnnTs=$remoteAnnotationDriveTimestamp " +
+                        "remoteReadTs=$remoteReadingTimestamp localReadTs=$localReadingTimestamp " +
+                        "localHas=$hasLocalAnnotations localSidecarTs=$localSidecarTimestamp " +
+                        DesktopCloudSidecarSync.localAnnotationDebugSummary(latestBook)
+                }
+                if (remoteChangedSinceDirtyStart && !(forceUploadAnnotations && hasLocalAnnotations)) {
+                    logDesktopCloudAnnotations {
+                        "desktop.queue.skip_upload book=${latestBook.id} reason=remote_changed_since_dirty " +
+                            "dirtyBaseTs=$dirtyBaseTimestamp remoteTs=${remoteBook?.lastModifiedTimestamp ?: 0L}"
+                    }
+                    logDesktopCloudSync { "desktop.book_queue.decision action=pull_remote_changed_since_dirty book=${latestBook.id}" }
+                    syncDesktopCloud(showBanner = false).join()
+                    return@launch
+                }
+                val canUploadMetadata = remoteBook == null || shouldUploadLocalCloudBookMetadataUpdate(
+                    localModifiedTimestamp = latestBook.timestamp,
+                    remoteModifiedTimestamp = remoteBook.lastModifiedTimestamp
+                )
+                val canUploadContent = when {
+                    remoteBook?.isDeleted == true && canUploadMetadata -> localFileAvailable
+                    uploadContent -> shouldUploadLocalCloudBookContent(
+                        localFileAvailable = localFileAvailable,
+                        localContentModifiedTimestamp = localContentTimestamp,
+                        remoteContentModifiedTimestamp = remoteBook?.fileContentModifiedTimestamp
+                    )
+                    else -> false
+                }
+                val canUploadAnnotations = (forceUploadAnnotations && hasLocalAnnotations) ||
+                    (hasLocalAnnotations &&
+                        (remoteBook == null ||
+                            !remoteBook.hasAnnotations ||
+                            localSidecarTimestamp > remoteAnnotationTimestamp))
+                val shouldApplyRemote = remoteBook != null && shouldApplyRemoteCloudBookMetadataUpdate(
+                    localModifiedTimestamp = latestBook.timestamp,
+                    remoteModifiedTimestamp = remoteBook.lastModifiedTimestamp
+                )
+
+                if (remoteBook != null && !canUploadMetadata && !canUploadContent && !canUploadAnnotations) {
+                    logDesktopCloudAnnotations {
+                        "desktop.queue.no_upload book=${latestBook.id} canUploadAnnotations=$canUploadAnnotations " +
+                            "canUploadMetadata=$canUploadMetadata shouldApplyRemote=$shouldApplyRemote " +
+                            "remoteHas=${remoteBook.hasAnnotations} remoteTs=${remoteBook.lastModifiedTimestamp} " +
+                            "remoteAnnTs=$remoteAnnotationTimestamp remoteDriveAnnTs=$remoteAnnotationDriveTimestamp " +
+                            "localSidecarTs=$localSidecarTimestamp"
+                    }
+                    logDesktopCloudSync {
+                        "desktop.book_queue.decision action=${if (remoteBook.isDeleted || shouldApplyRemote) "pull_remote" else "noop"} " +
+                            "book=${latestBook.id} canUploadMetadata=$canUploadMetadata canUploadContent=$canUploadContent " +
+                            "canUploadAnnotations=$canUploadAnnotations shouldApplyRemote=$shouldApplyRemote"
+                    }
+                    if (remoteBook.isDeleted || shouldApplyRemote) {
+                        syncDesktopCloud(showBanner = false).join()
+                    }
+                    return@launch
+                }
+
+                val usesRemoteMetadataForUpload = !canUploadMetadata && shouldApplyRemote && remoteBook != null
+                val bookForUpload = if (usesRemoteMetadataForUpload && remoteBook != null) {
+                    remoteBook.toDesktopBookItem(existing = latestBook).let { remoteMetadataBook ->
+                        if (canUploadContent) {
+                            remoteMetadataBook.copy(fileContentModifiedTimestamp = localContentTimestamp)
+                        } else {
+                            remoteMetadataBook
+                        }
+                    }
+                } else {
+                    latestBookForMetadata
+                }
+                logDesktopCloudSync {
+                    "desktop.book_queue.decision action=${if (usesRemoteMetadataForUpload) "upload_annotations_with_remote_metadata" else "upload_local"} " +
+                        "book=${latestBook.id} canUploadMetadata=$canUploadMetadata canUploadContent=$canUploadContent " +
+                        "canUploadAnnotations=$canUploadAnnotations shouldApplyRemote=$shouldApplyRemote"
+                }
+                logDesktopCloudAnnotations {
+                    "desktop.queue.upload book=${latestBook.id} action=${if (usesRemoteMetadataForUpload) "upload_annotations_with_remote_metadata" else "upload_local"} " +
+                        "canUploadAnnotations=$canUploadAnnotations canUploadMetadata=$canUploadMetadata " +
+                        "remoteHas=${remoteBook?.hasAnnotations} remoteTs=${remoteBook?.lastModifiedTimestamp ?: 0L} " +
+                        "remoteAnnTs=$remoteAnnotationTimestamp remoteDriveAnnTs=$remoteAnnotationDriveTimestamp " +
+                        "localSidecarTs=$localSidecarTimestamp"
+                }
                 val syncedBook = withContext(Dispatchers.IO) {
                     desktopCloudSync.uploadBookAndMetadata(
                         input = DesktopCloudSyncInput(
@@ -794,16 +1129,24 @@ internal fun EpistemeDesktopApp(
                             customFonts = customFonts,
                             includeFolderBooks = state.isFolderSyncEnabled
                         ),
-                        book = latestBook,
-                        uploadContent = uploadContent
+                        book = bookForUpload,
+                        uploadContent = canUploadContent,
+                        uploadAnnotations = canUploadAnnotations,
+                        remoteHasAnnotations = remoteBook?.hasAnnotations == true,
+                        remoteAnnotationModifiedTimestamp = remoteAnnotationTimestamp,
+                        remoteContentModifiedTimestamp = remoteBook?.fileContentModifiedTimestamp
                     )
                 } ?: return@launch
 
+                logDesktopCloudSync {
+                    "desktop.book_queue.upload_success oldTs=${latestBook.timestamp} newTs=${syncedBook.timestamp} " +
+                        syncedBook.desktopCloudSyncSummary("synced")
+                }
                 updateState(
                     state.copy(
                         rawLibraryBooks = state.rawLibraryBooks.map { current ->
                             if (current.id == syncedBook.id && current.timestamp == latestBook.timestamp) {
-                                current.copy(timestamp = syncedBook.timestamp)
+                                syncedBook
                             } else {
                                 current
                             }
@@ -822,6 +1165,128 @@ internal fun EpistemeDesktopApp(
                 desktopBookCloudSyncJobs.remove(book.id)
             }
         }
+    }
+
+    fun syncClosedReaderBooksIfDirty(bookIds: Set<String>) {
+        val dirtyBookIds = bookIds.intersect(readerCloudDirtyBookIds)
+        if (dirtyBookIds.isEmpty()) return
+        logDesktopCloudSync { "desktop.reader.close_dirty books=${dirtyBookIds.joinToString()} requested=${bookIds.joinToString()}" }
+        val dirtyBooks = dirtyBookIds.mapNotNull { bookId ->
+            state.rawLibraryBooks.firstOrNull { it.id == bookId }
+                ?.let { book ->
+                    Triple(
+                        book,
+                        readerCloudDirtyBaseTimestamps[bookId],
+                        bookId in readerCloudDirtySidecarBookIds
+                    )
+                }
+        }
+        clearReaderCloudDirty(dirtyBookIds)
+        dirtyBooks.forEach { (book, baseTimestamp, sidecarsDirty) ->
+            queueCloudBookMetadataSync(
+                book = book,
+                debounce = false,
+                dirtyBaseTimestamp = baseTimestamp,
+                forceUploadAnnotations = sidecarsDirty
+            )
+        }
+    }
+
+    fun syncClosedReaderBooksAfterDispose(bookIds: Set<String>) {
+        if (bookIds.isEmpty()) return
+        scope.launch {
+            delay(DesktopReaderCloseDisposeSyncDelayMillis)
+            val stillClosedBookIds = bookIds
+                .filter { bookId -> readerWindows.none { it.bookId == bookId } }
+                .toSet()
+            closingReaderBookIds = closingReaderBookIds - bookIds
+            readerCloudStalePositionGuards = readerCloudStalePositionGuards - stillClosedBookIds
+            syncClosedReaderBooksIfDirty(stillClosedBookIds)
+            clearReaderCloudDirty(stillClosedBookIds)
+        }
+    }
+
+    fun closeReaderWindow(windowId: String) {
+        logDesktopReaderClose("close_window_request windowId=${windowId.logPreview(80)} openWindows=${readerWindows.size}")
+        val closing = readerWindows.firstOrNull { it.id == windowId } ?: run {
+            logDesktopReaderClose("close_window_missing windowId=${windowId.logPreview(80)} openWindows=${readerWindows.size}")
+            return
+        }
+        val closingBookIds = setOf(closing.bookId)
+        val shouldStopTts = (closing.content as? DesktopReaderWindowContent.Text)?.extrasState?.cloudTts?.let {
+            it.isLoading || it.isPlaying || it.isPaused
+        } == true
+        logDesktopReaderClose(
+            "close_window_begin windowId=${closing.id.logPreview(80)} bookId=${closing.bookId.logPreview(80)} " +
+                "content=${closing.readerCloseContentLabel()} fullscreen=${closing.fullscreen} shouldStopTts=$shouldStopTts"
+        )
+        if (desktopFeatureNoticeState?.placement?.readerWindowId == windowId) {
+            dismissDesktopFeatureNotice()
+        }
+        markReaderBooksClosing(closingBookIds)
+        closing.cancelReaderWork()
+        readerWindows = readerWindows.withoutDesktopReaderWindow(windowId)
+        logDesktopReaderClose(
+            "close_window_removed windowId=${closing.id.logPreview(80)} bookId=${closing.bookId.logPreview(80)} " +
+                "remainingWindows=${readerWindows.size}"
+        )
+        updateState(state.reduce(AppAction.BookTabClosed(closing.bookId)))
+        if (shouldStopTts) {
+            scope.launch { desktopTtsAdapter.stop() }
+        }
+        syncClosedReaderBooksAfterDispose(closingBookIds)
+    }
+
+    fun closeReaderWindowsForBookIds(bookIds: Set<String>) {
+        if (bookIds.isEmpty()) return
+        val closing = readerWindows.filter { it.bookId in bookIds }
+        val closingBookIds = closing.mapTo(mutableSetOf()) { it.bookId }
+        val closingWindowIds = closing.mapTo(mutableSetOf()) { it.id }
+        val shouldStopTts = closing.any { window ->
+            (window.content as? DesktopReaderWindowContent.Text)?.extrasState?.cloudTts?.let {
+                it.isLoading || it.isPlaying || it.isPaused
+            } == true
+        }
+        val targetNoticeWindowId = desktopFeatureNoticeState?.placement?.readerWindowId
+        if (targetNoticeWindowId != null && targetNoticeWindowId in closingWindowIds) {
+            dismissDesktopFeatureNotice()
+        }
+        markReaderBooksClosing(closingBookIds)
+        closing.forEach { it.cancelReaderWork() }
+        readerWindows = readerWindows.withoutDesktopReaderBookIds(bookIds)
+        if (closingBookIds.isNotEmpty()) {
+            var nextState = state
+            closingBookIds.forEach { bookId ->
+                nextState = nextState.reduce(AppAction.BookTabClosed(bookId))
+            }
+            updateState(nextState)
+        }
+        if (shouldStopTts) {
+            scope.launch { desktopTtsAdapter.stop() }
+        }
+        closingReaderBookIds = closingReaderBookIds - closingBookIds
+        readerCloudStalePositionGuards = readerCloudStalePositionGuards - closingBookIds
+        clearReaderCloudDirty(closingBookIds)
+    }
+
+    fun closeAllReaderWindows() {
+        val closingBookIds = readerWindows.mapTo(mutableSetOf()) { it.bookId }
+        val shouldStopTts = readerWindows.any { window ->
+            (window.content as? DesktopReaderWindowContent.Text)?.extrasState?.cloudTts?.let {
+                it.isLoading || it.isPlaying || it.isPaused
+            } == true
+        }
+        markReaderBooksClosing(closingBookIds)
+        readerWindows.forEach { it.cancelReaderWork() }
+        readerWindows = emptyList()
+        if (desktopFeatureNoticeState?.placement?.readerWindowId != null) {
+            dismissDesktopFeatureNotice()
+        }
+        updateState(state.reduce(AppAction.AllTabsClosed))
+        if (shouldStopTts) {
+            scope.launch { desktopTtsAdapter.stop() }
+        }
+        syncClosedReaderBooksAfterDispose(closingBookIds)
     }
 
     fun syncCloudShelfChange(record: ShelfRecord, refs: List<BookShelfRef>, isDeleted: Boolean = false) {
@@ -891,20 +1356,21 @@ internal fun EpistemeDesktopApp(
     }
 
     fun updateAiByokSettings(next: ReaderAiByokSettings) {
-        val sanitized = next.sanitized()
-        val settingsToSave = if (!desktopBuildProfile.byokAiAvailable) {
-            aiByokSettings.sanitized().copy(
-                hideReaderAiFeatures = sanitized.hideReaderAiFeatures,
-                ttsSpeakerId = sanitized.ttsSpeakerId
-            )
-        } else {
-            logDesktopTts(
-                "settings_update keyPresent=${sanitized.geminiKey.isNotBlank()} " +
-                    "ttsModel=\"${sanitized.ttsModel.desktopTtsPreview()}\" speaker=\"${sanitized.ttsSpeakerId.desktopTtsPreview()}\" " +
-                    "cloudAvailable=${sanitized.isCloudTtsAvailable}"
-            )
-            sanitized
+        val sanitized = next.toDesktopPersistableAiSettings()
+        if (sanitized.ttsSpeakerId != aiByokSettings.toDesktopPersistableAiSettings().ttsSpeakerId && desktopTtsAdapter.isPlaybackActive) {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    desktopString("desktop_stop_reading_change_voices", "Stop reading to change voices.")
+                )
+            }
+            return
         }
+        val settingsToSave = sanitized
+        logDesktopTts(
+            "settings_update keyPresent=${sanitized.geminiKey.isNotBlank()} " +
+                "ttsModel=\"${sanitized.ttsModel.desktopTtsPreview()}\" speaker=\"${sanitized.ttsSpeakerId.desktopTtsPreview()}\" " +
+                "cloudAvailable=${sanitized.isCloudTtsAvailable}"
+        )
 
         aiByokSettings = settingsToSave
         readerWindows = readerWindows.replaceAllDesktopTextReaderContent { content ->
@@ -930,12 +1396,6 @@ internal fun EpistemeDesktopApp(
             }
     }
 
-    fun updateReaderAutoScroll(windowId: String, autoScroll: ReaderAutoScrollState) {
-        updateTextReaderWindow(windowId) { content ->
-            content.copy(extrasState = content.extrasState.copy(autoScroll = autoScroll.sanitized()))
-        }
-    }
-
     fun textReaderTtsCacheSummary(content: DesktopReaderWindowContent.Text): ReaderTtsCacheSummary {
         return desktopTtsAdapter.cacheSummary(
             content.session.reader.book.title,
@@ -955,10 +1415,15 @@ internal fun EpistemeDesktopApp(
     )
 
     fun cloudTtsUnavailableMessage(): String {
-        return if (desktopBuildProfile.byokAiAvailable) {
+        return if (!featurePolicy.aiAndCloud || !featurePolicy.networkAccess) {
             desktopString(
-                "desktop_cloud_tts_needs_gemini_key_desc",
-                "Add a Gemini key and select Gemini cloud TTS in AI keys and models."
+                "desktop_cloud_tts_unavailable",
+                "Cloud TTS unavailable"
+            )
+        } else if (!desktopByokCloudTtsAvailable && !desktopCreditCloudTtsControlsAvailable) {
+            desktopString(
+                "desktop_cloud_tts_not_configured_desc",
+                "Cloud TTS is not configured for this desktop build."
             )
         } else if (state.currentUser == null) {
             desktopString("desktop_cloud_tts_sign_in_required_desc", "Sign in with Google to use cloud TTS.")
@@ -989,12 +1454,6 @@ internal fun EpistemeDesktopApp(
             return desktopFeatureUnavailableNotice(
                 messageKey = "desktop_ai_not_configured_desc",
                 messageFallback = "Desktop AI is not configured for this build."
-            )
-        }
-        if (effectiveAiSettings().hideReaderAiFeatures) {
-            return desktopFeatureUnavailableNotice(
-                messageKey = "desktop_reader_ai_hidden_desc",
-                messageFallback = "Reader AI features are hidden."
             )
         }
         if (feature == ReaderAiFeature.DEFINE && desktopReaderWordCount(text) > 1 && state.currentUser == null) {
@@ -1037,8 +1496,14 @@ internal fun EpistemeDesktopApp(
     }
 
     fun desktopFeatureNoticeForCloudTts(): DesktopFeatureNotice? {
-        if (desktopBuildProfile.byokAiAvailable) return null
-        if (!featurePolicy.networkAccess || !desktopCloudConfig.isTtsWorkerConfigured) {
+        if (!featurePolicy.aiAndCloud || !featurePolicy.networkAccess) {
+            return desktopFeatureUnavailableNotice(
+                messageKey = "desktop_cloud_tts_not_configured_desc",
+                messageFallback = "Cloud TTS is not configured for this desktop build."
+            )
+        }
+        if (desktopByokCloudTtsAvailable) return null
+        if (!desktopCreditCloudTtsControlsAvailable) {
             return desktopFeatureUnavailableNotice(
                 messageKey = "desktop_cloud_tts_not_configured_desc",
                 messageFallback = "Cloud TTS is not configured for this desktop build."
@@ -1147,7 +1612,7 @@ internal fun EpistemeDesktopApp(
             }
         }
         desktopFeatureNoticeForReaderAi(ReaderAiFeature.SUMMARIZE, text)?.let { notice ->
-            desktopFeatureNotice = notice
+            showDesktopFeatureNotice(notice, readerWindowId = windowId)
             return
         }
         updateTextReaderWindow(windowId) { it.copy(isSummaryLoading = true, summaryResult = null) }
@@ -1189,7 +1654,7 @@ internal fun EpistemeDesktopApp(
                     isSummaryLoading = false
                 )
             }
-            desktopFeatureNoticeForError(result.error)?.let { desktopFeatureNotice = it }
+            desktopFeatureNoticeForError(result.error)?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
         }
     }
 
@@ -1201,7 +1666,7 @@ internal fun EpistemeDesktopApp(
             return
         }
         desktopFeatureNoticeForReaderAi(ReaderAiFeature.RECAP, currentText)?.let { notice ->
-            desktopFeatureNotice = notice
+            showDesktopFeatureNotice(notice, readerWindowId = windowId)
             return
         }
         val book = content.session.reader.book
@@ -1233,7 +1698,7 @@ internal fun EpistemeDesktopApp(
                     pastSummaries += generated
                 }
                 if (summary.error != null) {
-                    desktopFeatureNoticeForError(summary.error)?.let { desktopFeatureNotice = it }
+                    desktopFeatureNoticeForError(summary.error)?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
                 }
                 delay(500)
             }
@@ -1258,7 +1723,7 @@ internal fun EpistemeDesktopApp(
                     recapProgressMessage = null
                 )
             }
-            desktopFeatureNoticeForError(recap.error)?.let { desktopFeatureNotice = it }
+            desktopFeatureNoticeForError(recap.error)?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
         }
     }
 
@@ -1281,7 +1746,7 @@ internal fun EpistemeDesktopApp(
         if (normalizedText.isBlank()) return
         if (!effectiveAiSettings().areReaderAiFeaturesAvailable) return
         desktopFeatureNoticeForReaderAi(feature, normalizedText)?.let { notice ->
-            desktopFeatureNotice = notice
+            showDesktopFeatureNotice(notice, readerWindowId = windowId)
             return
         }
         val aiResultRequestId = content.readerAiResultRequestId + 1
@@ -1392,22 +1857,133 @@ internal fun EpistemeDesktopApp(
             )
             val latest = textReaderWindowContent(windowId)
             if (latest != null && isReaderAiResultVisible(latest, aiResultRequestId)) {
-                desktopFeatureNoticeForError(result.second)?.let { desktopFeatureNotice = it }
+                desktopFeatureNoticeForError(result.second)?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
             }
         }
     }
 
-    fun syncBookSidecars(book: BookItem) {
+    fun isDesktopFolderLocalSyncEnabled(sourceFolder: String?): Boolean {
+        if (sourceFolder.isNullOrBlank()) return false
+        return state.syncedFolders.firstOrNull { it.uriString == sourceFolder }?.localSyncEnabled ?: true
+    }
+
+    fun syncBookSidecars(book: BookItem, debounceMillis: Long = 0L) {
         if (book.sourceFolder.isNullOrBlank()) {
             logDesktopFolderSync("bookSidecars.skipNoFolder book=${book.id}")
+            return
+        }
+        if (!isDesktopFolderLocalSyncEnabled(book.sourceFolder)) {
+            logDesktopFolderSync(
+                "bookSidecars.skipDisabled book=${book.id} " +
+                    "sourceFolder=\"${book.sourceFolder.orEmpty().folderSyncPreview()}\""
+            )
             return
         }
         logDesktopFolderSync(
             "bookSidecars.request book=${book.id} sourceFolder=\"${book.sourceFolder.orEmpty().folderSyncPreview()}\""
         )
-        scope.launch(Dispatchers.IO) {
+        desktopBookSidecarSaveJobs.remove(book.id)?.cancel()
+        val saveJob = scope.launch(Dispatchers.IO) {
+            if (debounceMillis > 0L) {
+                delay(debounceMillis)
+            }
             DesktopLocalFolderSync.saveBookSidecars(book)
         }
+        desktopBookSidecarSaveJobs[book.id] = saveJob
+        saveJob.invokeOnCompletion {
+            desktopBookSidecarSaveJobs.remove(book.id, saveJob)
+        }
+    }
+
+    fun scheduleFolderMetadataExtraction(sourceFolders: Set<String>) {
+        val enabledSourceFolders = sourceFolders.filterTo(mutableSetOf()) { isDesktopFolderLocalSyncEnabled(it) }
+        if (enabledSourceFolders.isEmpty()) return
+        val snapshotBooks = state.rawLibraryBooks
+        val originalBooksById = snapshotBooks
+            .filter { it.sourceFolder in enabledSourceFolders }
+            .associateBy { it.id }
+        if (originalBooksById.isEmpty()) return
+
+        scope.launch {
+            val metadataResult = withContext(Dispatchers.IO) {
+                DesktopFolderMetadataExtractor.enrichFolderBooks(
+                    books = snapshotBooks,
+                    sourceFolders = enabledSourceFolders
+                )
+            }
+            if (metadataResult.stats.updatedBooks <= 0) return@launch
+
+            val enrichedBooksById = metadataResult.books
+                .filter { it.sourceFolder in enabledSourceFolders }
+                .associateBy { it.id }
+            val booksToSave = mutableListOf<BookItem>()
+            val mergedBooks = state.rawLibraryBooks.map { current ->
+                val enriched = enrichedBooksById[current.id]
+                    ?.takeIf { current.sourceFolder in enabledSourceFolders }
+                    ?: return@map current
+                val merged = current.withDesktopImportMetadata(
+                    enriched = enriched,
+                    original = originalBooksById[current.id]
+                )
+                if (merged != current) booksToSave += merged
+                merged
+            }
+            if (booksToSave.isEmpty()) return@launch
+
+            updateState(state.copy(rawLibraryBooks = mergedBooks))
+            withContext(Dispatchers.IO) {
+                booksToSave.forEach { syncBook ->
+                    DesktopLocalFolderSync.saveBookSidecars(syncBook)
+                }
+            }
+        }
+    }
+
+    fun BookItem.matchesIncomingReaderPosition(
+        pageIndex: Int,
+        progress: Float,
+        session: ReaderSessionState?
+    ): Boolean {
+        val savedPage = if (type == FileType.PDF || type == FileType.PPTX || SharedFileCapabilities.isComicArchive(type)) {
+            lastPageIndex
+        } else {
+            readerPosition?.pageIndex ?: lastPageIndex
+        }
+        val savedProgress = progressPercentage
+        val progressMatches = savedProgress != null && kotlin.math.abs(savedProgress - progress) < 0.001f
+        val locatorMatches = session == null || readerPosition == session.navigationLocator
+        return savedPage == pageIndex && progressMatches && locatorMatches
+    }
+
+    fun shouldIgnoreStaleReaderEcho(
+        bookId: String,
+        pageIndex: Int,
+        progress: Float,
+        session: ReaderSessionState?
+    ): Boolean {
+        val guard = readerCloudStalePositionGuards[bookId] ?: return false
+        if (guard.matchesIncomingReaderPosition(pageIndex, progress, session)) {
+            logDesktopPositionTrace {
+                "event=persist_skip_stale_echo bookId=\"${bookId.logPreview(80)}\" page=$pageIndex progress=$progress " +
+                    "incomingLocator=${session?.navigationLocator.desktopPositionTraceSummary()} " +
+                    "guardLocator=${guard.readerPosition.desktopPositionTraceSummary()}"
+            }
+            logDesktopCloudSync {
+                "desktop.reader.position_skip_stale_echo book=$bookId page=$pageIndex progress=$progress " +
+                    guard.desktopCloudSyncSummary("guard")
+            }
+            return true
+        }
+        readerCloudStalePositionGuards = readerCloudStalePositionGuards - bookId
+        logDesktopPositionTrace {
+            "event=persist_stale_guard_cleared bookId=\"${bookId.logPreview(80)}\" page=$pageIndex progress=$progress " +
+                "incomingLocator=${session?.navigationLocator.desktopPositionTraceSummary()} " +
+                "guardLocator=${guard.readerPosition.desktopPositionTraceSummary()}"
+        }
+        logDesktopCloudSync {
+            "desktop.reader.position_guard_cleared book=$bookId page=$pageIndex progress=$progress"
+        }
+        return false
     }
 
     fun updateBookReadingState(
@@ -1417,48 +1993,154 @@ internal fun EpistemeDesktopApp(
         session: ReaderSessionState? = null,
         pdfViewport: SharedPdfReaderViewport? = null
     ) {
+        val hasOpenReaderWindow = readerWindows.any { it.bookId == bookId }
+        val previousBook = state.rawLibraryBooks.firstOrNull { it.id == bookId }
+        logDesktopPositionTrace {
+            "event=persist_request bookId=\"${bookId.logPreview(80)}\" page=$pageIndex progress=$progress " +
+                "hasSession=${session != null} mode=${session?.reader?.settings?.readingMode ?: "none"} " +
+                "openWindow=$hasOpenReaderWindow closing=${bookId in closingReaderBookIds} " +
+                "incomingLocator=${session?.navigationLocator.desktopPositionTraceSummary()} " +
+                "previousPage=${previousBook?.lastPageIndex ?: "null"} " +
+                "previousProgress=${previousBook?.progressPercentage ?: "null"} " +
+                "previousLocator=${previousBook?.readerPosition.desktopPositionTraceSummary()}"
+        }
+        if (!hasOpenReaderWindow && bookId !in closingReaderBookIds) {
+            logDesktopPositionTrace {
+                "event=persist_skip_closed bookId=\"${bookId.logPreview(80)}\" page=$pageIndex progress=$progress"
+            }
+            logDesktopCloudSync {
+                "desktop.reader.position_skip_closed book=$bookId page=$pageIndex progress=$progress"
+            }
+            return
+        }
+        if (shouldIgnoreStaleReaderEcho(bookId, pageIndex, progress, session)) return
+
         var updatedBook: BookItem? = null
         var shouldSyncSidecars = false
-        val next = state.copy(
-            rawLibraryBooks = state.rawLibraryBooks.map { book ->
+        var dirtyBaseTimestamp: Long? = null
+        if (previousBook == null) {
+            logDesktopPositionTrace {
+                "event=persist_skip_missing_book bookId=\"${bookId.logPreview(80)}\" page=$pageIndex progress=$progress"
+            }
+            return
+        }
+        val textReaderSettings = session?.reader?.settings
+        val updatedTextReaderDefaults = textReaderSettings
+            ?.takeIf { it != state.readerDefaultSettings }
+        val readerPosition = session?.navigationLocator
+        val nextReaderSettings = textReaderSettings ?: previousBook.readerSettings
+        val nextBookmarks = session?.bookmarks ?: previousBook.readerBookmarks
+        val nextHighlights = session?.highlights ?: previousBook.readerHighlights
+        val nextPdfViewport = pdfViewport ?: previousBook.pdfReaderViewport
+        val progressChanged = previousBook.progressPercentage
+            ?.let { kotlin.math.abs(it - progress) >= DesktopProgressEpsilon }
+            ?: true
+        val isReaderDirty =
+            previousBook.lastPageIndex != pageIndex ||
+                progressChanged ||
+                previousBook.readerPosition != readerPosition ||
+                previousBook.readerSettings != nextReaderSettings ||
+                previousBook.readerBookmarks != nextBookmarks ||
+                previousBook.readerHighlights != nextHighlights ||
+                previousBook.pdfReaderViewport != nextPdfViewport
+        if (!isReaderDirty && updatedTextReaderDefaults == null) {
+            logDesktopPositionTrace {
+                "event=persist_skip_unchanged bookId=\"${bookId.logPreview(80)}\" page=$pageIndex progress=$progress"
+            }
+            return
+        }
+        val stateWithReaderDefaults = if (updatedTextReaderDefaults != null) {
+            state.withDesktopReaderEngineDefaultSettings(
+                DesktopReaderSettingsEngine.TEXT,
+                updatedTextReaderDefaults
+            )
+        } else {
+            state
+        }
+        val next = stateWithReaderDefaults.copy(
+            readerDefaultSettings = textReaderSettings ?: state.readerDefaultSettings,
+            rawLibraryBooks = stateWithReaderDefaults.rawLibraryBooks.map { book ->
                 if (book.id == bookId) {
-                    val readerPosition = session?.navigationLocator ?: book.readerPosition
-                    shouldSyncSidecars = session != null ||
-                        book.lastPageIndex != pageIndex ||
-                        book.progressPercentage != progress ||
-                        book.readerPosition != readerPosition
-                    book.copy(
-                        progressPercentage = progress,
-                        timestamp = System.currentTimeMillis(),
-                        isRecent = true,
-                        lastPageIndex = pageIndex,
-                        readerPosition = readerPosition,
-                        readerSettings = session?.reader?.settings ?: book.readerSettings,
-                        readerBookmarks = session?.bookmarks ?: book.readerBookmarks,
-                        readerHighlights = session?.highlights ?: book.readerHighlights,
-                        pdfReaderViewport = pdfViewport ?: book.pdfReaderViewport
-                    ).also { updatedBook = it }
+                    shouldSyncSidecars = isReaderDirty
+                    if (isReaderDirty && book.id !in readerCloudDirtyBookIds) {
+                        dirtyBaseTimestamp = book.timestamp
+                    }
+                    if (isReaderDirty) {
+                        val now = System.currentTimeMillis()
+                        book.copy(
+                            progressPercentage = progress,
+                            timestamp = now,
+                            isRecent = true,
+                            lastPageIndex = pageIndex,
+                            readerPosition = readerPosition,
+                            readerSettings = nextReaderSettings,
+                            readerBookmarks = nextBookmarks,
+                            readerHighlights = nextHighlights,
+                            pdfReaderViewport = nextPdfViewport,
+                            readingPositionModifiedTimestamp = now
+                        ).also { updatedBook = it }
+                    } else {
+                        book
+                    }
                 } else {
                     book
                 }
             }
         )
-        updateState(next)
-        if (shouldSyncSidecars) {
-            updatedBook?.let(::syncBookSidecars)
+        updateState(
+            next,
+            persistDebounceMillis = if (isReaderDirty) DesktopReaderPositionPersistDebounceMillis else 0L
+        )
+        logDesktopPositionTrace {
+            val saved = updatedBook
+            "event=persist_done bookId=\"${bookId.logPreview(80)}\" updated=${saved != null} " +
+                "requestedPage=$pageIndex requestedProgress=$progress " +
+                "savedPage=${saved?.lastPageIndex ?: "null"} savedProgress=${saved?.progressPercentage ?: "null"} " +
+                "savedLocator=${saved?.readerPosition.desktopPositionTraceSummary()} " +
+                "shouldSyncSidecars=$shouldSyncSidecars dirtyBaseTimestamp=${dirtyBaseTimestamp ?: "null"}"
         }
-        updatedBook?.let { queueCloudBookMetadataSync(it) }
+        if (updatedTextReaderDefaults != null) {
+            readerWindows = readerWindows.map { windowState ->
+                val content = windowState.content
+                if (content is DesktopReaderWindowContent.Text &&
+                    content.session.reader.settings != updatedTextReaderDefaults
+                ) {
+                    windowState.copy(
+                        content = content.copy(
+                            session = readerEngine.updateSettings(content.session, updatedTextReaderDefaults)
+                        )
+                    )
+                } else {
+                    windowState
+                }
+            }
+        }
+        if (shouldSyncSidecars) {
+            updatedBook?.let { book ->
+                syncBookSidecars(book, debounceMillis = DesktopReaderPositionPersistDebounceMillis)
+            }
+            markReaderCloudDirty(bookId, baseTimestamp = dirtyBaseTimestamp)
+        }
     }
 
     fun updateBookReaderSettings(bookId: String, settings: ReaderSettings) {
+        val pdfSettings = settings.toDesktopPdfReaderSettings()
         var updatedBook: BookItem? = null
-        val next = state.copy(
-            rawLibraryBooks = state.rawLibraryBooks.map { book ->
+        var dirtyBaseTimestamp: Long? = null
+        val stateWithPdfDefaults = state.withDesktopReaderEngineDefaultSettings(
+            DesktopReaderSettingsEngine.PDF,
+            pdfSettings
+        )
+        val next = stateWithPdfDefaults.copy(
+            rawLibraryBooks = stateWithPdfDefaults.rawLibraryBooks.map { book ->
                 if (book.id == bookId) {
+                    if (book.id !in readerCloudDirtyBookIds) {
+                        dirtyBaseTimestamp = book.timestamp
+                    }
                     book.copy(
                         timestamp = System.currentTimeMillis(),
                         isRecent = true,
-                        readerSettings = settings
+                        readerSettings = pdfSettings
                     ).also { updatedBook = it }
                 } else {
                     book
@@ -1467,7 +2149,7 @@ internal fun EpistemeDesktopApp(
         )
         updateState(next)
         updatedBook?.let(::syncBookSidecars)
-        updatedBook?.let { queueCloudBookMetadataSync(it) }
+        markReaderCloudDirty(bookId, baseTimestamp = dirtyBaseTimestamp)
     }
 
     fun importDesktopReaderTexture(settings: ReaderSettings): ReaderSettings? {
@@ -1512,6 +2194,8 @@ internal fun EpistemeDesktopApp(
 
     fun signOutDesktopAccount() {
         desktopAuthRepository.signOut()
+        desktopAccountProfileRepository.clearCachedProfiles()
+        desktopAccountProfileRefreshCompleted = true
         stopReaderCloudTts()
         saveDesktopCloudSyncSettings(syncEnabled = false)
         updateState(state.copy(currentUser = null, isProUser = false, credits = 0, isSyncEnabled = false))
@@ -1570,12 +2254,36 @@ internal fun EpistemeDesktopApp(
         }
     }
 
-    fun startReaderCloudTts(windowId: String, readScope: ReaderTtsReadScope, chunks: List<ReaderTtsChunk>) {
+    fun startReaderCloudTts(
+        windowId: String,
+        readScope: ReaderTtsReadScope,
+        chunks: List<ReaderTtsChunk>,
+        startChunkIndex: Int = 0,
+        restartActive: Boolean = false,
+        applyReplacements: Boolean = true
+    ) {
         val content = textReaderWindowContent(windowId) ?: return
         val replacementBookId = content.book.id.ifBlank { content.session.reader.book.title }
-        val ttsChunks = chunks
-            .filter { it.text.isNotBlank() }
-            .withTtsReplacements(state.readerTtsReplacementPreferences, replacementBookId)
+        val sourceChunks = chunks.filter { it.text.isNotBlank() }
+        logDesktopTtsStartTrace {
+            "event=desktop_start_request windowId=\"${windowId.logPreview(80)}\" scope=${readScope.name} " +
+                "incomingChunks=${chunks.size} sourceChunks=${sourceChunks.size} startChunkIndex=$startChunkIndex " +
+                "restartActive=$restartActive applyReplacements=$applyReplacements " +
+                "currentPage=${content.session.reader.currentPageIndex} sessionLocator=${content.session.navigationLocator.desktopPositionTraceSummary(160)} " +
+                "incomingFirst=${chunks.firstOrNull().desktopTtsStartTraceSummary(160)} " +
+                "sourceFirst=${sourceChunks.firstOrNull().desktopTtsStartTraceSummary(160)}"
+        }
+        val ttsChunks = if (applyReplacements) {
+            sourceChunks.withTtsReplacements(state.readerTtsReplacementPreferences, replacementBookId)
+        } else {
+            sourceChunks
+        }
+        logDesktopTtsStartTrace {
+            "event=desktop_start_prepared windowId=\"${windowId.logPreview(80)}\" scope=${readScope.name} " +
+                "ttsChunks=${ttsChunks.size} boundedStart=${startChunkIndex.coerceIn(0, ttsChunks.lastIndex.coerceAtLeast(0))} " +
+                "first=${ttsChunks.firstOrNull().desktopTtsStartTraceSummary(160)} " +
+                "second=${ttsChunks.getOrNull(1).desktopTtsStartTraceSummary(160)}"
+        }
         val settings = aiByokSettings.sanitized()
         val currentCloudTts = content.extrasState.cloudTts
         logDesktopTts(
@@ -1584,9 +2292,13 @@ internal fun EpistemeDesktopApp(
                 "keyPresent=${settings.geminiKey.isNotBlank()} ttsModel=\"${settings.ttsModel.desktopTtsPreview()}\" " +
                 "available=${desktopTtsAdapter.isAvailable}"
         )
-        if (currentCloudTts.isPlaying || currentCloudTts.isLoading || currentCloudTts.isPaused) {
+        val ttsActive = currentCloudTts.isPlaying || currentCloudTts.isLoading || currentCloudTts.isPaused
+        if (ttsActive && !restartActive) {
             stopReaderCloudTts(windowId)
             return
+        }
+        if (ttsActive) {
+            content.ttsJob?.cancel()
         }
         if (ttsChunks.isEmpty()) {
             logDesktopTts("reader_sequence_ignored reason=blank_text scope=${readScope.name}")
@@ -1604,7 +2316,7 @@ internal fun EpistemeDesktopApp(
         }
         if (!desktopTtsAdapter.isAvailable) {
             logDesktopTts("reader_sequence_blocked reason=adapter_unavailable")
-            desktopFeatureNoticeForCloudTts()?.let { desktopFeatureNotice = it }
+            desktopFeatureNoticeForCloudTts()?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
             updateTextReaderWindow(windowId) { latest ->
                 latest.copy(
                     extrasState = latest.extrasState.copy(
@@ -1638,11 +2350,18 @@ internal fun EpistemeDesktopApp(
             }
         }
         val ttsSessionId = System.currentTimeMillis()
+        val boundedStartChunkIndex = startChunkIndex.coerceIn(0, ttsChunks.lastIndex)
+        val playbackChunks = ttsChunks.drop(boundedStartChunkIndex)
+        logDesktopTtsStartTrace {
+            "event=desktop_playback_window windowId=\"${windowId.logPreview(80)}\" scope=${readScope.name} " +
+                "boundedStart=$boundedStartChunkIndex playbackChunks=${playbackChunks.size} " +
+                "playbackFirst=${playbackChunks.firstOrNull().desktopTtsStartTraceSummary(160)}"
+        }
         val initialProgress = ReaderTtsProgress(
             sessionId = ttsSessionId,
             scope = readScope,
             chunks = ttsChunks,
-            currentChunkIndex = -1
+            currentChunkIndex = boundedStartChunkIndex - 1
         )
         updateTextReaderWindow(windowId) { latest ->
             latest.copy(
@@ -1661,11 +2380,24 @@ internal fun EpistemeDesktopApp(
                 )
             )
         }
+        fun updateTextReaderTtsSession(transform: (DesktopReaderWindowContent.Text) -> DesktopReaderWindowContent.Text) {
+            updateTextReaderWindow(windowId) { latest ->
+                if (latest.extrasState.cloudTts.progress.sessionId == ttsSessionId) {
+                    transform(latest)
+                } else {
+                    latest
+                }
+            }
+        }
         val ttsJob = scope.launch {
             runCatching {
-                logDesktopTts("reader_sequence_start scope=${readScope.name} chunks=${ttsChunks.size}")
-                desktopTtsAdapter.speakChunks(content.session.reader.book.title, readScope, ttsChunks) { index ->
+                logDesktopTts(
+                    "reader_sequence_start scope=${readScope.name} chunks=${ttsChunks.size} " +
+                        "startChunk=${boundedStartChunkIndex + 1}"
+                )
+                desktopTtsAdapter.speakChunks(content.session.reader.book.title, readScope, playbackChunks) { relativeIndex ->
                     if (!isActive) throw kotlinx.coroutines.CancellationException("Reader cloud TTS stopped")
+                    val index = boundedStartChunkIndex + relativeIndex
                     val chunk = ttsChunks[index]
                     val progress = initialProgress.copy(currentChunkIndex = index)
                     val latest = textReaderWindowContent(windowId)
@@ -1680,7 +2412,7 @@ internal fun EpistemeDesktopApp(
                             session = updatedSession
                         )
                     }
-                    updateTextReaderWindow(windowId) { current ->
+                    updateTextReaderTtsSession { current ->
                         current.copy(
                             extrasState = current.extrasState.copy(
                                 cloudTts = ReaderCloudTtsState(
@@ -1700,11 +2432,14 @@ internal fun EpistemeDesktopApp(
                             "sourceCfi=\"${chunk.sourceCfi.orEmpty().logPreview()}\" chars=${chunk.text.length} " +
                             "text=\"${chunk.text.logPreview()}\""
                     )
+                    logDesktopTtsStartTrace {
+                        "event=desktop_chunk_start scope=${readScope.name} index=${index + 1}/${ttsChunks.size} " +
+                            "chunk=${chunk.desktopTtsStartTraceSummary(180)}"
+                    }
                 }
             }.onFailure { error ->
                 logDesktopTts("reader_sequence_failed error=\"${error.desktopTtsSummary()}\"")
-                if (error !is kotlinx.coroutines.CancellationException) error.printStackTrace()
-                updateTextReaderWindow(windowId) { latest ->
+                updateTextReaderTtsSession { latest ->
                     if (error is kotlinx.coroutines.CancellationException) {
                         latest.copy(
                             ttsJob = null,
@@ -1716,7 +2451,7 @@ internal fun EpistemeDesktopApp(
                             )
                         )
                     } else {
-                        desktopFeatureNoticeForError(error.message)?.let { desktopFeatureNotice = it }
+                        desktopFeatureNoticeForError(error.message)?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
                         latest.copy(
                             ttsJob = null,
                             extrasState = latest.extrasState.copy(
@@ -1731,7 +2466,7 @@ internal fun EpistemeDesktopApp(
                 }
             }.onSuccess {
                 logDesktopTts("reader_sequence_success chunks=${ttsChunks.size}")
-                updateTextReaderWindow(windowId) { latest ->
+                updateTextReaderTtsSession { latest ->
                     latest.copy(
                         ttsJob = null,
                         extrasState = latest.extrasState.copy(
@@ -1747,7 +2482,37 @@ internal fun EpistemeDesktopApp(
         updateTextReaderWindow(windowId) { latest -> latest.copy(ttsJob = ttsJob) }
     }
 
-    fun toggleReaderCloudTts(windowId: String, text: String) {
+    fun skipReaderCloudTtsChunk(windowId: String, delta: Int) {
+        val content = textReaderWindowContent(windowId) ?: return
+        val progress = content.extrasState.cloudTts.progress
+        if (progress.chunks.isEmpty()) return
+        val currentIndex = progress.currentChunkIndex.takeIf { it >= 0 } ?: return
+        val targetIndex = (currentIndex + delta).coerceIn(0, progress.chunks.lastIndex)
+        if (targetIndex == currentIndex) return
+        startReaderCloudTts(
+            windowId = windowId,
+            readScope = progress.scope,
+            chunks = progress.chunks,
+            startChunkIndex = targetIndex,
+            restartActive = true,
+            applyReplacements = false
+        )
+    }
+
+    fun locateReaderCloudTtsChunk(windowId: String) {
+        val content = textReaderWindowContent(windowId) ?: return
+        val chunk = content.extrasState.cloudTts.progress.currentChunk ?: return
+        val updatedSession = readerEngine.goToPage(content.session, chunk.pageIndex)
+        updateTextReaderWindow(windowId) { current -> current.copy(session = updatedSession) }
+        updateBookReadingState(
+            bookId = content.book.id,
+            pageIndex = updatedSession.reader.currentPageIndex,
+            progress = updatedSession.reader.progress,
+            session = updatedSession
+        )
+    }
+
+    fun toggleReaderCloudTts(windowId: String, text: String, locator: ReaderLocator? = null) {
         val content = textReaderWindowContent(windowId) ?: return
         val normalizedText = text.trim()
         val settings = aiByokSettings.sanitized()
@@ -1780,7 +2545,7 @@ internal fun EpistemeDesktopApp(
         }
         if (!desktopTtsAdapter.isAvailable) {
             logDesktopTts("reader_toggle_blocked reason=adapter_unavailable")
-            desktopFeatureNoticeForCloudTts()?.let { desktopFeatureNotice = it }
+            desktopFeatureNoticeForCloudTts()?.let { showDesktopFeatureNotice(it, readerWindowId = windowId) }
             updateTextReaderWindow(windowId) { latest ->
                 latest.copy(
                     extrasState = latest.extrasState.copy(
@@ -1794,14 +2559,24 @@ internal fun EpistemeDesktopApp(
             }
             return
         }
-        val page = content.session.reader.currentPage
-        val selectionChunks = if (page != null) {
+        val locatorChunks = locator
+            ?.takeIf { it.startOffset != null || !it.cfi.isNullOrBlank() }
+            ?.let { selectionLocator ->
+                ReaderTtsPlanner.chunksFromCurrentLocation(
+                    content.session.copy(navigationLocator = selectionLocator)
+                ).takeIf { it.isNotEmpty() }
+            }
+        val page = locator
+            ?.pageIndex
+            ?.let { content.session.reader.pages.getOrNull(it) }
+            ?: content.session.reader.currentPage
+        val selectionChunks = locatorChunks ?: if (page != null) {
             ReaderTtsPlanner.chunksForText(
                 text = normalizedText,
-                pageIndex = page.pageIndex,
-                chapterIndex = page.chapterIndex,
+                pageIndex = locator?.pageIndex ?: page.pageIndex,
+                chapterIndex = locator?.chapterIndex ?: page.chapterIndex,
                 chapterTitle = page.chapterTitle,
-                sourceStartOffset = page.startOffset
+                sourceStartOffset = locator?.startOffset ?: page.startOffset
             )
         } else {
             ReaderTtsPlanner.chunksForText(
@@ -1811,7 +2586,11 @@ internal fun EpistemeDesktopApp(
                 chapterTitle = desktopString("desktop_selection", "Selection")
             )
         }
-        startReaderCloudTts(windowId, ReaderTtsReadScope.PAGE, selectionChunks)
+        startReaderCloudTts(
+            windowId = windowId,
+            readScope = if (locatorChunks != null) ReaderTtsReadScope.BOOK else ReaderTtsReadScope.PAGE,
+            chunks = selectionChunks
+        )
     }
 
     fun finishImportFiles(
@@ -1938,7 +2717,7 @@ internal fun EpistemeDesktopApp(
                             book.withDesktopImportMetadata(
                                 enriched = enriched,
                                 original = originalTargetBooksById[book.id]
-                            )
+                            ).copy(timestamp = System.currentTimeMillis())
                         }
                     )
                 )
@@ -1989,6 +2768,11 @@ internal fun EpistemeDesktopApp(
             updateState(state.withBanner("No local folders are linked yet.", isError = true))
             return
         }
+        if (targetFolder == null && state.syncedFolders.none { it.localSyncEnabled }) {
+            logDesktopFolderSync("ui.sync.skipNoEnabledFolders mode=$mode")
+            updateState(state.withBanner("No local folders have sync enabled.", isError = true))
+            return
+        }
 
         val snapshotState = state
         val snapshotShelfRefs = shelfRefs
@@ -2002,14 +2786,22 @@ internal fun EpistemeDesktopApp(
         }
 
         scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                DesktopLocalFolderSync.sync(
-                    state = snapshotState,
-                    shelfRefs = snapshotShelfRefs,
-                    targetFolder = targetFolder,
-                    metadataOnly = metadataOnly
-                )
-            }
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    DesktopLocalFolderSync.sync(
+                        state = snapshotState,
+                        shelfRefs = snapshotShelfRefs,
+                        targetFolder = targetFolder,
+                        metadataOnly = metadataOnly,
+                        extractMetadata = false
+                    )
+                }
+            }.onFailure { error ->
+                logDesktopFolderSync("ui.sync.failed mode=$mode error=${error.folderSyncSummary()}")
+                if (showBanner) {
+                    updateState(state.withBanner(error.message ?: "Folder sync failed.", isError = true))
+                }
+            }.getOrNull() ?: return@launch
             val failedCount = result.failedFolders.size
             val stats = result.stats
             val metadataStats = result.metadataStats
@@ -2040,20 +2832,24 @@ internal fun EpistemeDesktopApp(
                     "new=${stats.newBooks} updated=${stats.updatedBooks} remoteUpdates=${stats.remoteMetadataUpdates} " +
                     "removed=${stats.removedBooks} metadataExtracted=${metadataStats.updatedBooks}"
             )
-            val completedState = if (showBanner || failedCount > 0) {
-                result.state.withBanner(message, isError = failedCount > 0)
-            } else {
-                result.state
-            }
+            val completedState = desktopFolderSyncCompletedState(
+                state = result.state,
+                message = message,
+                failedFolderCount = failedCount,
+                showBanner = showBanner
+            )
             replaceLibrary(
                 completedState,
                 refs = result.shelfRefs
             )
+            if (!metadataOnly) {
+                scheduleFolderMetadataExtraction(result.processedFolderUris.toSet())
+            }
             val existingBookIds = completedState.rawLibraryBooks.mapTo(mutableSetOf()) { it.id }
             readerWindows = readerWindows.mapNotNull { window ->
                 val migratedBookId = result.idMigrations[window.bookId] ?: window.bookId
                 if (migratedBookId !in existingBookIds) {
-                    window.closeReaderResources()
+                    window.cancelReaderWork()
                     null
                 } else if (migratedBookId != window.bookId) {
                     val migratedContent = when (val content = window.content) {
@@ -2091,7 +2887,7 @@ internal fun EpistemeDesktopApp(
 
     fun syncDesktopLibrary(showBanner: Boolean = true) {
         val hasCloud = state.isSyncEnabled
-        val hasFolders = state.syncedFolders.isNotEmpty()
+        val hasFolders = state.syncedFolders.any { it.localSyncEnabled }
         if (!hasCloud && !hasFolders) {
             updateState(state.withBanner("No sync methods are active.", isError = true))
             return
@@ -2203,6 +2999,22 @@ internal fun EpistemeDesktopApp(
         }
     }
 
+    fun createShelfWithBooks(name: String, bookIds: Set<String>, clearSelection: Boolean = true) {
+        SharedLibraryEditor.createShelfWithBooks(
+            state = state,
+            shelfRecords = shelfRecords,
+            shelfRefs = shelfRefs,
+            name = name,
+            bookIds = bookIds,
+            clearSelection = clearSelection,
+            nowMillis = System.currentTimeMillis()
+        )?.let { result ->
+            replaceLibrary(result.state, records = result.shelfRecords, refs = result.shelfRefs)
+            result.shelfRecords.lastOrNull { record -> record.name == name.trim() }
+                ?.let { record -> syncCloudShelfChange(record, result.shelfRefs) }
+        }
+    }
+
     fun createSmartShelf(name: String, definition: SmartCollectionDefinition) {
         SharedLibraryEditor.createSmartShelf(state, shelfRecords, shelfRefs, name, definition, System.currentTimeMillis())?.let {
             replaceLibrary(it.state, records = it.shelfRecords, refs = it.shelfRefs)
@@ -2234,6 +3046,33 @@ internal fun EpistemeDesktopApp(
         SharedLibraryEditor.addSelectedBooksToShelf(state, shelfRecords, shelfRefs, shelfId, System.currentTimeMillis())?.let { result ->
             replaceLibrary(result.state, records = result.shelfRecords, refs = result.shelfRefs)
             result.shelfRecords.firstOrNull { record -> record.id == shelfId }
+                ?.let { record -> syncCloudShelfChange(record, result.shelfRefs) }
+        }
+    }
+
+    fun addBooksToShelves(bookIds: Set<String>, shelfIds: Set<String>, clearSelection: Boolean) {
+        val targetShelfIds = shelfIds.filterTo(linkedSetOf()) { SharedLibraryEditor.canMutateShelf(it) }
+        SharedLibraryEditor.addBooksToShelves(
+            state = state,
+            shelfRecords = shelfRecords,
+            shelfRefs = shelfRefs,
+            bookIds = bookIds,
+            shelfIds = targetShelfIds,
+            clearSelection = clearSelection,
+            nowMillis = System.currentTimeMillis()
+        )?.let { result ->
+            replaceLibrary(result.state, records = result.shelfRecords, refs = result.shelfRefs)
+            targetShelfIds.forEach { shelfId ->
+                result.shelfRecords.firstOrNull { record -> record.id == shelfId }
+                    ?.let { record -> syncCloudShelfChange(record, result.shelfRefs) }
+            }
+        }
+    }
+
+    fun replaceShelfBooks(shelf: Shelf, bookIds: Set<String>) {
+        SharedLibraryEditor.replaceShelfBooks(state, shelfRecords, shelfRefs, shelf.id, bookIds, System.currentTimeMillis())?.let { result ->
+            replaceLibrary(result.state, records = result.shelfRecords, refs = result.shelfRefs)
+            result.shelfRecords.firstOrNull { record -> record.id == shelf.id }
                 ?.let { record -> syncCloudShelfChange(record, result.shelfRefs) }
         }
     }
@@ -2298,7 +3137,9 @@ internal fun EpistemeDesktopApp(
                 }
                 rewritten.onSuccess(::applyBookMetadataUpdate)
                     .onFailure { error ->
-                        println("Failed to update EPUB metadata for ${updated.displayName}: ${error.message}")
+                        logDesktopDiagnostic("EpistemeDesktopMetadata") {
+                            "epub_metadata_update_failed book=${updated.id} error=\"${error.message.orEmpty().logPreview()}\""
+                        }
                         updateState(state.copy(bannerMessage = BannerMessage("Could not update EPUB metadata.")))
                     }
             }
@@ -2312,10 +3153,9 @@ internal fun EpistemeDesktopApp(
         val now = System.currentTimeMillis()
         val next = SharedLibraryEditor.markBookOpened(state, bookId, now)
         val openedState = next.reduce(AppAction.BookTabOpened(bookId))
-        updateState(openedState)
+        updateState(openedState, persistDebounceMillis = DesktopLibraryOpenPersistDebounceMillis)
         openedState.rawLibraryBooks.firstOrNull { it.id == bookId }?.let { book ->
-            syncBookSidecars(book)
-            queueCloudBookMetadataSync(book)
+            syncBookSidecars(book, debounceMillis = DesktopLibraryOpenPersistDebounceMillis)
         }
     }
 
@@ -2330,13 +3170,16 @@ internal fun EpistemeDesktopApp(
                     rawLibraryBooks = state.rawLibraryBooks.map { current ->
                         if (current.id == book.id) {
                             current.withDesktopImportMetadata(enriched = enriched, original = book)
+                                .copy(timestamp = System.currentTimeMillis())
                         } else {
                             current
                         }
                     }
                 )
             )
-            state.rawLibraryBooks.firstOrNull { it.id == book.id }?.let { queueCloudBookMetadataSync(it) }
+            state.rawLibraryBooks.firstOrNull { it.id == book.id }?.let {
+                markReaderCloudDirty(it.id, baseTimestamp = book.timestamp)
+            }
         }
     }
 
@@ -2362,14 +3205,23 @@ internal fun EpistemeDesktopApp(
     }
 
     fun exitReaderTo(tab: SharedAppTab) {
-        selectedTab = tab.takeUnless { it == SharedAppTab.READER } ?: SharedAppTab.LIBRARY
+        if (tab == SharedAppTab.SHELVES) {
+            selectedLibraryTab = NonReaderLibraryTab.SHELVES
+            selectedTab = SharedAppTab.LIBRARY
+        } else {
+            selectedTab = tab.takeUnless { it == SharedAppTab.READER } ?: SharedAppTab.LIBRARY
+        }
     }
 
     fun selectAppTab(tab: SharedAppTab) {
-        val nextTab = if (tab == SharedAppTab.CATALOGS && !featurePolicy.opdsCatalogs) {
-            SharedAppTab.HOME
-        } else {
-            tab
+        val nextTab = when {
+            tab == SharedAppTab.CATALOGS && !featurePolicy.opdsCatalogs -> SharedAppTab.LIBRARY
+            tab == SharedAppTab.PRO && !desktopAccountAvailable() -> SharedAppTab.LIBRARY
+            tab == SharedAppTab.SHELVES -> {
+                selectedLibraryTab = NonReaderLibraryTab.SHELVES
+                SharedAppTab.LIBRARY
+            }
+            else -> tab
         }
         if (nextTab == SharedAppTab.SETTINGS) {
             settingsQuery = ""
@@ -2385,11 +3237,47 @@ internal fun EpistemeDesktopApp(
         }
     }
 
+    fun focusDesktopAppWindow() {
+        val ownerWindow = (window as? java.awt.Window)
+            ?: window?.let { javax.swing.SwingUtilities.getWindowAncestor(it) }
+            ?: return
+        EventQueue.invokeLater {
+            if (!ownerWindow.isDisplayable || !ownerWindow.isShowing) return@invokeLater
+            if (ownerWindow is java.awt.Frame && ownerWindow.extendedState and java.awt.Frame.ICONIFIED != 0) {
+                ownerWindow.extendedState = ownerWindow.extendedState and java.awt.Frame.ICONIFIED.inv()
+            }
+            ownerWindow.toFront()
+            ownerWindow.requestFocus()
+            ownerWindow.requestFocusInWindow()
+        }
+    }
+
+    fun confirmDesktopFeatureNotice(notice: DesktopFeatureNotice) {
+        dismissDesktopFeatureNotice()
+        when (notice.action) {
+            DesktopFeatureNoticeAction.SIGN_IN -> signInDesktopAccount()
+            DesktopFeatureNoticeAction.OPEN_PRO -> {
+                selectAppTab(SharedAppTab.PRO)
+                focusDesktopAppWindow()
+            }
+            null -> Unit
+        }
+    }
+
     fun applyReaderOpenResult(result: DesktopReaderOpenResult) {
+        val applyStartedAt = System.nanoTime()
+        logDesktopReaderOpenTrace {
+            result.opening.openTracePrefix("desktop_apply_start") +
+                " result=${result.openTraceKind()}"
+        }
         val window = readerWindows.firstOrNull { it.opening.requestId == result.opening.requestId }
         if (window == null) {
             if (result is DesktopReaderOpenResult.Pdf) {
                 result.document.close()
+            }
+            logDesktopReaderOpenTrace {
+                result.opening.openTracePrefix("desktop_apply_missing_window") +
+                    " result=${result.openTraceKind()} durationMs=${applyStartedAt.elapsedOpenTraceMs()}"
             }
             return
         }
@@ -2411,10 +3299,6 @@ internal fun EpistemeDesktopApp(
             }
 
             is DesktopReaderOpenResult.Pdf -> {
-                (window.content as? DesktopReaderWindowContent.Pdf)
-                    ?.document
-                    ?.takeIf { it.handleId != result.document.handleId }
-                    ?.close()
                 readerWindows = readerWindows.withDesktopReaderWindowContent(
                     requestId = result.opening.requestId,
                     content = DesktopReaderWindowContent.Pdf(
@@ -2447,6 +3331,11 @@ internal fun EpistemeDesktopApp(
                 recordBookOpened(result.book.id)
             }
         }
+        logDesktopReaderOpenTrace {
+            result.opening.openTracePrefix("desktop_apply_done") +
+                " result=${result.openTraceKind()} windowId=\"${window.id.logPreview(80)}\" " +
+                "durationMs=${applyStartedAt.elapsedOpenTraceMs()} openWindows=${readerWindows.size}"
+        }
     }
 
     fun openReader(
@@ -2456,10 +3345,6 @@ internal fun EpistemeDesktopApp(
         returnTabOverride: SharedAppTab? = null
     ) {
         val desktopReaderSurface = SharedFileCapabilities.surfaceFor(book.type, ReaderPlatform.DESKTOP)
-        if (shouldRequestDesktopWebViewRuntime(desktopReaderSurface)) {
-            webViewRuntimeRequested = true
-        }
-
         if (desktopReaderSurface == ReaderFeatureSurface.PDF_VIEWER) {
             val path = book.path
             if (path.isNullOrBlank()) {
@@ -2502,23 +3387,57 @@ internal fun EpistemeDesktopApp(
                 ?: SharedAppTab.LIBRARY,
             password = password
         )
+        logDesktopReaderOpenTrace {
+            opening.openTracePrefix("desktop_open_request") +
+                " type=${book.type} surface=$desktopReaderSurface force=$force " +
+                "path=\"${book.path.orEmpty().logPreview(180)}\""
+        }
         val readerDefaultSettings = state.readerDefaultSettings
+        val previousWindowCount = readerWindows.size
         if (force) {
-            readerWindows.firstOrNull { it.bookId == book.id }?.closeReaderResources()
+            readerWindows.firstOrNull { it.bookId == book.id }?.let { existingWindow ->
+                logDesktopReaderOpenTrace {
+                    opening.openTracePrefix("desktop_force_cancel_existing") +
+                        " windowId=\"${existingWindow.id.logPreview(80)}\""
+                }
+                existingWindow.cancelReaderWork()
+            }
         }
         val openDecision = readerWindows.openOrFocusDesktopReaderWindow(opening, force)
         readerWindows = openDecision.windows
+        logDesktopReaderOpenTrace {
+            opening.openTracePrefix("desktop_window_decision") +
+                " shouldStart=${openDecision.shouldStartOpen} force=$force " +
+                "previousWindows=$previousWindowCount nextWindows=${openDecision.windows.size}"
+        }
         if (!openDecision.shouldStartOpen) {
             recordBookOpened(book.id)
+            logDesktopReaderOpenTrace {
+                opening.openTracePrefix("desktop_focus_existing_done")
+            }
             return
         }
 
         scope.launch {
+            logDesktopReaderOpenTrace {
+                opening.openTracePrefix("desktop_open_coroutine_start")
+            }
             val result = withContext(Dispatchers.IO) {
+                val ioStartedAt = System.nanoTime()
+                logDesktopReaderOpenTrace {
+                    opening.openTracePrefix("desktop_open_io_start") +
+                        " surface=$desktopReaderSurface"
+                }
                 runCatching {
                     when (desktopReaderSurface) {
                         ReaderFeatureSurface.PDF_VIEWER -> {
+                            val pdfStartedAt = System.nanoTime()
                             val path = book.path.orEmpty()
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_pdf_load_start") +
+                                    " type=${book.type} path=\"${path.logPreview(180)}\" " +
+                                    "passwordSupplied=${!opening.password.isNullOrEmpty()}"
+                            }
                             val streamReference = SharedOpdsStreamUri.parse(path)
                             val document = if (streamReference != null) {
                                 DesktopPdfium.loadOpdsStream(
@@ -2539,19 +3458,77 @@ internal fun EpistemeDesktopApp(
                                     else -> DesktopPdfium.loadComic(readerFile, book.type)
                                 }
                             }
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_pdf_load_done") +
+                                    " type=${book.type} durationMs=${pdfStartedAt.elapsedOpenTraceMs()} " +
+                                    "pages=${document.pageCount}"
+                            }
                             DesktopReaderOpenResult.Pdf(opening, book, document)
                         }
 
                         ReaderFeatureSurface.EPUB_READER,
                         ReaderFeatureSurface.TEXT_READER -> {
                             val path = book.path?.takeIf { it.isNotBlank() } ?: error("Book path is missing.")
+                            val readerFile = File(path)
+                            val settingsStartedAt = System.nanoTime()
+                            val restoredSettings = resolvedDesktopReaderSettings(book, readerDefaultSettings)
+                            val semanticMode = if (restoredSettings.readingMode == ReaderReadingMode.VERTICAL) {
+                                SharedJvmBookLoadSemanticMode.SKIP
+                            } else {
+                                SharedJvmBookLoadSemanticMode.FULL
+                            }
+                            val preparedHtmlChapterRange = if (semanticMode == SharedJvmBookLoadSemanticMode.SKIP) {
+                                val initialChapter = book.readerPosition?.chapterIndex?.takeIf { it >= 0 } ?: 0
+                                (initialChapter - DesktopVerticalInitialPreparedHtmlChapterRadius).coerceAtLeast(0)..
+                                    (initialChapter + DesktopVerticalInitialPreparedHtmlChapterRadius)
+                            } else {
+                                null
+                            }
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_settings_restored") +
+                                    " durationMs=${settingsStartedAt.elapsedOpenTraceMs()} " +
+                                    "mode=${restoredSettings.readingMode} semanticMode=${semanticMode.name} " +
+                                    "preparedHtmlChapters=${preparedHtmlChapterRange?.let { "${it.first}..${it.last}" } ?: "all"} " +
+                                    "fontSize=${restoredSettings.fontSize} textAlign=${restoredSettings.textAlign} " +
+                                    "pageWidth=${restoredSettings.pageWidth}"
+                            }
+                            val loadStartedAt = System.nanoTime()
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_text_load_start") +
+                                    " type=${book.type} semanticMode=${semanticMode.name} fileBytes=${readerFile.length()} " +
+                                    "path=\"${path.logPreview(180)}\""
+                            }
                             val loadedBook = SharedJvmBookLoader.load(
-                                file = File(path),
+                                file = readerFile,
                                 type = book.type,
                                 titleOverride = book.title?.takeIf { it.isNotBlank() },
-                                authorOverride = book.author?.takeIf { it.isNotBlank() }
+                                authorOverride = book.author?.takeIf { it.isNotBlank() },
+                                semanticMode = semanticMode,
+                                preparedHtmlChapterRange = preparedHtmlChapterRange
                             )
-                            val restoredSettings = resolvedDesktopReaderSettings(book, readerDefaultSettings)
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_text_load_done") +
+                                    " durationMs=${loadStartedAt.elapsedOpenTraceMs()} " +
+                                    "loadedTitle=\"${loadedBook.title.logPreview(120)}\" " +
+                                    "chapters=${loadedBook.chapters.size} pagesBeforeSession=n/a " +
+                                    "textChars=${loadedBook.chapters.sumOf { it.plainText.length }} " +
+                                    "htmlChars=${loadedBook.chapters.sumOf { it.htmlContent.length }} " +
+                                    "semanticBlocks=${loadedBook.chapters.sumOf { it.semanticBlocks.size }} " +
+                                    "cssFiles=${loadedBook.css.size} cssChars=${loadedBook.css.values.sumOf { it.length }}"
+                            }
+                            val sessionStartedAt = System.nanoTime()
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_session_create_start") +
+                                    " initialPage=${book.lastPageIndex ?: 0} hasLocator=${book.readerPosition != null} " +
+                                    "locator=${book.readerPosition.desktopPositionTraceSummary(70)} " +
+                                    "bookmarks=${book.readerBookmarks.size} highlights=${book.readerHighlights.size}"
+                            }
+                            logDesktopPositionTrace {
+                                opening.openTracePrefix("desktop_position_restore_start") +
+                                    " initialPage=${book.lastPageIndex ?: 0} storedProgress=${book.progressPercentage ?: "null"} " +
+                                    "storedLocator=${book.readerPosition.desktopPositionTraceSummary()} " +
+                                    "mode=${restoredSettings.readingMode}"
+                            }
                             val restoredSession = readerEngine.createSession(
                                 book = loadedBook,
                                 settings = restoredSettings,
@@ -2560,9 +3537,42 @@ internal fun EpistemeDesktopApp(
                                 bookmarks = book.readerBookmarks,
                                 highlights = book.readerHighlights
                             )
+                            logDesktopReaderOpenTrace {
+                                opening.openTracePrefix("desktop_session_create_done") +
+                                    " durationMs=${sessionStartedAt.elapsedOpenTraceMs()} " +
+                                    "pages=${restoredSession.reader.pages.size} " +
+                                    "currentPage=${restoredSession.reader.currentPageIndex + 1} " +
+                                    "navigationLocator=${restoredSession.navigationLocator.desktopPositionTraceSummary(70)} " +
+                                    "visiblePages=${restoredSession.reader.visiblePages.map { it.pageIndex + 1 }}"
+                            }
+                            logDesktopPositionTrace {
+                                opening.openTracePrefix("desktop_position_restore_session_done") +
+                                    " durationMs=${sessionStartedAt.elapsedOpenTraceMs()} " +
+                                    "page=${restoredSession.reader.currentPageIndex} pages=${restoredSession.reader.pages.size} " +
+                                    "navigationLocator=${restoredSession.navigationLocator.desktopPositionTraceSummary()}"
+                            }
                             val restoredProgress = book.progressPercentage
                             val session = if (book.readerPosition == null && book.lastPageIndex == null && restoredProgress != null) {
+                                val progressStartedAt = System.nanoTime()
+                                logDesktopReaderOpenTrace {
+                                    opening.openTracePrefix("desktop_progress_restore_start") +
+                                        " progress=$restoredProgress"
+                                }
                                 readerEngine.goToProgress(restoredSession, restoredProgress.coerceIn(0f, 100f) / 100f)
+                                    .also { restored ->
+                                        logDesktopReaderOpenTrace {
+                                            opening.openTracePrefix("desktop_progress_restore_done") +
+                                                " durationMs=${progressStartedAt.elapsedOpenTraceMs()} " +
+                                                "currentPage=${restored.reader.currentPageIndex + 1} " +
+                                                "navigationLocator=${restored.navigationLocator.desktopPositionTraceSummary(70)}"
+                                        }
+                                        logDesktopPositionTrace {
+                                            opening.openTracePrefix("desktop_position_restore_progress_done") +
+                                                " durationMs=${progressStartedAt.elapsedOpenTraceMs()} " +
+                                                "page=${restored.reader.currentPageIndex} " +
+                                                "navigationLocator=${restored.navigationLocator.desktopPositionTraceSummary()}"
+                                        }
+                                    }
                             } else {
                                 restoredSession
                             }
@@ -2572,6 +3582,11 @@ internal fun EpistemeDesktopApp(
                         else -> error("${SharedFileCapabilities.displayNameFor(book.type)} reader support comes later.")
                     }
                 }.getOrElse { error ->
+                    logDesktopReaderOpenTrace {
+                        opening.openTracePrefix("desktop_open_io_exception") +
+                            " durationMs=${ioStartedAt.elapsedOpenTraceMs()} " +
+                            "error=\"${error.message.orEmpty().logPreview(240)}\""
+                    }
                     if (desktopReaderSurface == ReaderFeatureSurface.PDF_VIEWER &&
                         book.type == FileType.PDF &&
                         error.isDesktopPdfPasswordException()
@@ -2589,7 +3604,16 @@ internal fun EpistemeDesktopApp(
                                 (error.message ?: "unknown error")
                         )
                     }
+                }.also { loadedResult ->
+                    logDesktopReaderOpenTrace {
+                        opening.openTracePrefix("desktop_open_io_done") +
+                            " result=${loadedResult.openTraceKind()} durationMs=${ioStartedAt.elapsedOpenTraceMs()}"
+                    }
                 }
+            }
+            logDesktopReaderOpenTrace {
+                opening.openTracePrefix("desktop_open_result_ready") +
+                    " result=${result.openTraceKind()}"
             }
             applyReaderOpenResult(result)
         }
@@ -2844,8 +3868,18 @@ internal fun EpistemeDesktopApp(
     }
 
     val latestReaderWindows by rememberUpdatedState(readerWindows)
+    val latestStateForDispose by rememberUpdatedState(state)
+    val latestShelfRecordsForDispose by rememberUpdatedState(shelfRecords)
+    val latestShelfRefsForDispose by rememberUpdatedState(shelfRefs)
+    val latestCustomFontsForDispose by rememberUpdatedState(customFonts)
     DisposableEffect(Unit) {
         onDispose {
+            flushDesktopPersistenceBeforeDispose(
+                projected = latestStateForDispose,
+                records = latestShelfRecordsForDispose,
+                refs = latestShelfRefsForDispose,
+                fonts = latestCustomFontsForDispose
+            )
             latestReaderWindows.forEach { it.closeReaderResources() }
         }
     }
@@ -2868,9 +3902,10 @@ internal fun EpistemeDesktopApp(
         }
     }
 
-    LaunchedEffect(state.isSyncEnabled, state.currentUser?.uid, state.isProUser) {
+    LaunchedEffect(state.isSyncEnabled, state.currentUser?.uid, state.isProUser, desktopAccountProfileRefreshCompleted) {
         if (
             !initialDesktopCloudSyncDone &&
+            desktopAccountProfileRefreshCompleted &&
             state.isSyncEnabled &&
             state.currentUser != null &&
             state.isProUser
@@ -2881,7 +3916,7 @@ internal fun EpistemeDesktopApp(
     }
 
     LaunchedEffect(Unit) {
-        if (state.syncedFolders.isNotEmpty()) {
+        if (state.syncedFolders.any { it.localSyncEnabled }) {
             scanSyncedFolders(showBanner = false)
         }
     }
@@ -2920,18 +3955,35 @@ internal fun EpistemeDesktopApp(
             appSeedColor = state.appSeedColor,
             appFontFamily = desktopAppFontFamily
         ) {
-        EpistemeDesktopWindowChromeEffect(
-            window = window,
-            captionColor = MaterialTheme.colorScheme.surface,
-            textColor = MaterialTheme.colorScheme.onSurface,
-            borderColor = MaterialTheme.colorScheme.background
-        )
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-        ) {
-            SharedAppShell(
+            val appThemeControls: @Composable () -> Unit = {
+                SharedAppThemeControls(
+                    appThemeMode = state.appThemeMode,
+                    appContrastOption = state.appContrastOption,
+                    appTextDimFactorLight = state.appTextDimFactorLight,
+                    appTextDimFactorDark = state.appTextDimFactorDark,
+                    appSeedColor = state.appSeedColor,
+                    customAppThemes = state.customAppThemes,
+                    onThemeModeChanged = { mode -> updateState(state.reduce(AppAction.AppThemeChanged(mode))) },
+                    onContrastOptionChanged = { option -> updateState(state.reduce(AppAction.AppContrastChanged(option))) },
+                    onTextDimFactorLightChanged = { factor -> updateState(state.reduce(AppAction.AppTextDimFactorLightChanged(factor))) },
+                    onTextDimFactorDarkChanged = { factor -> updateState(state.reduce(AppAction.AppTextDimFactorDarkChanged(factor))) },
+                    onSeedColorChanged = { color -> updateState(state.reduce(AppAction.AppSeedColorChanged(color))) },
+                    onCustomThemeAdded = { theme -> updateState(state.reduce(AppAction.CustomAppThemeAdded(theme))) },
+                    onCustomThemeDeleted = { themeId -> updateState(state.reduce(AppAction.CustomAppThemeDeleted(themeId))) }
+                )
+            }
+            EpistemeDesktopWindowChromeEffect(
+                window = window,
+                captionColor = MaterialTheme.colorScheme.surface,
+                textColor = MaterialTheme.colorScheme.onSurface,
+                borderColor = MaterialTheme.colorScheme.background
+            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+            ) {
+                SharedAppShell(
                 selectedTab = selectedTab,
                 snackbarHostState = snackbarHostState,
                 appThemeMode = state.appThemeMode,
@@ -2942,6 +3994,23 @@ internal fun EpistemeDesktopApp(
                 customAppThemes = state.customAppThemes,
                 isTabsEnabled = state.isTabsEnabled,
                 featurePolicy = featurePolicy,
+                currentUser = if (desktopAccountAvailable()) state.currentUser else null,
+                accountAvailable = desktopAccountAvailable(),
+                isOssBuild = desktopBuildProfile.isOssOffline,
+                isProUser = state.isProUser,
+                isSyncEnabled = state.isSyncEnabled,
+                syncAvailable = desktopCloudSyncAvailable(),
+                onSignInRequested = if (desktopAccountAvailable()) {
+                    ::signInDesktopAccount
+                } else {
+                    null
+                },
+                accountAvatar = { user, modifier ->
+                    DesktopProfileAvatar(user = user, modifier = modifier)
+                },
+                onSyncEnabledChange = { enabled ->
+                    setDesktopCloudSyncEnabled(enabled)
+                },
                 onTabSelected = { tab ->
                     selectAppTab(tab)
                 },
@@ -2960,46 +4029,13 @@ internal fun EpistemeDesktopApp(
                     if (!enabled) closeAllReaderWindows()
                     updateState(state.reduce(AppAction.TabsEnabledChanged(enabled)))
                 },
-                onAiSettingsRequested = if (desktopBuildProfile.byokAiAvailable) {
+                onAiSettingsRequested = if (desktopAiKeySettingsAvailable) {
                     { showAiByokSettingsDialog = true }
                 } else {
                     null
                 }
             ) { tab ->
                 when (tab) {
-                        SharedAppTab.HOME -> HomeScreen(
-                            state = state,
-                            selectedLibraryTab = selectedLibraryTab,
-                            onLibraryTabChange = { selectedLibraryTab = it },
-                            onStateChange = ::updateState,
-                            onImportBooks = {
-                                importFiles(chooseFiles())
-                            },
-                            onImportFolder = { chooseFolder()?.let(::importFolder) },
-                            onRead = ::openReader,
-                            onSelect = { id -> updateState(state.reduce(LibraryAction.BookSelectionToggled(id))) },
-                            onClearSelection = { updateState(state.reduce(LibraryAction.SelectionCleared)) },
-                            onRemoveSelected = ::removeSelectedBooks,
-                            onShowBookInfo = {
-                                bookInfoInitiallyEditing = false
-                                bookInfoDialogFor = it
-                            },
-                            onEditBook = {
-                                bookInfoInitiallyEditing = true
-                                bookInfoDialogFor = it
-                            },
-                            onCreateShelf = { showCreateShelfDialog = true },
-                            onCreateSmartShelf = { showCreateSmartShelfDialog = true },
-                            onRenameShelf = { shelfToRename = it },
-                            onDeleteShelf = { shelfToDelete = it },
-                            onRemoveFolder = { folderToRemove = it },
-                            onTagSelectedBooks = { showTagSelectionDialog = true },
-                            onAddSelectedBooksToShelf = { showAddToShelfDialog = true },
-                            onSyncFolderMetadata = { syncFolderMetadata() },
-                            onScanFolders = { scanSyncedFolders() },
-                            onTogglePinned = { book -> updateState(state.reduce(AppAction.LibraryPinToggled(book.id))) }
-                        )
-
                         SharedAppTab.SETTINGS -> SharedSettingsHub(
                             model = sharedSettingsHubModel(
                                 SharedSettingsHubInput(
@@ -3009,19 +4045,20 @@ internal fun EpistemeDesktopApp(
                                     isSignedIn = state.currentUser != null,
                                     isProUser = state.isProUser,
                                     accountAvailable = featurePolicy.aiAndCloud && !desktopBuildProfile.byokAiAvailable,
+                                    includeAccountAuthActions = false,
                                     syncAvailable = desktopCloudSyncAvailable(),
                                     folderSyncAvailable = true,
-                                    aiSettingsAvailable = desktopBuildProfile.byokAiAvailable,
+                                    aiSettingsAvailable = desktopAiKeySettingsAvailable,
                                     includeLanguage = true,
                                     includeScreenCaptureProtection = false,
                                     includeExternalFileBehavior = false,
                                     includeStrictFileFilter = false,
                                     includeReaderTabs = false,
-                                    includeHideReaderAi = featurePolicy.aiAndCloud,
+                                    includeHideReaderAi = false,
                                     isTabsEnabled = state.isTabsEnabled,
                                     isSyncEnabled = state.isSyncEnabled,
                                     isFolderSyncEnabled = state.isFolderSyncEnabled,
-                                    hideReaderAi = effectiveAiSettings().hideReaderAiFeatures,
+                                    hideReaderAi = false,
                                     languageTitle = desktopString("options_language", "Language"),
                                     languageSummary = selectedDesktopLanguageOption(desktopLanguageTag).let { option ->
                                         desktopString(option.labelKey, option.fallbackLabel)
@@ -3034,11 +4071,21 @@ internal fun EpistemeDesktopApp(
                             onDestinationChange = { settingsDestination = it },
                             readerDefaultSettings = state.readerDefaultSettings,
                             onReaderDefaultSettingsChange = { settings ->
-                                updateState(state.reduce(AppAction.ReaderDefaultSettingsChanged(settings)))
+                                updateState(
+                                    state.withDesktopReaderEngineDefaultSettings(
+                                        DesktopReaderSettingsEngine.TEXT,
+                                        settings
+                                    )
+                                )
                             },
                             pdfReaderDefaultSettings = state.pdfReaderDefaultSettings,
                             onPdfReaderDefaultSettingsChange = { settings ->
-                                updateState(state.reduce(AppAction.PdfReaderDefaultSettingsChanged(settings)))
+                                updateState(
+                                    state.withDesktopReaderEngineDefaultSettings(
+                                        DesktopReaderSettingsEngine.PDF,
+                                        settings
+                                    )
+                                )
                             },
                             readerToolbarPreferences = state.readerToolbarPreferences,
                             onReaderToolbarPreferencesChange = { preferences ->
@@ -3050,6 +4097,10 @@ internal fun EpistemeDesktopApp(
                             },
                             customFonts = customFonts,
                             onPickCustomFont = { importCustomFont(chooseFontFile())?.path },
+                            customReaderThemes = state.customReaderThemes,
+                            onCustomReaderThemesChange = { themes ->
+                                updateState(state.reduce(AppAction.CustomReaderThemesChanged(themes)))
+                            },
                             readerCustomTextureIds = readerCustomTextureIds,
                             onImportReaderTexture = ::importDesktopReaderTexture,
                             onAction = { action ->
@@ -3060,14 +4111,10 @@ internal fun EpistemeDesktopApp(
                                         updateState(state.reduce(AppAction.TabsEnabledChanged(!state.isTabsEnabled)))
                                     }
                                     SharedSettingsAction.FOLDER_SYNC -> setDesktopFolderSyncEnabled(!state.isFolderSyncEnabled)
-                                    SharedSettingsAction.AI_SETTINGS -> if (desktopBuildProfile.byokAiAvailable) showAiByokSettingsDialog = true
+                                    SharedSettingsAction.AI_SETTINGS -> if (desktopAiKeySettingsAvailable) showAiByokSettingsDialog = true
                                     SharedSettingsAction.SIGN_IN -> signInDesktopAccount()
                                     SharedSettingsAction.SIGN_OUT -> signOutDesktopAccount()
-                                    SharedSettingsAction.HIDE_READER_AI -> {
-                                        val next = aiByokSettings.copy(hideReaderAiFeatures = !effectiveAiSettings().hideReaderAiFeatures)
-                                        aiByokSettings = next
-                                        runCatching { aiByokStore.save(next.sanitized()) }
-                                    }
+                                    SharedSettingsAction.HIDE_READER_AI -> Unit
                                     SharedSettingsAction.CUSTOM_FONTS -> selectAppTab(SharedAppTab.CUSTOM_FONTS)
                                     SharedSettingsAction.HELP_FEEDBACK -> selectAppTab(SharedAppTab.FEEDBACK)
                                     SharedSettingsAction.SUPPORT -> selectAppTab(SharedAppTab.SUPPORT)
@@ -3136,24 +4183,47 @@ internal fun EpistemeDesktopApp(
                                 bookInfoInitiallyEditing = true
                                 bookInfoDialogFor = it
                             },
-                            onCreateShelf = { showCreateShelfDialog = true },
+                            onCreateShelf = {
+                                createShelfBookIds = emptySet()
+                                createShelfClearsSelection = false
+                                showCreateShelfDialog = true
+                            },
+                            onCreateShelfWithBooks = { name, bookIds -> createShelfWithBooks(name, bookIds) },
                             onCreateSmartShelf = { showCreateSmartShelfDialog = true },
                             onRenameShelf = { shelfToRename = it },
                             onDeleteShelf = { shelfToDelete = it },
                             onRemoveFolder = { folderToRemove = it },
                             onTagSelectedBooks = { showTagSelectionDialog = true },
-                            onAddSelectedBooksToShelf = { showAddToShelfDialog = true },
+                            onAddSelectedBooksToShelf = {
+                                addToShelfBookIds = state.selectedBookIds
+                                addToShelfClearsSelection = true
+                            },
+                            onAddBooksToShelf = { bookIds ->
+                                addToShelfBookIds = bookIds
+                                addToShelfClearsSelection = false
+                            },
+                            onManageShelfBooks = { shelfToManageBooks = it },
                             onSyncFolderMetadata = { syncFolderMetadata() },
                             onScanFolders = { scanSyncedFolders() },
                             onTogglePinned = { book -> updateState(state.reduce(AppAction.LibraryPinToggled(book.id))) }
                         )
 
-                        SharedAppTab.SHELVES -> ShelvesScreen(
-                            shelves = state.shelves,
+                        SharedAppTab.SHELVES -> LibraryScreen(
+                            state = state,
+                            selectedLibraryTab = NonReaderLibraryTab.SHELVES,
+                            onLibraryTabChange = {
+                                selectedLibraryTab = it
+                                selectedTab = SharedAppTab.LIBRARY
+                            },
+                            onStateChange = ::updateState,
+                            onImportBooks = {
+                                importFiles(chooseFiles())
+                            },
+                            onImportFolder = { chooseFolder()?.let(::importFolder) },
                             onRead = ::openReader,
                             onSelect = { id -> updateState(state.reduce(LibraryAction.BookSelectionToggled(id))) },
-                            selectedBookIds = state.selectedBookIds,
-                            pinnedBookIds = state.pinnedLibraryBookIds,
+                            onClearSelection = { updateState(state.reduce(LibraryAction.SelectionCleared)) },
+                            onRemoveSelected = ::removeSelectedBooks,
                             onShowBookInfo = {
                                 bookInfoInitiallyEditing = false
                                 bookInfoDialogFor = it
@@ -3162,12 +4232,29 @@ internal fun EpistemeDesktopApp(
                                 bookInfoInitiallyEditing = true
                                 bookInfoDialogFor = it
                             },
-                            onTogglePinned = { book -> updateState(state.reduce(AppAction.LibraryPinToggled(book.id))) },
-                            onCreateShelf = { showCreateShelfDialog = true },
+                            onCreateShelf = {
+                                createShelfBookIds = emptySet()
+                                createShelfClearsSelection = false
+                                showCreateShelfDialog = true
+                            },
+                            onCreateShelfWithBooks = { name, bookIds -> createShelfWithBooks(name, bookIds) },
                             onCreateSmartShelf = { showCreateSmartShelfDialog = true },
                             onRenameShelf = { shelfToRename = it },
                             onDeleteShelf = { shelfToDelete = it },
-                            onRemoveFolder = { folderToRemove = it }
+                            onRemoveFolder = { folderToRemove = it },
+                            onTagSelectedBooks = { showTagSelectionDialog = true },
+                            onAddSelectedBooksToShelf = {
+                                addToShelfBookIds = state.selectedBookIds
+                                addToShelfClearsSelection = true
+                            },
+                            onAddBooksToShelf = { bookIds ->
+                                addToShelfBookIds = bookIds
+                                addToShelfClearsSelection = false
+                            },
+                            onManageShelfBooks = { shelfToManageBooks = it },
+                            onSyncFolderMetadata = { syncFolderMetadata() },
+                            onScanFolders = { scanSyncedFolders() },
+                            onTogglePinned = { book -> updateState(state.reduce(AppAction.LibraryPinToggled(book.id))) }
                         )
 
                         SharedAppTab.CATALOGS -> {
@@ -3243,6 +4330,21 @@ internal fun EpistemeDesktopApp(
                                 { openExternalUrl(EpistemeIssuesUrl) }
                             } else {
                                 null
+                            },
+                            onOpenPrivacyPolicy = if (featurePolicy.projectLinks) {
+                                { openExternalUrl(desktopBuildProfile.legalLinks.privacyPolicyUrl) }
+                            } else {
+                                null
+                            },
+                            onOpenTerms = if (featurePolicy.projectLinks) {
+                                { openExternalUrl(desktopBuildProfile.legalLinks.termsUrl) }
+                            } else {
+                                null
+                            },
+                            onOpenLicenses = if (featurePolicy.projectLinks) {
+                                { openExternalUrl(desktopBuildProfile.legalLinks.licensesUrl) }
+                            } else {
+                                null
                             }
                         )
 
@@ -3253,18 +4355,48 @@ internal fun EpistemeDesktopApp(
         }
 
         readerWindows.forEach { readerWindow ->
-            key(readerWindow.id) {
+            key(readerWindow.id, readerWindow.surfaceResetId) {
+                val restoredReaderWindowState = savedReaderWindowState
                 val windowState = rememberWindowState(
+                    placement = restoredReaderWindowState?.toReaderWindowPlacement() ?: WindowPlacement.Floating,
                     position = WindowPosition(Alignment.Center),
-                    size = DpSize(1120.dp, 760.dp)
+                    size = restoredReaderWindowState?.toWindowSize(DesktopReaderWindowDefaultSize)
+                        ?: DesktopReaderWindowDefaultSize
                 )
                 Window(
-                    onCloseRequest = { closeReaderWindow(readerWindow.id) },
+                    onCloseRequest = {
+                        logDesktopReaderClose(
+                            "window_on_close_request windowId=${readerWindow.id.logPreview(80)} " +
+                                "bookId=${readerWindow.bookId.logPreview(80)} fullscreen=${readerWindow.fullscreen}"
+                        )
+                        if (!readerWindow.fullscreen) {
+                            saveReaderWindowStateSnapshot(DesktopWindowStateSnapshot.fromWindowState(windowState))
+                        }
+                        closeReaderWindow(readerWindow.id)
+                    },
                     title = desktopString("desktop_label_pair_format", "%1\$s - %2\$s", readerWindow.title, readerWindowDefaults.title),
                     state = windowState,
                     icon = painterResource(readerWindowDefaults.iconResourcePath)
                 ) {
                     val readerAwtWindow = this.window
+                    val latestReaderWindowForDispose by rememberUpdatedState(readerWindow)
+                    DisposableEffect(readerWindow.id) {
+                        onDispose {
+                            logDesktopReaderClose(
+                                "window_dispose_effect windowId=${latestReaderWindowForDispose.id.logPreview(80)} " +
+                                    "bookId=${latestReaderWindowForDispose.bookId.logPreview(80)} " +
+                                    "content=${latestReaderWindowForDispose.readerCloseContentLabel()}"
+                            )
+                            latestReaderWindowForDispose.closeReaderResources()
+                        }
+                    }
+                    DesktopWindowStatePersistenceEffect(
+                        windowState = windowState,
+                        store = readerWindowStateStore,
+                        enabled = !readerWindow.fullscreen,
+                        transformSnapshot = { it.toPersistableReaderWindowSnapshot() },
+                        onSnapshotSaved = { savedReaderWindowState = it }
+                    )
                     DisposableEffect(readerAwtWindow, readerWindowDefaults.minimumSize) {
                         readerAwtWindow.minimumSize = readerWindowDefaults.minimumSize
                         onDispose {}
@@ -3310,11 +4442,18 @@ internal fun EpistemeDesktopApp(
                             ) {
                                 when (val content = readerWindow.content) {
                                 DesktopReaderWindowContent.Opening -> {
-                                    DesktopReaderOpeningScreen(opening = readerWindow.opening)
+                                    val openingBook = state.rawLibraryBooks.firstOrNull { it.id == readerWindow.bookId }
+                                    DesktopReaderOpeningScreen(
+                                        opening = readerWindow.opening,
+                                        readerSettings = openingBook?.let { resolvedDesktopReaderSettings(it, state.readerDefaultSettings) }
+                                    )
                                 }
 
                                 is DesktopReaderWindowContent.PasswordRequired -> {
-                                    DesktopReaderOpeningScreen(opening = readerWindow.opening)
+                                    DesktopReaderOpeningScreen(
+                                        opening = readerWindow.opening,
+                                        readerSettings = resolvedDesktopReaderSettings(content.book, state.readerDefaultSettings)
+                                    )
                                     DesktopPdfPasswordDialog(
                                         title = content.book.displayName,
                                         isError = content.attemptedPassword,
@@ -3350,6 +4489,7 @@ internal fun EpistemeDesktopApp(
                                         onFullscreenChange = { enabled ->
                                             updateReaderWindow(readerWindow.id) { it.copy(fullscreen = enabled) }
                                         },
+                                        appThemeControls = appThemeControls,
                                         onPageStateChange = { page, progress, viewport ->
                                             updateBookReadingState(
                                                 bookId = content.book.id,
@@ -3365,12 +4505,26 @@ internal fun EpistemeDesktopApp(
                                         onPdfHighlighterPaletteChange = { palette ->
                                             updateState(state.reduce(AppAction.PdfHighlighterPaletteChanged(palette)))
                                         },
+                                        customReaderThemes = state.customReaderThemes,
+                                        onCustomReaderThemesChange = { themes ->
+                                            updateState(state.reduce(AppAction.CustomReaderThemesChanged(themes)))
+                                        },
                                         customTextureIds = readerCustomTextureIds,
                                         onImportTexture = ::importDesktopReaderTexture,
                                         onLocalSidecarsChanged = {
                                             state.rawLibraryBooks.firstOrNull { it.id == content.book.id }?.let { book ->
                                                 syncBookSidecars(book)
-                                                queueCloudBookMetadataSync(book)
+                                                markReaderCloudDirty(
+                                                    bookId = book.id,
+                                                    baseTimestamp = book.timestamp,
+                                                    sidecarsDirty = true
+                                                )
+                                                queueCloudBookMetadataSync(
+                                                    book = book,
+                                                    debounce = true,
+                                                    dirtyBaseTimestamp = book.timestamp,
+                                                    forceUploadAnnotations = true
+                                                )
                                             }
                                         },
                                         aiByokSettings = effectiveAiSettings(),
@@ -3382,23 +4536,26 @@ internal fun EpistemeDesktopApp(
                                         },
                                         summaryCacheStore = desktopSummaryCacheStore,
                                         credits = state.credits,
-                                        showPaidCredits = !desktopBuildProfile.byokAiAvailable,
+                                        showPaidCredits = desktopCloudTtsUsesCredits,
                                         onAiByokSettingsChange = ::updateAiByokSettings,
                                         featurePolicy = featurePolicy,
+                                        cloudTtsControlsAvailable = desktopCloudTtsControlsAvailable,
                                         onReaderAiEntitlementRequired = { feature, text ->
                                             desktopFeatureNoticeForReaderAi(feature, text)?.let { notice ->
-                                                desktopFeatureNotice = notice
+                                                showDesktopFeatureNotice(notice, readerWindowId = readerWindow.id)
                                                 true
                                             } ?: false
                                         },
                                         onCloudTtsEntitlementRequired = {
                                             desktopFeatureNoticeForCloudTts()?.let { notice ->
-                                                desktopFeatureNotice = notice
+                                                showDesktopFeatureNotice(notice, readerWindowId = readerWindow.id)
                                                 true
                                             } ?: false
                                         },
                                         onPaidFeatureError = { errorMessage ->
-                                            desktopFeatureNoticeForError(errorMessage)?.let { desktopFeatureNotice = it }
+                                            desktopFeatureNoticeForError(errorMessage)?.let {
+                                                showDesktopFeatureNotice(it, readerWindowId = readerWindow.id)
+                                            }
                                         },
                                         hasReflowFile = activePdfHasReflowFile,
                                         isReflowingThisBook = activePdfBook.id in reflowingPdfBookIds,
@@ -3411,6 +4568,40 @@ internal fun EpistemeDesktopApp(
                                 }
 
                                 is DesktopReaderWindowContent.Text -> {
+                                    var previousTextReaderMode by remember(readerWindow.id) {
+                                        mutableStateOf(content.session.reader.settings.readingMode)
+                                    }
+                                    LaunchedEffect(content.session.reader.settings.readingMode) {
+                                        val previousMode = previousTextReaderMode
+                                        val currentMode = content.session.reader.settings.readingMode
+                                        previousTextReaderMode = currentMode
+                                        if (
+                                            shouldResetDesktopTextReaderWindowSurface(
+                                                previousMode = previousMode,
+                                                currentMode = currentMode,
+                                                usesNativeWebView = desktopEpubWebViewUsesNativeSwtBrowser()
+                                            )
+                                        ) {
+                                            if (!readerWindow.fullscreen) {
+                                                saveReaderWindowStateSnapshot(
+                                                    DesktopWindowStateSnapshot.fromWindowState(windowState)
+                                                )
+                                            }
+                                            logReaderModeSwitch(
+                                                "window_surface_reset_request windowId=${readerWindow.id.logPreview()} " +
+                                                    "bookId=${readerWindow.bookId.logPreview()} previousMode=$previousMode currentMode=$currentMode " +
+                                                    "surfaceResetId=${readerWindow.surfaceResetId} fullscreen=${readerWindow.fullscreen} " +
+                                                    "windowState=${windowState.size.width.value.formatLogFloat()}x" +
+                                                    "${windowState.size.height.value.formatLogFloat()} placement=${windowState.placement}"
+                                            )
+                                            updateReaderWindow(readerWindow.id) { currentWindow ->
+                                                currentWindow.copy(
+                                                    surfaceResetId = currentWindow.surfaceResetId + 1,
+                                                    focusRequestId = currentWindow.focusRequestId + 1
+                                                )
+                                            }
+                                        }
+                                    }
                                     LaunchedEffect(
                                         readerWindow.id,
                                         content.session.reader.book.id,
@@ -3437,9 +4628,15 @@ internal fun EpistemeDesktopApp(
                                         onFullscreenChange = { enabled ->
                                             updateReaderWindow(readerWindow.id) { it.copy(fullscreen = enabled) }
                                         },
+                                        readerAwtWindow = readerAwtWindow,
                                         toolbarPreferences = state.readerToolbarPreferences,
                                         onToolbarPreferencesChange = { preferences ->
                                             updateState(state.reduce(AppAction.ReaderToolbarPreferencesChanged(preferences)))
+                                        },
+                                        appThemeControls = appThemeControls,
+                                        customReaderThemes = state.customReaderThemes,
+                                        onCustomReaderThemesChange = { themes ->
+                                            updateState(state.reduce(AppAction.CustomReaderThemesChanged(themes)))
                                         },
                                         highlightPalette = state.readerHighlightPalette,
                                         onHighlightPaletteChange = { palette ->
@@ -3457,7 +4654,7 @@ internal fun EpistemeDesktopApp(
                                         readerExtrasState = content.extrasState,
                                         aiByokSettings = effectiveAiSettings(),
                                         externalLookupAvailable = featurePolicy.externalLookup,
-                                        cloudTtsControlsAvailable = featurePolicy.aiAndCloud,
+                                        cloudTtsControlsAvailable = desktopCloudTtsControlsAvailable,
                                         onExternalLookup = ::openReaderExternalLookup,
                                         onAiAction = { feature, text ->
                                             runReaderAiAction(readerWindow.id, feature, text)
@@ -3470,68 +4667,46 @@ internal fun EpistemeDesktopApp(
                                                 )
                                             }
                                         },
-                                        onCloudTtsToggle = { text -> toggleReaderCloudTts(readerWindow.id, text) },
+                                        onCloudTtsToggle = { text, locator -> toggleReaderCloudTts(readerWindow.id, text, locator) },
                                         onCloudTtsStart = { readScope, chunks ->
                                             startReaderCloudTts(readerWindow.id, readScope, chunks)
                                         },
                                         onCloudTtsPauseResume = { pauseResumeReaderCloudTts(readerWindow.id) },
                                         onCloudTtsStop = { stopReaderCloudTts(readerWindow.id) },
                                         onCloudTtsClearCache = { clearReaderCloudTtsCache(readerWindow.id) },
+                                        onCloudTtsVoiceChange = { voiceId ->
+                                            updateAiByokSettings(effectiveAiSettings().copy(ttsSpeakerId = voiceId))
+                                        },
                                         onOpenAiHub = {
                                             updateTextReaderWindow(readerWindow.id) { current ->
                                                 current.copy(showAiHub = true)
                                             }
-                                        },
-                                        onAutoScrollChange = { autoScroll ->
-                                            updateReaderAutoScroll(readerWindow.id, autoScroll)
                                         },
                                         onDownloadReaderImage = ::downloadReaderImage,
                                         readerTextureDataUri = DesktopReaderTextures::dataUriFor,
                                         readerCustomTextureIds = readerCustomTextureIds,
                                         onImportReaderTexture = ::importDesktopReaderTexture,
                                         bottomChromeExtraContent = {
-                                            if (featurePolicy.aiAndCloud) {
+                                            if (desktopCloudTtsControlsAvailable) {
                                                 val settings = effectiveAiSettings()
-                                                val ttsActive = content.extrasState.cloudTts.isLoading ||
-                                                    content.extrasState.cloudTts.isPlaying ||
-                                                    content.extrasState.cloudTts.isPaused
-                                                if (content.showCloudTtsSettings) {
-                                                    DesktopCloudTtsSettingsOverlay(
+                                                var isTtsOverlayCollapsed by remember(readerWindow.id) { mutableStateOf(false) }
+                                                val ttsControls = readerCloudTtsControlsModel(content.extrasState.cloudTts)
+                                                if (ttsControls.isVisible) {
+                                                    SharedReaderTtsOverlayControls(
                                                         settings = settings,
-                                                        isTtsActive = ttsActive,
-                                                        showCredits = !desktopBuildProfile.byokAiAvailable,
+                                                        cloudTts = content.extrasState.cloudTts,
                                                         credits = state.credits,
-                                                        cacheSummary = content.extrasState.cloudTts.cacheSummary,
-                                                        onClearCache = { clearReaderCloudTtsCache(readerWindow.id) },
-                                                        onSettingsChange = { next ->
-                                                            updateAiByokSettings(
-                                                                aiByokSettings.sanitized().copy(
-                                                                    ttsSpeakerId = next.sanitized().ttsSpeakerId
-                                                                )
-                                                            )
-                                                        }
+                                                        showCredits = desktopCloudTtsUsesCredits,
+                                                        isCollapsed = isTtsOverlayCollapsed,
+                                                        onCollapseChange = { isTtsOverlayCollapsed = it },
+                                                        onPauseResume = { pauseResumeReaderCloudTts(readerWindow.id) },
+                                                        onSkipPrevious = { skipReaderCloudTtsChunk(readerWindow.id, -1) },
+                                                        onSkipNext = { skipReaderCloudTtsChunk(readerWindow.id, 1) },
+                                                        onLocateCurrentChunk = { locateReaderCloudTtsChunk(readerWindow.id) },
+                                                        onClose = { stopReaderCloudTts(readerWindow.id) },
+                                                        modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 4.dp)
                                                     )
                                                 }
-                                                DesktopCloudTtsChromeControls(
-                                                    settings = settings,
-                                                    cloudTts = content.extrasState.cloudTts,
-                                                    credits = state.credits,
-                                                    showCredits = !desktopBuildProfile.byokAiAvailable,
-                                                    onRead = {
-                                                        startReaderCloudTts(
-                                                            readerWindow.id,
-                                                            ReaderTtsReadScope.BOOK,
-                                                            ReaderTtsPlanner.chunksFromCurrentLocation(content.session)
-                                                        )
-                                                    },
-                                                    onPauseResume = { pauseResumeReaderCloudTts(readerWindow.id) },
-                                                    onStop = { stopReaderCloudTts(readerWindow.id) },
-                                                    onOpenSettings = {
-                                                        updateTextReaderWindow(readerWindow.id) { current ->
-                                                            current.copy(showCloudTtsSettings = !current.showCloudTtsSettings)
-                                                        }
-                                                    }
-                                                )
                                             }
                                         },
                                         webViewRuntimeState = webViewRuntimeState,
@@ -3568,11 +4743,20 @@ internal fun EpistemeDesktopApp(
                                                 }
                                             },
                                             credits = state.credits,
-                                            showCredits = !desktopBuildProfile.byokAiAvailable
+                                            showCredits = desktopCloudTtsUsesCredits
                                         )
                                     }
                                 }
                             }
+                                desktopFeatureNoticeState
+                                    ?.takeIf { it.placement.rendersInReaderWindow(readerWindow.id) }
+                                    ?.let { noticeState ->
+                                        DesktopFeatureNoticeDialog(
+                                            notice = noticeState.notice,
+                                            onDismiss = ::dismissDesktopFeatureNotice,
+                                            onConfirm = { confirmDesktopFeatureNotice(noticeState.notice) }
+                                        )
+                                    }
                             }
                         }
                     }
@@ -3580,38 +4764,17 @@ internal fun EpistemeDesktopApp(
             }
         }
 
-        desktopFeatureNotice?.let { notice ->
-            AlertDialog(
-                onDismissRequest = { desktopFeatureNotice = null },
-                title = { Text(readerString(notice.titleKey, notice.titleFallback)) },
-                text = { Text(readerString(notice.messageKey, notice.messageFallback)) },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            desktopFeatureNotice = null
-                            when (notice.action) {
-                                DesktopFeatureNoticeAction.SIGN_IN -> signInDesktopAccount()
-                                DesktopFeatureNoticeAction.OPEN_PRO -> selectAppTab(SharedAppTab.PRO)
-                                null -> Unit
-                            }
-                        }
-                    ) {
-                        Text(readerString(notice.confirmKey, notice.confirmFallback))
-                    }
-                },
-                dismissButton = if (notice.action != null) {
-                    {
-                        TextButton(onClick = { desktopFeatureNotice = null }) {
-                            Text(readerString("action_not_now", "Not now"))
-                        }
-                    }
-                } else {
-                    null
-                }
-            )
-        }
+        desktopFeatureNoticeState
+            ?.takeIf { it.placement.rendersInMainWindow() }
+            ?.let { noticeState ->
+                DesktopFeatureNoticeDialog(
+                    notice = noticeState.notice,
+                    onDismiss = ::dismissDesktopFeatureNotice,
+                    onConfirm = { confirmDesktopFeatureNotice(noticeState.notice) }
+                )
+            }
 
-        if (showAiByokSettingsDialog && desktopBuildProfile.byokAiAvailable) {
+        if (showAiByokSettingsDialog && desktopAiKeySettingsAvailable) {
             DesktopAiByokSettingsDialog(
                 settings = aiByokSettings,
                 secureStorageAvailable = aiByokStore.isSecureStorageAvailable,
@@ -3672,10 +4835,20 @@ internal fun EpistemeDesktopApp(
                 label = readerString("shelf_name_hint", "Shelf name"),
                 initialValue = "",
                 confirmLabel = readerString("action_create", "Create"),
-                onDismiss = { showCreateShelfDialog = false },
-                onConfirm = { name ->
-                    createShelf(name)
+                onDismiss = {
                     showCreateShelfDialog = false
+                    createShelfBookIds = emptySet()
+                    createShelfClearsSelection = false
+                },
+                onConfirm = { name ->
+                    if (createShelfBookIds.isEmpty()) {
+                        createShelf(name)
+                    } else {
+                        createShelfWithBooks(name, createShelfBookIds, clearSelection = createShelfClearsSelection)
+                    }
+                    showCreateShelfDialog = false
+                    createShelfBookIds = emptySet()
+                    createShelfClearsSelection = false
                 }
             )
         }
@@ -3737,17 +4910,36 @@ internal fun EpistemeDesktopApp(
             )
         }
 
-        if (showAddToShelfDialog) {
+        if (addToShelfBookIds.isNotEmpty()) {
             SharedAddToShelfDialog(
                 shelves = state.shelves.filter { it.type == ShelfType.MANUAL && it.id != "unshelved" },
-                onDismiss = { showAddToShelfDialog = false },
+                onDismiss = {
+                    addToShelfBookIds = emptySet()
+                    addToShelfClearsSelection = false
+                },
                 onCreateShelf = {
-                    showAddToShelfDialog = false
+                    createShelfBookIds = addToShelfBookIds
+                    createShelfClearsSelection = addToShelfClearsSelection
+                    addToShelfBookIds = emptySet()
+                    addToShelfClearsSelection = false
                     showCreateShelfDialog = true
                 },
-                onShelfSelected = { shelf ->
-                    addSelectedBooksToShelf(shelf.id)
-                    showAddToShelfDialog = false
+                onShelvesSelected = { shelfIds ->
+                    addBooksToShelves(addToShelfBookIds, shelfIds, clearSelection = addToShelfClearsSelection)
+                    addToShelfBookIds = emptySet()
+                    addToShelfClearsSelection = false
+                }
+            )
+        }
+
+        shelfToManageBooks?.let { shelf ->
+            SharedManageShelfBooksDialog(
+                shelf = shelf,
+                books = state.rawLibraryBooks,
+                onDismiss = { shelfToManageBooks = null },
+                onSave = { bookIds ->
+                    replaceShelfBooks(shelf, bookIds)
+                    shelfToManageBooks = null
                 }
             )
         }
@@ -3797,6 +4989,33 @@ internal fun EpistemeDesktopApp(
     }
 }
 
+@Composable
+private fun DesktopFeatureNoticeDialog(
+    notice: DesktopFeatureNotice,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(readerString(notice.titleKey, notice.titleFallback)) },
+        text = { Text(readerString(notice.messageKey, notice.messageFallback)) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(readerString(notice.confirmKey, notice.confirmFallback))
+            }
+        },
+        dismissButton = if (notice.action != null) {
+            {
+                TextButton(onClick = onDismiss) {
+                    Text(readerString("action_not_now", "Not now"))
+                }
+            }
+        } else {
+            null
+        }
+    )
+}
+
 private fun desktopSignInRequiredNotice(
     messageKey: String,
     messageFallback: String
@@ -3822,7 +5041,7 @@ private fun desktopOutOfCreditsNotice(
         messageKey = messageKey,
         messageFallback = messageFallback,
         confirmKey = "desktop_view_pro_and_credits",
-        confirmFallback = "View Pro and credits",
+        confirmFallback = "View account & credits",
         action = DesktopFeatureNoticeAction.OPEN_PRO
     )
 }
@@ -3837,7 +5056,7 @@ private fun desktopProRequiredNotice(
         messageKey = messageKey,
         messageFallback = messageFallback,
         confirmKey = "desktop_view_pro_and_credits",
-        confirmFallback = "View Pro and credits",
+        confirmFallback = "View account & credits",
         action = DesktopFeatureNoticeAction.OPEN_PRO
     )
 }

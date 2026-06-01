@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="action_cancel">Katkesta</string>
+    <string name="action_save">Salvesta</string>
+    <string name="action_delete">Kustuta</string>
+    <string name="action_remove">Eemalda</string>
+    <string name="action_ok">Sobib</string>
+    <string name="action_close">Sulge</string>
+    <string name="action_add">Lisa</string>
+    <string name="action_rename">Muuda nime</string>
+</resources>

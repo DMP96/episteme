@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <plurals name="book_count">
+        <item quantity="one">%1$d raamat</item>
+        <item quantity="other">%1$d raamatut</item>
+    </plurals>
+    <plurals name="book_word">
+        <item quantity="one">raamat</item>
+        <item quantity="other">raamatut</item>
+    </plurals>
+    <plurals name="search_results_count">
+        <item quantity="one">Leidus %1$d tulemus</item>
+        <item quantity="other">Leidus %1$d tulemust</item>
+    </plurals>
+    <plurals name="search_matches_count">
+        <item quantity="one">Leidus %1$d vaste</item>
+        <item quantity="other">Leidus %1$d vastet</item>
+    </plurals>
+    <plurals name="dialog_delete_permanently">
+        <item quantity="one">Kustuta fail jäädavalt</item>
+        <item quantity="other">Kustuta failid jäädavalt</item>
+    </plurals>
+</resources>

@@ -4768,19 +4768,19 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun savePdfReadingPosition(page: Int, totalPages: Int) {
+    fun savePdfReadingPosition(page: Int, totalPages: Int, progress: Float? = null) {
         val currentPdfUri = _internalState.value.selectedPdfUri
         if (currentPdfUri != null) {
-            val progress = if (totalPages > 0) {
+            val finalProgress = progress ?: if (totalPages > 0) {
                 ((page + 1).toFloat() / totalPages.toFloat()) * 100f
             } else {
                 0f
             }
-            Timber.tag("PdfPositionDebug").i("ViewModel: Save request triggered | Page: $page | Total: $totalPages | Progress: $progress | URI: ${currentPdfUri.lastPathSegment}")
+            Timber.tag("PdfPositionDebug").i("ViewModel: Save request triggered | Page: $page | Total: $totalPages | Progress: $finalProgress | URI: ${currentPdfUri.lastPathSegment}")
             viewModelScope.launch {
                 recentFilesRepository.getFileByUri(currentPdfUri.toString())?.let { _ ->
                     recentFilesRepository.updatePdfReadingPosition(
-                        uriString = currentPdfUri.toString(), page = page, progress = progress
+                        uriString = currentPdfUri.toString(), page = page, progress = finalProgress
                     )
                 } ?: run {
                     Timber.tag("PdfPositionDebug").e("ViewModel: Save aborted. Could not resolve file item from URI in DB.")

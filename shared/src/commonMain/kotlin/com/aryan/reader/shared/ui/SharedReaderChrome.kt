@@ -1451,8 +1451,17 @@ fun SharedReaderFormatControls(
                             },
                             label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
                         )
+                        FilterChip(
+                            selected = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE,
+                            onClick = {
+                                onReaderAction(
+                                    ReaderAction.SettingsChanged(settings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE))
+                                )
+                            },
+                            label = { Text(readerString("visual_options_pdf_spread_two_adaptive", "Two pages (adaptive)")) }
+                        )
                     }
-                    AnimatedVisibility(visible = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE) {
+                    AnimatedVisibility(visible = settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || settings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,

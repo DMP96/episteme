@@ -846,6 +846,7 @@
     <string name="visual_options_pdf_page_spread">PDF page spread</string>
     <string name="visual_options_pdf_spread_single">Single page</string>
     <string name="visual_options_pdf_spread_two">Two pages</string>
+    <string name="visual_options_pdf_spread_two_adaptive">Two pages (adaptive)</string>
     <string name="visual_options_pdf_spread_flip">Flip pages</string>
     <string name="visual_options_pdf_spread_flip_desc">Reverses the order of pages in a two-page spread.</string>
     <string name="visual_options_pdf_first_page_alone">First page alone</string>

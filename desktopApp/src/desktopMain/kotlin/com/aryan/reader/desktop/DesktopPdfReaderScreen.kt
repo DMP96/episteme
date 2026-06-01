@@ -515,23 +515,37 @@ internal fun PdfReaderScreen(
     val displayMode = pdfState.displayMode
     val isPdfTwoPageSpread = displayMode == PdfDisplayMode.PAGINATION &&
         PdfSpreadLayout.isTwoPageSpreadEnabled(pdfReaderSettings)
+    val paginationSpreadStarts = remember(
+        document.pageCount,
+        pdfReaderSettings.pageSpreadMode,
+        pdfReaderSettings.pdfFirstPageStandaloneInSpread,
+        pdfReaderSettings.pdfPageSpreadFlipped,
+        document.pageSizes
+    ) {
+        val provider = com.aryan.reader.shared.pdf.PdfPageSizeProvider { index ->
+            val size = document.pageSizes.getOrNull(index) ?: return@PdfPageSizeProvider false
+            size.width > size.height
+        }
+        PdfSpreadLayout.spreadStartPageIndices(document.pageCount, pdfReaderSettings, provider)
+    }
     val paginatedVisiblePageIndices: List<Int> = remember(
         pageIndex,
         document.pageCount,
         displayMode,
         pdfReaderSettings.pageSpreadMode,
         pdfReaderSettings.pdfFirstPageStandaloneInSpread,
-        pdfReaderSettings.pdfPageSpreadFlipped
+        pdfReaderSettings.pdfPageSpreadFlipped,
+        paginationSpreadStarts
     ) {
         if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.visiblePageIndices(pageIndex, document.pageCount, pdfReaderSettings)
+            PdfSpreadLayout.visiblePageIndices(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         } else {
             listOf(pageIndex.coerceIn(0, (document.pageCount - 1).coerceAtLeast(0)))
         }
     }
-    val pdfPageLabel = desktopPdfPageLabel(pageIndex, document.pageCount, displayMode, pdfReaderSettings)
+    val pdfPageLabel = desktopPdfPageLabel(pageIndex, document.pageCount, displayMode, pdfReaderSettings, paginationSpreadStarts)
     val pdfPageScrubPreviewLabel = pageScrubPreview?.let {
-        desktopPdfPageLabel(it, document.pageCount, displayMode, pdfReaderSettings)
+        desktopPdfPageLabel(it, document.pageCount, displayMode, pdfReaderSettings, paginationSpreadStarts)
     }
     val zoomControlScale = pdfZoomPreview?.zoom ?: scale
     val shouldShowPdfZoomIndicator = abs(zoomControlScale - 1f) > 0.001f
@@ -545,7 +559,7 @@ internal fun PdfReaderScreen(
         pageIndex
     ) {
         if (displayMode != PdfDisplayMode.PAGINATION) return@LaunchedEffect
-        val normalizedPage = PdfSpreadLayout.normalizePageIndex(pageIndex, document.pageCount, pdfReaderSettings)
+        val normalizedPage = PdfSpreadLayout.normalizePageIndex(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         if (normalizedPage != pageIndex) {
             dispatchPdf(SharedPdfReaderAction.GoToPage(normalizedPage))
         }
@@ -797,17 +811,17 @@ internal fun PdfReaderScreen(
     val selectedAnnotationId = pdfState.selectedAnnotationId
     val annotations = pdfState.annotations
     val canGoPrevious = if (displayMode == PdfDisplayMode.PAGINATION) {
-        PdfSpreadLayout.canGoPrevious(pageIndex, document.pageCount, pdfReaderSettings)
+        PdfSpreadLayout.canGoPrevious(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
     } else {
         pdfState.canGoPrevious
     }
     val canGoNext = if (displayMode == PdfDisplayMode.PAGINATION) {
-        PdfSpreadLayout.canGoNext(pageIndex, document.pageCount, pdfReaderSettings)
+        PdfSpreadLayout.canGoNext(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
     } else {
         pdfState.canGoNext
     }
     val progressPercent = if (displayMode == PdfDisplayMode.PAGINATION) {
-        PdfSpreadLayout.progressPercent(pageIndex, document.pageCount, pdfReaderSettings)
+        PdfSpreadLayout.progressPercent(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
     } else {
         pdfState.progressPercent
     }
@@ -828,7 +842,7 @@ internal fun PdfReaderScreen(
 
     fun pdfProgressPercentFor(pageIndex: Int): Float {
         return if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.progressPercent(pageIndex, document.pageCount, pdfReaderSettings)
+            PdfSpreadLayout.progressPercent(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         } else {
             ((pageIndex + 1).toFloat() / document.pageCount.coerceAtLeast(1)) * 100f
         }
@@ -1083,7 +1097,7 @@ internal fun PdfReaderScreen(
     ) {
         val boundedTarget = target.coerceIn(0, (document.pageCount - 1).coerceAtLeast(0))
         val clampedTarget = if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.normalizePageIndex(boundedTarget, document.pageCount, pdfReaderSettings)
+            PdfSpreadLayout.normalizePageIndex(boundedTarget, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         } else {
             boundedTarget
         }
@@ -1122,7 +1136,7 @@ internal fun PdfReaderScreen(
             pageScrubStartPage = pdfState.pageIndex
         }
         val targetPage = if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.normalizePageIndex(value.roundToInt(), document.pageCount, pdfReaderSettings)
+            PdfSpreadLayout.normalizePageIndex(value.roundToInt(), document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         } else {
             value.roundToInt().coerceIn(0, (document.pageCount - 1).coerceAtLeast(0))
         }
@@ -1146,7 +1160,7 @@ internal fun PdfReaderScreen(
 
     fun previousPdfPageTarget(): Int {
         return if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.previousPageIndex(pageIndex, document.pageCount, pdfReaderSettings)
+            PdfSpreadLayout.previousPageIndex(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         } else {
             pageIndex - 1
         }
@@ -1154,7 +1168,7 @@ internal fun PdfReaderScreen(
 
     fun nextPdfPageTarget(): Int {
         return if (displayMode == PdfDisplayMode.PAGINATION) {
-            PdfSpreadLayout.nextPageIndex(pageIndex, document.pageCount, pdfReaderSettings)
+            PdfSpreadLayout.nextPageIndex(pageIndex, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
         } else {
             pageIndex + 1
         }
@@ -1825,7 +1839,7 @@ internal fun PdfReaderScreen(
         }
         dispatchPdf(SharedPdfReaderAction.GoToSearchResult(targetIndex, searchResults))
         if (displayMode == PdfDisplayMode.PAGINATION) {
-            val normalizedTarget = PdfSpreadLayout.normalizePageIndex(targetPage, document.pageCount, pdfReaderSettings)
+            val normalizedTarget = PdfSpreadLayout.normalizePageIndex(targetPage, document.pageCount, pdfReaderSettings, paginationSpreadStarts)
             if (normalizedTarget != pdfState.pageIndex) {
                 dispatchPdf(SharedPdfReaderAction.GoToPage(normalizedTarget))
             }
@@ -3540,10 +3554,11 @@ private fun desktopPdfPageLabel(
     pageIndex: Int,
     pageCount: Int,
     displayMode: PdfDisplayMode,
-    settings: ReaderSettings
+    settings: ReaderSettings,
+    spreadStarts: List<Int>?
 ): String {
     val pageRange = if (displayMode == PdfDisplayMode.PAGINATION) {
-        PdfSpreadLayout.pageRangeLabel(pageIndex, pageCount, settings)
+        PdfSpreadLayout.pageRangeLabel(pageIndex, pageCount, settings, spreadStarts)
     } else {
         "${pageIndex.coerceIn(0, (pageCount - 1).coerceAtLeast(0)) + 1}"
     }

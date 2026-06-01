@@ -322,7 +322,7 @@ fun PdfViewerScreen(
     initialBookmarksJson: String?,
     isProUser: Boolean,
     onNavigateBack: () -> Unit,
-    onSavePosition: (page: Int, totalPages: Int) -> Unit,
+    onSavePosition: (page: Int, totalPages: Int, progress: Float) -> Unit,
     onBookmarksChanged: (bookmarksJson: String) -> Unit,
     onNavigateToPro: () -> Unit,
     viewModel: MainViewModel
@@ -955,9 +955,13 @@ fun PdfViewerScreen(
         totalDisplayPages,
         pdfSpreadSettings.pageSpreadMode,
         pdfSpreadSettings.pdfFirstPageStandaloneInSpread,
-        pdfSpreadSettings.pdfPageSpreadFlipped
+        pdfSpreadSettings.pdfPageSpreadFlipped,
+        pageAspectRatios
     ) {
-        PdfSpreadLayout.spreadStartPageIndices(totalDisplayPages, pdfSpreadSettings)
+        val provider = com.aryan.reader.shared.pdf.PdfPageSizeProvider { index ->
+            pageAspectRatios.getOrElse(index) { 1f } > 1f
+        }
+        PdfSpreadLayout.spreadStartPageIndices(totalDisplayPages, pdfSpreadSettings, provider)
     }
     val paginationPagerPageCount by remember(
         displayMode,
@@ -987,7 +991,7 @@ fun PdfViewerScreen(
         if (!PdfSpreadLayout.isTwoPageSpreadEnabled(pdfSpreadSettings)) {
             return displayPage.coerceIn(0, (paginationPagerPageCount - 1).coerceAtLeast(0))
         }
-        val normalizedPage = PdfSpreadLayout.normalizePageIndex(displayPage, totalDisplayPages, pdfSpreadSettings)
+        val normalizedPage = PdfSpreadLayout.normalizePageIndex(displayPage, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts)
         val spreadIndex = paginationSpreadStarts.indexOf(normalizedPage)
         return spreadIndex.coerceAtLeast(0).coerceIn(0, (paginationPagerPageCount - 1).coerceAtLeast(0))
     }
@@ -1292,6 +1296,9 @@ fun PdfViewerScreen(
     val currentPageState by rememberUpdatedState(currentPage)
     val currentPendingPage by rememberUpdatedState(pendingRestorePage)
     val currentVisibleAllAnnotations by rememberUpdatedState(visibleAllAnnotations)
+    val currentDisplayMode by rememberUpdatedState(displayMode)
+    val currentPdfSpreadSettings by rememberUpdatedState(pdfSpreadSettings)
+    val currentPaginationSpreadStarts by rememberUpdatedState(paginationSpreadStarts)
 
     val saveAllData = remember(currentBookId, annotationRepository, textBoxRepository, highlightRepository) {
         { force: Boolean ->
@@ -1311,6 +1318,9 @@ fun PdfViewerScreen(
             val totalPagesSnapshot = currentTotalPages
             val currentPageSnapshot = currentPageState
             val pendingPageSnapshot = currentPendingPage
+            val displayModeSnapshot = currentDisplayMode
+            val pdfSpreadSettingsSnapshot = currentPdfSpreadSettings
+            val paginationSpreadStartsSnapshot = currentPaginationSpreadStarts
             viewModel.viewModelScope.launch {
                 val bookId = bookIdSnapshot ?: return@launch
 
@@ -1383,8 +1393,13 @@ fun PdfViewerScreen(
                             if (force || page != lastSavedHashes[4]) {
                                 Timber.tag("PdfPositionDebug").d("UI: COMMIT SAVE | Page: $page | Total: $totalPgs | Force: $force")
                                 if (totalPgs > 0) {
+                                    val currentProgress = if (displayModeSnapshot == DisplayMode.PAGINATION) {
+                                        PdfSpreadLayout.progressPercent(page, totalPgs, pdfSpreadSettingsSnapshot, paginationSpreadStartsSnapshot)
+                                    } else {
+                                        ((page + 1).toFloat() / totalPgs.coerceAtLeast(1)) * 100f
+                                    }
                                     withContext(Dispatchers.Main) {
-                                        onSavePosition(page, totalPgs)
+                                        onSavePosition(page, totalPgs, currentProgress)
                                     }
                                 }
                                 lastSavedHashes[4] = page
@@ -3774,7 +3789,7 @@ fun PdfViewerScreen(
         currentPageScale = nextPageScale
         val isCurrentTwoPageSpread =
             displayMode == DisplayMode.PAGINATION &&
-                PdfSpreadLayout.visiblePageIndices(currentPage, totalDisplayPages, pdfSpreadSettings).size > 1
+                PdfSpreadLayout.visiblePageIndices(currentPage, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts).size > 1
         if (isCurrentTwoPageSpread) {
             val currentLockedState = lockedState
             val nextPageOffset = if (isScrollLocked && currentLockedState != null) {
@@ -3795,7 +3810,7 @@ fun PdfViewerScreen(
         if (
             resetZoomTrigger != 0L &&
             displayMode == DisplayMode.PAGINATION &&
-            PdfSpreadLayout.visiblePageIndices(currentPage, totalDisplayPages, pdfSpreadSettings).size > 1 &&
+            PdfSpreadLayout.visiblePageIndices(currentPage, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts).size > 1 &&
             currentActiveScale > 1f &&
             !isScrollLocked
         ) {
@@ -4464,7 +4479,8 @@ fun PdfViewerScreen(
                                                 PdfSpreadLayout.visiblePageIndices(
                                                     pageIndex = paginationDisplayPageForPagerPage(pagerPageIndex),
                                                     pageCount = totalDisplayPages,
-                                                    settings = pdfSpreadSettings
+                                                    settings = pdfSpreadSettings,
+                                                    spreadStarts = paginationSpreadStarts
                                                 )
                                             }
                                             val isVisiblePage = remember(pagerState.currentPage, pagerPageIndex) {
@@ -5145,9 +5161,9 @@ fun PdfViewerScreen(
                                                     coroutineScope.launch {
                                                         val current = currentPaginationDisplayPage()
                                                         val targetPage = if (direction > 0) {
-                                                            PdfSpreadLayout.nextPageIndex(current, totalDisplayPages, pdfSpreadSettings)
+                                                            PdfSpreadLayout.nextPageIndex(current, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts)
                                                         } else {
-                                                            PdfSpreadLayout.previousPageIndex(current, totalDisplayPages, pdfSpreadSettings)
+                                                            PdfSpreadLayout.previousPageIndex(current, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts)
                                                         }
                                                         animatePaginationToDisplayPage(targetPage)
                                                     }
@@ -5239,7 +5255,8 @@ fun PdfViewerScreen(
                                                             val currentSpreadPageIndices = PdfSpreadLayout.visiblePageIndices(
                                                                 pageIndex = currentPaginationDisplayPage(),
                                                                 pageCount = totalDisplayPages,
-                                                                settings = pdfSpreadSettings
+                                                                settings = pdfSpreadSettings,
+                                                                spreadStarts = paginationSpreadStarts
                                                             )
                                                             val targetPage = if (pageIndex in currentSpreadPageIndices) {
                                                                 pageIndex
@@ -5325,9 +5342,9 @@ fun PdfViewerScreen(
                                                     coroutineScope.launch {
                                                         val current = currentPaginationDisplayPage()
                                                         val targetPage = if (direction > 0) {
-                                                            PdfSpreadLayout.nextPageIndex(current, totalDisplayPages, pdfSpreadSettings)
+                                                            PdfSpreadLayout.nextPageIndex(current, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts)
                                                         } else {
-                                                            PdfSpreadLayout.previousPageIndex(current, totalDisplayPages, pdfSpreadSettings)
+                                                            PdfSpreadLayout.previousPageIndex(current, totalDisplayPages, pdfSpreadSettings, paginationSpreadStarts)
                                                         }
                                                         animatePaginationToDisplayPage(targetPage)
                                                     }

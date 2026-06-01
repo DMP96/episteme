@@ -70,4 +70,20 @@ class PdfSpreadLayoutTest {
         assertEquals(80f, PdfSpreadLayout.progressPercent(2, pageCount = 5, settings = settings))
         assertEquals(100f, PdfSpreadLayout.progressPercent(4, pageCount = 5, settings = settings))
     }
+
+    @Test
+    fun `adaptive mode spread progress uses the visible spread end`() {
+        val settings = ReaderSettings(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE)
+        val provider = PdfPageSizeProvider { index -> index == 2 } // [0,1], [2], [3,4], [5]
+        val spreadStarts = PdfSpreadLayout.spreadStartPageIndices(6, settings, provider)
+
+        // Spread [0, 1] -> max index is 1. Progress = (1 + 1)/6 * 100 = 33.33%
+        assertEquals((2f / 6f) * 100f, PdfSpreadLayout.progressPercent(0, 6, settings, spreadStarts))
+        // Spread [2] -> max index is 2. Progress = (2 + 1)/6 * 100 = 50%
+        assertEquals((3f / 6f) * 100f, PdfSpreadLayout.progressPercent(2, 6, settings, spreadStarts))
+        // Spread [3, 4] -> max index is 4. Progress = (4 + 1)/6 * 100 = 83.33%
+        assertEquals((5f / 6f) * 100f, PdfSpreadLayout.progressPercent(3, 6, settings, spreadStarts))
+        // Spread [5] -> max index is 5. Progress = (5 + 1)/6 * 100 = 100%
+        assertEquals(100f, PdfSpreadLayout.progressPercent(5, 6, settings, spreadStarts))
+    }
 }

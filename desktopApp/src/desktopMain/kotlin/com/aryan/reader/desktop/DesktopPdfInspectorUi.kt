@@ -331,8 +331,17 @@ private fun ColumnScope.DesktopPdfInspectorContent(
                                         },
                                         label = { Text(readerString("visual_options_pdf_spread_two", "Two pages")) }
                                     )
+                                    FilterChip(
+                                        selected = pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE,
+                                        onClick = {
+                                            onReaderSettingsChange(
+                                                pdfReaderSettings.copy(pageSpreadMode = ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE)
+                                            )
+                                        },
+                                        label = { Text(readerString("visual_options_pdf_spread_two_adaptive", "Two pages (adaptive)")) }
+                                    )
                                 }
-                                if (pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE) {
+                                if (pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pdfReaderSettings.pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE) {
                                     DesktopPdfVisualOptionSwitch(
                                         title = readerString("visual_options_pdf_first_page_alone", "First page alone"),
                                         description = readerString(

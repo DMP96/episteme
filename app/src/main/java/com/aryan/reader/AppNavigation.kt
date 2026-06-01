@@ -227,7 +227,9 @@ fun AppNavigation(
                             Timber.d("Back action triggered from PDF Viewer.")
                             viewModel.clearSelectedFile()
                         },
-                        onSavePosition = viewModel::savePdfReadingPosition,
+                        onSavePosition = { page, totalPages, progress ->
+                            viewModel.savePdfReadingPosition(page, totalPages, progress)
+                        },
                         onBookmarksChanged = { bookmarksJson ->
                             if (bookId != null) {
                                 viewModel.saveBookmarks(bookId, bookmarksJson)

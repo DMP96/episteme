@@ -40,7 +40,8 @@ enum class ReaderReadingMode {
 
 enum class ReaderPageSpreadMode {
     SINGLE,
-    TWO_PAGE
+    TWO_PAGE,
+    TWO_PAGE_ADAPTIVE
 }
 
 enum class SharedReaderTextAlign {
@@ -257,5 +258,5 @@ object ReaderSpreadLayout {
 
 fun ReaderSettings.isTwoPageSpreadEnabled(): Boolean {
     return readingMode == ReaderReadingMode.PAGINATED && 
-        pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE
+        (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE)
 }

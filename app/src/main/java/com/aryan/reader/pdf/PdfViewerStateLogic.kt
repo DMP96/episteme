@@ -45,10 +45,11 @@ internal fun pdfPageRangeText(
     pageIndex: Int,
     pageCount: Int,
     displayMode: DisplayMode,
-    settings: ReaderSettings
+    settings: ReaderSettings,
+    spreadStarts: List<Int>? = null
 ): String {
     val pageRange = if (displayMode == DisplayMode.PAGINATION) {
-        PdfSpreadLayout.pageRangeLabel(pageIndex, pageCount, settings)
+        PdfSpreadLayout.pageRangeLabel(pageIndex, pageCount, settings, spreadStarts)
     } else {
         "${pageIndex.coerceIn(0, (pageCount - 1).coerceAtLeast(0)) + 1}"
     }
@@ -59,10 +60,11 @@ internal fun pdfPageRangeLabel(
     pageIndex: Int,
     pageCount: Int,
     displayMode: DisplayMode,
-    settings: ReaderSettings
+    settings: ReaderSettings,
+    spreadStarts: List<Int>? = null
 ): String {
     val pageRange = if (displayMode == DisplayMode.PAGINATION) {
-        PdfSpreadLayout.pageRangeLabel(pageIndex, pageCount, settings)
+        PdfSpreadLayout.pageRangeLabel(pageIndex, pageCount, settings, spreadStarts)
     } else {
         "${pageIndex.coerceIn(0, (pageCount - 1).coerceAtLeast(0)) + 1}"
     }

@@ -71,6 +71,7 @@ internal fun DesktopPdfInspectorPanel(
     pageIndex: Int,
     displayMode: PdfDisplayMode,
     pdfReaderSettings: ReaderSettings,
+    spreadStarts: List<Int>?,
     customTextureIds: List<String>,
     onImportTexture: ((ReaderSettings) -> ReaderSettings?)?,
     onReaderSettingsChange: (ReaderSettings) -> Unit,
@@ -146,6 +147,7 @@ internal fun DesktopPdfInspectorPanel(
                 pageIndex = pageIndex,
                 displayMode = displayMode,
                 pdfReaderSettings = pdfReaderSettings,
+                spreadStarts = spreadStarts,
                 customTextureIds = customTextureIds,
                 onImportTexture = onImportTexture,
                 onReaderSettingsChange = onReaderSettingsChange,
@@ -237,6 +239,7 @@ private fun ColumnScope.DesktopPdfInspectorContent(
     pageIndex: Int,
     displayMode: PdfDisplayMode,
     pdfReaderSettings: ReaderSettings,
+    spreadStarts: List<Int>?,
     customTextureIds: List<String>,
     onImportTexture: ((ReaderSettings) -> ReaderSettings?)?,
     onReaderSettingsChange: (ReaderSettings) -> Unit,
@@ -374,7 +377,7 @@ private fun ColumnScope.DesktopPdfInspectorContent(
                     item {
                         DesktopPdfInspectorSection(readerString("visual_options_progress_bar_position", "Position")) {
                             val pageRange = if (displayMode == PdfDisplayMode.PAGINATION) {
-                                PdfSpreadLayout.pageRangeLabel(pageIndex, document.pageCount, pdfReaderSettings)
+                                PdfSpreadLayout.pageRangeLabel(pageIndex, document.pageCount, pdfReaderSettings, spreadStarts)
                             } else {
                                 "${pageIndex + 1}"
                             }

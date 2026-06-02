@@ -6082,7 +6082,8 @@ fun PdfViewerScreen(
                                         pageIndex = sliderCurrentPage.roundToInt(),
                                         pageCount = totalDisplayPages,
                                         displayMode = displayMode,
-                                        settings = pdfSpreadSettings
+                                        settings = pdfSpreadSettings,
+                                        spreadStarts = paginationSpreadStarts
                                     ),
                                     style = MaterialTheme.typography.bodyLarge,
                                     color = pdfReaderSliderColors.contentColor,
@@ -6099,7 +6100,8 @@ fun PdfViewerScreen(
                             pageIndex = sliderCurrentPage.roundToInt(),
                             pageCount = totalDisplayPages,
                             displayMode = displayMode,
-                            settings = pdfSpreadSettings
+                            settings = pdfSpreadSettings,
+                            spreadStarts = paginationSpreadStarts
                         )
                     )
                 }
@@ -6200,7 +6202,8 @@ fun PdfViewerScreen(
                         pageIndex = currentPage,
                         pageCount = totalDisplayPages,
                         displayMode = displayMode,
-                        settings = pdfSpreadSettings
+                        settings = pdfSpreadSettings,
+                        spreadStarts = paginationSpreadStarts
                     ),
                     totalPages = totalPages,
                     pagerStatePageCount = pagerState.pageCount,

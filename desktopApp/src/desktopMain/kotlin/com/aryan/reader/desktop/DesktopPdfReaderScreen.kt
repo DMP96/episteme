@@ -2325,6 +2325,7 @@ internal fun PdfReaderScreen(
                 pageIndex = pageIndex,
                 displayMode = displayMode,
                 pdfReaderSettings = pdfReaderSettings,
+                spreadStarts = paginationSpreadStarts,
                 customTextureIds = customTextureIds,
                 onImportTexture = onImportTexture,
                 onReaderSettingsChange = ::updatePdfReaderSettings,

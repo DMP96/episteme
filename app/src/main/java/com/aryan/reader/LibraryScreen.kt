@@ -105,6 +105,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -120,6 +121,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -135,15 +137,19 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.util.UnstableApi
 import androidx.navigation.NavHostController
+import coil.ImageLoader
 import coil.compose.AsyncImage
-import coil.request.ImageRequest
+import coil.decode.SvgDecoder
 import com.aryan.reader.data.RecentFileItem
 import com.aryan.reader.data.TagEntity
 import com.aryan.reader.opds.OpdsAcquisition
 import com.aryan.reader.opds.OpdsCatalog
 import com.aryan.reader.opds.OpdsDownloadState
 import com.aryan.reader.opds.OpdsEntry
+import com.aryan.reader.opds.OpdsRepository
 import com.aryan.reader.opds.OpdsViewModel
+import com.aryan.reader.shared.LOCAL_FOLDER_SYNC_DATA_DIR
+import com.aryan.reader.shared.opds.SharedOpdsLocalBookMatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -325,6 +331,7 @@ fun LibraryScreen(
             onEditFolderFiltersClick = { folder, filters -> viewModel.updateFolderFilters(folder, filters) },
             syncedFolders = uiState.syncedFolders,
             onRemoveFolderClick = { folder -> viewModel.removeSyncedFolder(folder) },
+            onFolderLocalSyncChange = viewModel::setFolderLocalSyncEnabled,
             onDisconnectSyncFolderClick = viewModel::disconnectAllSyncedFolders,
             downloadingBookIds = uiState.downloadingBookIds,
             lastFolderScanTime = uiState.lastFolderScanTime,
@@ -590,6 +597,7 @@ fun LibraryScreenContent(
     isRefreshing: Boolean,
     syncedFolders: List<SyncedFolder>,
     onRemoveFolderClick: (SyncedFolder) -> Unit,
+    onFolderLocalSyncChange: (SyncedFolder, Boolean, Boolean) -> Unit,
     onOpdsBookDownloaded: (Uri, String) -> Unit,
     onStreamOpdsBook: (OpdsEntry, OpdsCatalog?) -> Unit,
     onDeleteCatalogStreams: (String) -> Unit,
@@ -666,7 +674,8 @@ fun LibraryScreenContent(
                                 modifier = Modifier
                                     .weight(1f)
                                     .padding(vertical = 4.dp)
-                                    .focusRequester(searchFocusRequester),
+                                    .focusRequester(searchFocusRequester)
+                                    .testTag("LibrarySearchTextField"),
                                 singleLine = true,
                                 colors = TextFieldDefaults.colors(
                                     focusedContainerColor = Color.Transparent,
@@ -693,7 +702,10 @@ fun LibraryScreenContent(
                                     Icon(Icons.Default.FilterList, contentDescription = stringResource(R.string.content_desc_filter))
                                 }
                                 Box {
-                                    TextButton(onClick = { showSortMenu = true }) {
+                                    TextButton(
+                                        onClick = { showSortMenu = true },
+                                        modifier = Modifier.testTag("LibrarySortButton")
+                                    ) {
                                         Icon(
                                             painter = painterResource(id = R.drawable.sort),
                                             contentDescription = stringResource(R.string.content_desc_sort),
@@ -822,7 +834,9 @@ fun LibraryScreenContent(
                             text = { Text(stringResource(R.string.fab_new_shelf)) },
                             icon = { Icon(Icons.Default.Add, contentDescription = stringResource(R.string.fab_new_shelf)) },
                             onClick = onNewShelfClick,
-                            modifier = Modifier.padding(16.dp)
+                            modifier = Modifier
+                                .padding(16.dp)
+                                .testTag("LibraryNewShelfFab")
                         )
                     }
                 }
@@ -888,6 +902,7 @@ fun LibraryScreenContent(
                         allRecentFiles = rawLibraryFiles,
                         onAddFolderClick = onSelectSyncFolderClick,
                         onRemoveFolderClick = onRemoveFolderClick,
+                        onFolderLocalSyncChange = onFolderLocalSyncChange,
                         onEditFolderFiltersClick = onEditFolderFiltersClick,
                         onScanNowClick = onScanNowClick,
                         onSyncMetadataClick = onSyncMetadataClick,
@@ -1140,7 +1155,8 @@ private fun ShelfDetailScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .padding(vertical = 4.dp)
-                                .focusRequester(searchFocusRequester),
+                                .focusRequester(searchFocusRequester)
+                                .testTag("ShelfSearchTextField"),
                             singleLine = true,
                             colors = TextFieldDefaults.colors(
                                 focusedContainerColor = Color.Transparent,
@@ -1193,7 +1209,10 @@ private fun ShelfDetailScreen(
                     },
                     actions = {
                         Box {
-                            TextButton(onClick = { showSortMenu = true }) {
+                            TextButton(
+                                onClick = { showSortMenu = true },
+                                modifier = Modifier.testTag("ShelfSortButton")
+                            ) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.sort),
                                     contentDescription = stringResource(R.string.content_desc_sort),
@@ -1375,7 +1394,10 @@ private fun AddBooksModeScreen(
                     },
                     actions = {
                         Box {
-                            TextButton(onClick = { showSortMenu = true }) {
+                            TextButton(
+                                onClick = { showSortMenu = true },
+                                modifier = Modifier.testTag("AddBooksSortButton")
+                            ) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.sort),
                                     contentDescription = stringResource(R.string.content_desc_sort),
@@ -1581,6 +1603,7 @@ private fun ShelfListItem(
         ),
         modifier = Modifier
             .fillMaxWidth()
+            .testTag("ShelfItem_${shelf.id}")
             .then(
                 if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.large)
                 else Modifier
@@ -1659,6 +1682,7 @@ private fun LibraryListItem(
         ),
         modifier = Modifier
             .fillMaxWidth()
+            .testTag("LibraryBookItem_${item.bookId}")
             .graphicsLayer { alpha = if (item.isAvailable) 1.0f else 0.8f }
             .then(
                 if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.large)
@@ -1929,12 +1953,15 @@ private fun FolderSyncScreen(
     allRecentFiles: List<RecentFileItem>,
     onAddFolderClick: () -> Unit,
     onRemoveFolderClick: (SyncedFolder) -> Unit,
+    onFolderLocalSyncChange: (SyncedFolder, Boolean, Boolean) -> Unit,
     onEditFolderFiltersClick: (SyncedFolder, Set<FileType>) -> Unit,
     onScanNowClick: () -> Unit,
     onSyncMetadataClick: () -> Unit,
     isLoading: Boolean
 ) {
     var editingFolder by remember { mutableStateOf<SyncedFolder?>(null) }
+    var disablingFolder by remember { mutableStateOf<SyncedFolder?>(null) }
+    val hasEnabledSyncFolders = syncedFolders.any { it.localSyncEnabled }
     val folderStatsByUri = remember(allRecentFiles) {
         allRecentFiles
             .asSequence()
@@ -1973,7 +2000,7 @@ private fun FolderSyncScreen(
                 ) {
                     FilledTonalButton(
                         onClick = onScanNowClick,
-                        enabled = !isLoading,
+                        enabled = !isLoading && hasEnabledSyncFolders,
                         modifier = Modifier.weight(1f),
                         shape = MaterialTheme.shapes.small
                     ) {
@@ -1988,7 +2015,7 @@ private fun FolderSyncScreen(
 
                     androidx.compose.material3.OutlinedButton(
                         onClick = onSyncMetadataClick,
-                        enabled = !isLoading,
+                        enabled = !isLoading && hasEnabledSyncFolders,
                         modifier = Modifier.weight(1f),
                         shape = MaterialTheme.shapes.small
                     ) {
@@ -2016,6 +2043,13 @@ private fun FolderSyncScreen(
                         folder = folder,
                         stats = folderStatsByUri[folder.uriString] ?: FolderFileStats.Empty,
                         onRemoveClick = onRemoveFolderClick,
+                        onLocalSyncToggleClick = { selectedFolder ->
+                            if (selectedFolder.localSyncEnabled) {
+                                disablingFolder = selectedFolder
+                            } else {
+                                onFolderLocalSyncChange(selectedFolder, true, false)
+                            }
+                        },
                         onEditFiltersClick = { editingFolder = folder }
                     )
                 }
@@ -2031,6 +2065,46 @@ private fun FolderSyncScreen(
                 editingFolder = null
             },
             onDismiss = { editingFolder = null }
+        )
+    }
+
+    disablingFolder?.let { folder ->
+        AlertDialog(
+            onDismissRequest = { disablingFolder = null },
+            title = { Text(stringResource(R.string.dialog_disable_folder_local_sync_title)) },
+            text = {
+                Text(
+                    stringResource(
+                        R.string.dialog_disable_folder_local_sync_desc,
+                        LOCAL_FOLDER_SYNC_DATA_DIR
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onFolderLocalSyncChange(folder, false, true)
+                        disablingFolder = null
+                    }
+                ) {
+                    Text(stringResource(R.string.action_disable_remove_sync_data))
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { disablingFolder = null }) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                    TextButton(
+                        onClick = {
+                            onFolderLocalSyncChange(folder, false, false)
+                            disablingFolder = null
+                        }
+                    ) {
+                        Text(stringResource(R.string.action_disable_keep_sync_data))
+                    }
+                }
+            }
         )
     }
 }
@@ -2050,6 +2124,7 @@ private fun FolderCard(
     folder: SyncedFolder,
     stats: FolderFileStats,
     onRemoveClick: (SyncedFolder) -> Unit,
+    onLocalSyncToggleClick: (SyncedFolder) -> Unit,
     onEditFiltersClick: (SyncedFolder) -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
@@ -2075,13 +2150,22 @@ private fun FolderCard(
                         tint = MaterialTheme.colorScheme.primary
                     )
                     Spacer(modifier = Modifier.width(12.dp))
-                    Text(
-                        text = folder.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = folder.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (!folder.localSyncEnabled) {
+                            Text(
+                                text = stringResource(R.string.folder_local_sync_disabled),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
                 }
 
                 Box {
@@ -2094,6 +2178,21 @@ private fun FolderCard(
                             onClick = {
                                 showMenu = false
                                 onEditFiltersClick(folder)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    if (folder.localSyncEnabled) {
+                                        stringResource(R.string.menu_disable_folder_local_sync)
+                                    } else {
+                                        stringResource(R.string.menu_enable_folder_local_sync)
+                                    }
+                                )
+                            },
+                            onClick = {
+                                showMenu = false
+                                onLocalSyncToggleClick(folder)
                             }
                         )
                         DropdownMenuItem(
@@ -2377,6 +2476,7 @@ fun OpdsTab(
     val uiState by opdsViewModel.uiState.collectAsStateWithLifecycle()
     val downloadingState = uiState.downloadingState
     val context = LocalContext.current
+    val coverImageLoader = rememberOpdsCoverImageLoader(uiState.currentCatalog)
     var selectedEntry by remember { mutableStateOf<OpdsEntry?>(null) }
     var showCatalogDialog by remember { mutableStateOf(false) }
     var editingCatalog by remember { mutableStateOf<OpdsCatalog?>(null) }
@@ -2601,6 +2701,7 @@ fun OpdsTab(
                                         entry = entry,
                                         localLibraryFiles = localLibraryFiles,
                                         downloadState = downloadingState[entry.id],
+                                        coverImageLoader = coverImageLoader,
                                         onDownloadClick = { acquisition ->
                                             opdsViewModel.downloadBook(
                                                 entry, acquisition, context
@@ -2649,6 +2750,7 @@ fun OpdsTab(
                 entry = selectedEntry!!,
                 localLibraryFiles = localLibraryFiles,
                 downloadState = downloadingState[selectedEntry!!.id],
+                coverImageLoader = coverImageLoader,
                 onDownloadFormat = { acquisition ->
                     opdsViewModel.downloadBook(selectedEntry!!, acquisition, context) { downloadedUri ->
                         onBookDownloaded(downloadedUri, selectedEntry!!.title)
@@ -2777,6 +2879,29 @@ fun OpdsTab(
 }
 
 @Composable
+private fun rememberOpdsCoverImageLoader(catalog: OpdsCatalog?): ImageLoader {
+    val context = LocalContext.current.applicationContext
+    val username = catalog?.username
+    val password = catalog?.password
+    val imageLoader = remember(context, username, password) {
+        ImageLoader.Builder(context)
+            .okHttpClient {
+                OpdsRepository.sharedHttpClient.newBuilder()
+                    .authenticator(OpdsRepository.OpdsAuthenticator(username, password))
+                    .build()
+            }
+            .components {
+                add(SvgDecoder.Factory())
+            }
+            .build()
+    }
+    DisposableEffect(imageLoader) {
+        onDispose { imageLoader.shutdown() }
+    }
+    return imageLoader
+}
+
+@Composable
 fun OpdsCatalogCard(catalog: OpdsCatalog, onClick: () -> Unit, onEdit: (() -> Unit)?, onDelete: (() -> Unit)?) {
     Surface(
         onClick = onClick,
@@ -2853,13 +2978,20 @@ fun OpdsBookCard(
     entry: OpdsEntry,
     localLibraryFiles: List<RecentFileItem>,
     downloadState: OpdsDownloadState?,
+    coverImageLoader: ImageLoader,
     onDownloadClick: (OpdsAcquisition) -> Unit,
     onReadClick: (RecentFileItem) -> Unit,
     onStreamClick: () -> Unit,
     onClick: () -> Unit
 ) {
     val libraryItem = remember(entry, localLibraryFiles) {
-        localLibraryFiles.find { it.title.equals(entry.title, ignoreCase = true) || it.displayName.equals(entry.title, ignoreCase = true) }
+        SharedOpdsLocalBookMatcher.find(
+            entry = entry,
+            books = localLibraryFiles,
+            title = { it.title },
+            displayName = { it.displayName },
+            path = { it.uriString }
+        )
     }
     val isDownloading = downloadState?.isDownloading == true
     val progress = downloadState?.progress
@@ -2878,6 +3010,7 @@ fun OpdsBookCard(
             AsyncImage(
                 model = entry.coverUrl,
                 contentDescription = null,
+                imageLoader = coverImageLoader,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .size(width = 70.dp, height = 100.dp)
@@ -2984,6 +3117,7 @@ fun OpdsBookDetailsSheet(
     entry: OpdsEntry,
     localLibraryFiles: List<RecentFileItem>,
     downloadState: OpdsDownloadState?,
+    coverImageLoader: ImageLoader,
     onDownloadFormat: (OpdsAcquisition) -> Unit,
     onReadClick: (RecentFileItem) -> Unit,
     onStreamClick: () -> Unit,
@@ -2992,7 +3126,13 @@ fun OpdsBookDetailsSheet(
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val libraryItem = remember(entry, localLibraryFiles) {
-        localLibraryFiles.find { it.title.equals(entry.title, ignoreCase = true) || it.displayName.equals(entry.title, ignoreCase = true) }
+        SharedOpdsLocalBookMatcher.find(
+            entry = entry,
+            books = localLibraryFiles,
+            title = { it.title },
+            displayName = { it.displayName },
+            path = { it.uriString }
+        )
     }
     val isDownloading = downloadState?.isDownloading == true
     val progress = downloadState?.progress
@@ -3012,6 +3152,7 @@ fun OpdsBookDetailsSheet(
                 AsyncImage(
                     model = entry.coverUrl,
                     contentDescription = null,
+                    imageLoader = coverImageLoader,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(width = 110.dp, height = 160.dp)

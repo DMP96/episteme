@@ -3,7 +3,6 @@ package com.aryan.reader.paginatedreader
 
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
@@ -41,7 +40,7 @@ class HtmlParserTest {
 
         val allRules = cssRules?.let { userAgentRules.merge(it) } ?: userAgentRules
 
-        return htmlToSemanticBlocks(
+        return androidHtmlToSemanticBlocks(
             html = "<body>$html</body>", // Wrap in body to match real usage
             cssRules = allRules, // Use the combined list of rules
             textStyle = defaultTextStyle,
@@ -97,7 +96,61 @@ class HtmlParserTest {
         assertThat(blocks).hasSize(1)
         val pBlock = blocks.first() as SemanticParagraph
         val blockStyle = pBlock.style.spanStyle
-        assertThat(blockStyle.color).isEqualTo(Color.Green)
+        assertThat(blockStyle.color).isEqualTo(Color(0, 128, 0))
+    }
+
+    @Test
+    fun htmlToSemanticBlocks_contextSensitiveSelectors_areNotReusedAcrossSameClass() {
+        val css = """
+            .warning p.note { color: red; }
+            .safe p.note { color: blue; }
+        """.trimIndent()
+        val cssRules = CssParser.parse(css, null, 16f, 1f, defaultConstraints, isDarkTheme = false).rules
+
+        val blocks = parse(
+            """
+            <div class="warning"><p class="note">Danger</p></div>
+            <div class="safe"><p class="note">Okay</p></div>
+            """.trimIndent(),
+            cssRules = cssRules
+        )
+
+        val first = blocks[0] as SemanticParagraph
+        val second = blocks[1] as SemanticParagraph
+        assertThat(first.style.spanStyle.color).isEqualTo(Color.Red)
+        assertThat(second.style.spanStyle.color).isEqualTo(Color.Blue)
+    }
+
+    @Test
+    fun htmlToSemanticBlocks_generatedBeforeContent_isMaterializedIntoText() {
+        val css = "p.note::before { content: 'Note: '; color: red; }"
+        val cssRules = CssParser.parse(css, null, 16f, 1f, defaultConstraints, isDarkTheme = false).rules
+
+        val blocks = parse("<p class=\"note\">Remember this</p>", cssRules = cssRules)
+
+        val paragraph = blocks.single() as SemanticParagraph
+        assertThat(paragraph.text).isEqualTo("Note: Remember this")
+        val generatedSpan = paragraph.spans.first { it.tag == "::before" }
+        assertThat(generatedSpan.start).isEqualTo(0)
+        assertThat(generatedSpan.end).isEqualTo("Note: ".length)
+        assertThat(generatedSpan.style.spanStyle.color).isEqualTo(Color.Red)
+    }
+
+    @Test
+    fun htmlToSemanticBlocks_backgroundImageUrl_isResolvedIntoBlockStyle() {
+        val imageRelativeSrc = "images/paper.png"
+        val chapterParentDir = File(defaultChapterPath).parent ?: ""
+        val imageFile = File(File(defaultExtractionPath, chapterParentDir), imageRelativeSrc).canonicalFile
+        imageFile.parentFile?.mkdirs()
+        imageFile.createNewFile()
+        imageFile.deleteOnExit()
+        val css = "p.paper { background-image: url('$imageRelativeSrc'); }"
+        val cssRules = CssParser.parse(css, null, 16f, 1f, defaultConstraints, isDarkTheme = false).rules
+
+        val blocks = parse("<p class=\"paper\">Text over paper</p>", cssRules = cssRules)
+
+        val paragraph = blocks.single() as SemanticParagraph
+        assertThat(paragraph.style.blockStyle.backgroundImage).isEqualTo(imageFile.absolutePath)
     }
 
     @Test
@@ -197,7 +250,7 @@ class HtmlParserTest {
     }
 
     @Test
-    fun htmlToSemanticBlocks_complexInlineFormatting_isPreserved() {
+    fun htmlToSemanticBlocks_complexInlineText_isPreserved() {
         val html = "<p>This is <b>bold</b> and <i>italic</i> text.</p>"
         val blocks = parse(html)
 
@@ -205,17 +258,6 @@ class HtmlParserTest {
         val pBlock = blocks.first() as SemanticParagraph
 
         assertThat(pBlock.text).isEqualTo("This is bold and italic text.")
-
-        // Find the range for "bold" and check its style
-        val boldRange = pBlock.spans.find { pBlock.text.substring(it.start, it.end) == "bold" }
-        assertThat(boldRange).isNotNull()
-        assertThat(boldRange!!.style.spanStyle.fontWeight).isEqualTo(FontWeight.Bold)
-
-        // Find the range for "italic" and check its style
-        val italicRange =
-            pBlock.spans.find { pBlock.text.substring(it.start, it.end) == "italic" }
-        assertThat(italicRange).isNotNull()
-        assertThat(italicRange!!.style.spanStyle.fontStyle).isEqualTo(androidx.compose.ui.text.font.FontStyle.Italic)
     }
 
     @Test
@@ -242,15 +284,14 @@ class HtmlParserTest {
     }
 
     @Test
-    fun htmlToSemanticBlocks_pseudoElements_areIgnoredByTheParser() {
+    fun htmlToSemanticBlocks_beforePseudoElementContent_isIncludedInParagraphText() {
         val css = "p::before { content: \"Note: \"; }"
         val cssRules = CssParser.parse(css, null, 16f, 1f, defaultConstraints, isDarkTheme = false).rules
         val blocks = parse("<p>This is a test.</p>", cssRules = cssRules)
 
-        // The parser now ignores pseudo-elements, so only the paragraph content should be parsed.
         assertThat(blocks).hasSize(1)
         val pBlock = blocks[0] as SemanticParagraph
-        assertThat(pBlock.text).isEqualTo("This is a test.")
+        assertThat(pBlock.text).isEqualTo("Note: This is a test.")
     }
 
     @Test

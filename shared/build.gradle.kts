@@ -3,7 +3,7 @@ plugins {
     id("com.android.library")
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.compose.multiplatform)
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.1.20"
+    alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.kover)
 }
 
@@ -28,7 +28,6 @@ kotlin {
         commonMain.dependencies {
             implementation(compose.foundation)
             implementation(compose.material3)
-            implementation(compose.materialIconsExtended)
             implementation(compose.ui)
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
             implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
@@ -47,5 +46,9 @@ android {
 
     defaultConfig {
         minSdk = 26
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 }

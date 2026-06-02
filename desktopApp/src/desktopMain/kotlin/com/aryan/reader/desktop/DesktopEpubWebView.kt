@@ -1,57 +1,85 @@
 package com.aryan.reader.desktop
 
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import com.aryan.reader.shared.EpubAnnotationSerializer
 import com.aryan.reader.shared.ReaderLocator
 import com.aryan.reader.shared.UserHighlight
-import com.aryan.reader.shared.reader.ReaderReadingMode
 import com.aryan.reader.shared.ui.ReaderContentNavigationTarget
-import com.multiplatform.webview.jsbridge.IJsMessageHandler
-import com.multiplatform.webview.jsbridge.JsMessage
-import com.multiplatform.webview.jsbridge.rememberWebViewJsBridge
-import com.multiplatform.webview.request.RequestInterceptor
-import com.multiplatform.webview.request.WebRequest
-import com.multiplatform.webview.request.WebRequestInterceptResult
-import com.multiplatform.webview.web.LoadingState
-import com.multiplatform.webview.web.WebContent
-import com.multiplatform.webview.web.WebView
-import com.multiplatform.webview.web.WebViewNavigator
-import com.multiplatform.webview.web.WebViewState
-import com.multiplatform.webview.web.rememberWebViewNavigator
 import kotlinx.coroutines.launch
-import java.awt.AWTEvent
-import java.awt.Toolkit
-import java.awt.event.AWTEventListener
-import java.awt.event.MouseEvent
 
 @Composable
 internal fun DesktopEpubWebView(
     html: String,
     appearanceScript: String,
+    highlightPaletteScript: String,
     navigationTarget: ReaderContentNavigationTarget,
     highlights: List<UserHighlight>,
     onHighlightCreated: (UserHighlight) -> Unit,
     onHighlightSelected: (String) -> Unit,
     isFullscreen: Boolean,
     onKeyboardNavigation: (DesktopReaderKeyNavigation) -> Unit,
-    onSelectionAction: (DesktopReaderSelectionAction, String) -> Unit,
+    onSelectionAction: (DesktopReaderSelectionActionPayload) -> Unit,
     onLinkClicked: (DesktopEpubLinkClick) -> Unit,
     onVisiblePageChanged: (Int, ReaderLocator?) -> Unit,
     onPointerActivity: () -> Unit = {},
     networkAccessEnabled: Boolean,
+    backgroundColor: Color,
     modifier: Modifier = Modifier
 ) {
+    val backend = desktopEpubWebViewBackend()
+    LaunchedEffect(html, networkAccessEnabled, highlights.size, navigationTarget.readingMode, backend) {
+        logDesktopWebView2(
+            "backend_selected backend=${backend.logName} htmlChars=${html.length} htmlHash=${html.hashCode()} " +
+                "network=$networkAccessEnabled highlights=${highlights.size} navMode=${navigationTarget.readingMode}"
+        )
+        logDesktopReaderOpenTrace {
+            "event=desktop_webview_selected backend=${backend.logName} htmlChars=${html.length} " +
+                "htmlHash=${html.hashCode()} network=$networkAccessEnabled highlights=${highlights.size} " +
+                "navMode=${navigationTarget.readingMode}"
+        }
+    }
+    DesktopNativeSwtEpubWebView(
+        html = html,
+        appearanceScript = appearanceScript,
+        highlightPaletteScript = highlightPaletteScript,
+        navigationTarget = navigationTarget,
+        highlights = highlights,
+        onHighlightCreated = onHighlightCreated,
+        onHighlightSelected = onHighlightSelected,
+        isFullscreen = isFullscreen,
+        onKeyboardNavigation = onKeyboardNavigation,
+        onSelectionAction = onSelectionAction,
+        onLinkClicked = onLinkClicked,
+        onVisiblePageChanged = onVisiblePageChanged,
+        onPointerActivity = onPointerActivity,
+        networkAccessEnabled = networkAccessEnabled,
+        backgroundColor = backgroundColor,
+        modifier = modifier
+    )
+}
+
+internal data class DesktopEpubBridgeHandler(
+    val methodName: String,
+    val onMessage: (String) -> Unit
+)
+
+@Composable
+internal fun rememberDesktopEpubBridgeHandlers(
+    onHighlightCreated: (UserHighlight) -> Unit,
+    onHighlightSelected: (String) -> Unit,
+    onKeyboardNavigation: (DesktopReaderKeyNavigation) -> Unit,
+    onSelectionAction: (DesktopReaderSelectionActionPayload) -> Unit,
+    onLinkClicked: (DesktopEpubLinkClick) -> Unit,
+    onVisiblePageChanged: (Int, ReaderLocator?) -> Unit,
+    onPointerActivity: () -> Unit
+): List<DesktopEpubBridgeHandler> {
     val latestOnHighlightCreated by rememberUpdatedState(onHighlightCreated)
     val latestOnHighlightSelected by rememberUpdatedState(onHighlightSelected)
     val latestOnKeyboardNavigation by rememberUpdatedState(onKeyboardNavigation)
@@ -60,81 +88,98 @@ internal fun DesktopEpubWebView(
     val latestOnVisiblePageChanged by rememberUpdatedState(onVisiblePageChanged)
     val latestOnPointerActivity by rememberUpdatedState(onPointerActivity)
     val scope = rememberCoroutineScope()
-    val linkRequestInterceptor = remember(scope, networkAccessEnabled) {
-        object : RequestInterceptor {
-            override fun onInterceptUrlRequest(
-                request: WebRequest,
-                navigator: WebViewNavigator
-            ): WebRequestInterceptResult {
-                if (!networkAccessEnabled && request.url.isRemoteNetworkUrl()) {
-                    logEpubLink("request_blocked_offline url=\"${request.url.logPreview()}\"")
-                    return WebRequestInterceptResult.Reject
-                }
-                if (!request.isForMainFrame) return WebRequestInterceptResult.Allow
-                val link = request.url.readerLinkClickFromIntercept() ?: return WebRequestInterceptResult.Allow
-                logEpubLink(
-                    "request_intercept method=${request.method} redirect=${request.isRedirect} " +
-                        "url=\"${request.url.logPreview()}\" href=\"${link.href.logPreview()}\""
-                )
-                scope.launch {
-                    latestOnLinkClicked(link.copy(source = "request"))
-                }
-                return WebRequestInterceptResult.Reject
-            }
-        }
-    }
-    val navigator = rememberWebViewNavigator(requestInterceptor = linkRequestInterceptor)
-    val bridge = rememberWebViewJsBridge()
-
-    DisposableEffect(bridge) {
-        val handlers = listOf(
-            desktopEpubBridgeHandler("readerHighlightCreated") { message ->
-                val highlight = EpubAnnotationSerializer.parseHighlightJsonLenient(message.params)
+    return remember(scope) {
+        listOf(
+            DesktopEpubBridgeHandler("readerHighlightCreated") { params ->
+                logEpubHighlightFlow("bridge_received method=readerHighlightCreated params=\"${params.logPreview(900)}\"")
+                val highlight = EpubAnnotationSerializer.parseHighlightJsonLenient(params)
                 if (highlight == null) {
-                    logEpubSelectionDebug("highlight_parse_failed params=${message.params.logPreview(900)}")
+                    logEpubHighlightFlow("bridge_parse_failed method=readerHighlightCreated")
+                    logEpubSelectionDebug("highlight_parse_failed params=${params.logPreview(900)}")
                 } else {
+                    logEpubHighlightFlow(
+                        "bridge_parse_success id=${highlight.id} color=${highlight.color.id} " +
+                            "chapter=${highlight.chapterIndex} offsets=${highlight.locator.startOffset}..${highlight.locator.endOffset} " +
+                            "page=${highlight.locator.pageIndex} textChars=${highlight.text.length} cfi=\"${highlight.cfi.logPreview()}\""
+                    )
+                    logDesktopHighlightMap(
+                        "bridge_highlight_created id=${highlight.id} color=${highlight.color.id} " +
+                            "chapter=${highlight.chapterIndex} locatorChapter=${highlight.locator.chapterIndex} " +
+                            "page=${highlight.locator.pageIndex} offsets=${highlight.locator.startOffset}..${highlight.locator.endOffset} " +
+                            "block=${highlight.locator.blockIndex} char=${highlight.locator.charOffset} " +
+                            "chapterId=${highlight.locator.chapterId.orEmpty().logPreview()} href=${highlight.locator.href.orEmpty().logPreview()} " +
+                            "textChars=${highlight.text.length} cfi=\"${highlight.cfi.logPreview()}\""
+                    )
                     scope.launch { latestOnHighlightCreated(highlight) }
                 }
             },
-            desktopEpubBridgeHandler("readerHighlightClicked") { message ->
-                message.params.readerHighlightClickOrNull()?.let { highlightClick ->
+            DesktopEpubBridgeHandler("readerHighlightClicked") { params ->
+                params.readerHighlightClickOrNull()?.let { highlightClick ->
                     scope.launch { latestOnHighlightSelected(highlightClick.highlightId) }
                 }
             },
-            desktopEpubBridgeHandler("readerPositionChanged") { message ->
-                message.params.readerPositionOrNull()?.let { position ->
+            DesktopEpubBridgeHandler("readerPositionChanged") { params ->
+                params.readerPositionOrNull()?.let { position ->
+                    logDesktopPositionTrace(
+                        "event=bridge_position_changed page=${position.pageIndex} " +
+                            "locator=${position.locator.desktopPositionTraceSummary()}"
+                    )
+                    logDesktopHighlightMap(
+                        "bridge_position_changed page=${position.pageIndex} chapter=${position.locator?.chapterIndex} " +
+                            "offsets=${position.locator?.startOffset}..${position.locator?.endOffset} " +
+                            "block=${position.locator?.blockIndex} char=${position.locator?.charOffset} " +
+                            "chapterId=${position.locator?.chapterId.orEmpty().logPreview()} href=${position.locator?.href.orEmpty().logPreview()} " +
+                            "text=\"${position.locator?.textQuote.orEmpty().logPreview(120)}\" " +
+                            "cfi=\"${position.locator?.cfi.orEmpty().logPreview(160)}\""
+                    )
+                    logDesktopTtsStartTrace {
+                        "event=bridge_position_changed page=${position.pageIndex} " +
+                            "locator=${position.locator.desktopPositionTraceSummary(160)}"
+                    }
                     scope.launch { latestOnVisiblePageChanged(position.pageIndex, position.locator) }
                 }
             },
-            desktopEpubBridgeHandler("readerSelectionAction") { message ->
-                val selectionAction = message.params.readerSelectionActionOrNull()
+            DesktopEpubBridgeHandler("readerDesktopPositionTraceLog") { params ->
+                logDesktopPositionTrace(params.readerSelectionDebugMessageOrNull() ?: params.logPreview(900))
+            },
+            DesktopEpubBridgeHandler("readerTtsStartTraceLog") { params ->
+                logDesktopTtsStartTrace { params.readerSelectionDebugMessageOrNull() ?: params.logPreview(900) }
+            },
+            DesktopEpubBridgeHandler("readerSelectionAction") { params ->
+                val selectionAction = params.readerSelectionActionOrNull()
                 if (selectionAction != null) {
-                    scope.launch { latestOnSelectionAction(selectionAction.action, selectionAction.text) }
+                    scope.launch { latestOnSelectionAction(selectionAction) }
                 }
             },
-            desktopEpubBridgeHandler("readerKeyNavigation") { message ->
-                message.params.readerKeyNavigationOrNull()?.let { action ->
+            DesktopEpubBridgeHandler("readerKeyNavigation") { params ->
+                params.readerKeyNavigationOrNull()?.let { action ->
                     scope.launch { latestOnKeyboardNavigation(action) }
                 }
             },
-            desktopEpubBridgeHandler("readerPointerActivity") { _ ->
+            DesktopEpubBridgeHandler("readerPointerActivity") {
                 scope.launch { latestOnPointerActivity() }
             },
-            desktopEpubBridgeHandler("readerTtsHighlightLog") { message ->
-                logDesktopTts("epub_highlight_js ${message.params.logPreview(500)}")
+            DesktopEpubBridgeHandler("readerTtsHighlightLog") { params ->
+                logDesktopTts("epub_highlight_js ${params.logPreview(500)}")
             },
-            desktopEpubBridgeHandler("readerSelectionDebugLog") { message ->
-                logEpubSelectionDebug(message.params.readerSelectionDebugMessageOrNull() ?: message.params.logPreview(900))
+            DesktopEpubBridgeHandler("readerSelectionDebugLog") { params ->
+                logEpubSelectionDebug(params.readerSelectionDebugMessageOrNull() ?: params.logPreview(900))
             },
-            desktopEpubBridgeHandler("readerPaginationLayoutLog") { message ->
-                logEpubPagination(message.params.readerPaginationLogMessageOrNull() ?: message.params.logPreview(900))
+            DesktopEpubBridgeHandler("readerHighlightFlowLog") { params ->
+                logEpubHighlightFlow(params.readerSelectionDebugMessageOrNull() ?: params.logPreview(900))
             },
-            desktopEpubBridgeHandler("readerGapLayoutLog") { message ->
-                logReaderGap(message.params.readerPaginationLogMessageOrNull() ?: message.params.logPreview(900))
+            DesktopEpubBridgeHandler("readerDesktopHighlightMapLog") { params ->
+                logDesktopHighlightMap(params.readerSelectionDebugMessageOrNull() ?: params.logPreview(900))
             },
-            desktopEpubBridgeHandler("readerLinkClicked") { message ->
-                logEpubLink("bridge_message params=\"${message.params.logPreview()}\"")
-                val link = message.params.readerLinkClickOrNull()
+            DesktopEpubBridgeHandler("readerPaginationLayoutLog") { params ->
+                logEpubPagination(params.readerPaginationLogMessageOrNull() ?: params.logPreview(900))
+            },
+            DesktopEpubBridgeHandler("readerGapLayoutLog") { params ->
+                logReaderGap(params.readerPaginationLogMessageOrNull() ?: params.logPreview(900))
+            },
+            DesktopEpubBridgeHandler("readerLinkClicked") { params ->
+                logEpubLink("bridge_message params=\"${params.logPreview()}\"")
+                val link = params.readerLinkClickOrNull()
                 if (link == null) {
                     logEpubLink("bridge_message_ignored reason=parse_failed")
                 } else {
@@ -146,214 +191,70 @@ internal fun DesktopEpubWebView(
                 }
             }
         )
-        handlers.forEach { bridge.register(it) }
-        onDispose {
-            handlers.forEach { bridge.unregister(it) }
-        }
-    }
-
-    val state = remember {
-        WebViewState(
-            WebContent.Data(
-                data = html,
-                baseUrl = null,
-                encoding = "utf-8",
-                mimeType = "text/html",
-                historyUrl = null
-            )
-        )
-    }
-
-    LaunchedEffect(html) {
-        navigator.loadHtml(
-            html = html,
-            baseUrl = null,
-            mimeType = "text/html",
-            encoding = "utf-8",
-            historyUrl = null
-        )
-    }
-
-    DisposableEffect(Unit) {
-        var lastActivityAt = 0L
-        var lastMouseX: Int? = null
-        var lastMouseY: Int? = null
-        val listener = AWTEventListener { event ->
-            val mouseEvent = event as? MouseEvent ?: return@AWTEventListener
-            if (
-                mouseEvent.id != MouseEvent.MOUSE_MOVED &&
-                mouseEvent.id != MouseEvent.MOUSE_DRAGGED &&
-                mouseEvent.id != MouseEvent.MOUSE_PRESSED &&
-                mouseEvent.id != MouseEvent.MOUSE_WHEEL
-            ) {
-                return@AWTEventListener
-            }
-            if (mouseEvent.id == MouseEvent.MOUSE_MOVED || mouseEvent.id == MouseEvent.MOUSE_DRAGGED) {
-                val screenX = mouseEvent.xOnScreen
-                val screenY = mouseEvent.yOnScreen
-                if (lastMouseX == screenX && lastMouseY == screenY) return@AWTEventListener
-                lastMouseX = screenX
-                lastMouseY = screenY
-            } else {
-                lastMouseX = mouseEvent.xOnScreen
-                lastMouseY = mouseEvent.yOnScreen
-            }
-            val now = mouseEvent.`when`.takeIf { it > 0L } ?: System.currentTimeMillis()
-            if (now - lastActivityAt < 120L) return@AWTEventListener
-            lastActivityAt = now
-            scope.launch { latestOnPointerActivity() }
-        }
-        val eventMask = AWTEvent.MOUSE_MOTION_EVENT_MASK or
-            AWTEvent.MOUSE_EVENT_MASK or
-            AWTEvent.MOUSE_WHEEL_EVENT_MASK
-        Toolkit.getDefaultToolkit().addAWTEventListener(listener, eventMask)
-        onDispose {
-            Toolkit.getDefaultToolkit().removeAWTEventListener(listener)
-        }
-    }
-
-    Box(modifier = modifier) {
-        WebView(
-            state = state,
-            modifier = Modifier.fillMaxSize(),
-            captureBackPresses = false,
-            navigator = navigator,
-            webViewJsBridge = bridge
-        )
-
-        LaunchedEffect(state.loadingState) {
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            navigator.evaluateJavaScript(DesktopEpubKeyNavigationScript)
-        }
-
-        LaunchedEffect(isFullscreen, state.loadingState) {
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            navigator.evaluateJavaScript("window.readerDesktopFullscreen = ${if (isFullscreen) "true" else "false"};")
-        }
-
-        LaunchedEffect(html, state.loadingState) {
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            navigator.evaluateJavaScript("window.readerPaginationLayoutLog && window.readerPaginationLayoutLog('desktop_finished');")
-        }
-
-        LaunchedEffect(appearanceScript, state.loadingState) {
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            navigator.evaluateJavaScript(appearanceScript)
-        }
-
-        LaunchedEffect(
-            navigationTarget.autoScroll,
-            navigationTarget.readingMode,
-            state.loadingState
-        ) {
-            if (navigationTarget.readingMode != ReaderReadingMode.VERTICAL) return@LaunchedEffect
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            val autoScroll = navigationTarget.autoScroll.sanitized()
-            val command = if (autoScroll.enabled) {
-                "window.readerAutoScroll && window.readerAutoScroll.start(${autoScroll.speed});"
-            } else {
-                "window.readerAutoScroll && window.readerAutoScroll.stop();"
-            }
-            navigator.evaluateJavaScript(command)
-        }
-
-        LaunchedEffect(
-            navigationTarget.requestId,
-            navigationTarget.readingMode,
-            state.loadingState
-        ) {
-            if (navigationTarget.readingMode != ReaderReadingMode.VERTICAL) return@LaunchedEffect
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            val locator = navigationTarget.locator ?: return@LaunchedEffect
-            navigator.evaluateJavaScript("window.readerScrollToLocator && window.readerScrollToLocator(${locator.toReaderLocatorJson()});")
-        }
-
-        LaunchedEffect(
-            navigationTarget.ttsRequestId,
-            navigationTarget.ttsLocator,
-            navigationTarget.readingMode,
-            state.loadingState
-        ) {
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            val locator = navigationTarget.ttsLocator
-            val command = if (locator == null) {
-                logDesktopTts(
-                    "epub_highlight_command clear mode=${navigationTarget.readingMode} request=${navigationTarget.ttsRequestId}"
-                )
-                "window.readerSetTtsLocator && window.readerSetTtsLocator(null, false);"
-            } else {
-                val follow = navigationTarget.readingMode == ReaderReadingMode.VERTICAL
-                logDesktopTts(
-                    "epub_highlight_command set mode=${navigationTarget.readingMode} request=${navigationTarget.ttsRequestId} " +
-                        "follow=$follow chapter=${locator.chapterIndex} page=${locator.pageIndex} " +
-                        "offsets=${locator.startOffset}..${locator.endOffset} cfi=\"${locator.cfi.orEmpty().logPreview()}\" " +
-                        "text=\"${locator.textQuote.orEmpty().logPreview()}\""
-                )
-                "window.readerSetTtsLocator && window.readerSetTtsLocator(${locator.toReaderLocatorJson()}, $follow);"
-            }
-            navigator.evaluateJavaScript(command)
-        }
-
-        LaunchedEffect(highlights, state.loadingState) {
-            if (!state.loadingState.isFinished()) return@LaunchedEffect
-            val highlightsJson = EpubAnnotationSerializer.highlightsToJson(highlights)
-            navigator.evaluateJavaScript("window.readerApplyHighlights && window.readerApplyHighlights($highlightsJson);")
-        }
-
-        val loadingState = state.loadingState
-        if (loadingState is LoadingState.Loading) {
-            LinearProgressIndicator(
-                progress = { loadingState.progress },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
     }
 }
 
-private fun desktopEpubBridgeHandler(
-    methodName: String,
-    onMessage: (JsMessage) -> Unit
-): IJsMessageHandler {
-    return object : IJsMessageHandler {
-        override fun methodName(): String = methodName
-
-        override fun handle(
-            message: JsMessage,
-            navigator: WebViewNavigator?,
-            callback: (String) -> Unit
-        ) {
-            onMessage(message)
-        }
-    }
-}
-
-private fun LoadingState.isFinished(): Boolean = this is LoadingState.Finished
-
-private val DesktopEpubKeyNavigationScript = """
+internal val DesktopEpubKeyNavigationScript = """
     (function () {
-      if (!window.readerDesktopPointerActivityInstalled) {
-        window.readerDesktopPointerActivityInstalled = true;
-        var lastPointerActivityAt = 0;
-        var lastPointerX = null;
-        var lastPointerY = null;
-        function notifyPointerActivity(event, requireMovement) {
-          if (requireMovement && event) {
-            var x = Math.round(event.screenX || event.clientX || 0);
-            var y = Math.round(event.screenY || event.clientY || 0);
-            if (lastPointerX === x && lastPointerY === y) return;
-            lastPointerX = x;
-            lastPointerY = y;
-          }
-          var now = Date.now();
-          if (now - lastPointerActivityAt < 120) return;
-          lastPointerActivityAt = now;
+      if (!window.readerDesktopChromeTapInstalled) {
+        window.readerDesktopChromeTapInstalled = true;
+        var chromeTapStart = null;
+        var lastChromeTapNotifiedAt = 0;
+        function notifyChromeTap() {
           if (!window.kmpJsBridge || !window.kmpJsBridge.callNative) return;
           window.kmpJsBridge.callNative('readerPointerActivity', '{}');
+          lastChromeTapNotifiedAt = Date.now();
         }
-        document.addEventListener('mousemove', function (event) { notifyPointerActivity(event, true); }, true);
-        document.addEventListener('pointermove', function (event) { notifyPointerActivity(event, true); }, true);
-        document.addEventListener('pointerdown', function (event) { notifyPointerActivity(event, false); }, true);
-        document.addEventListener('wheel', function (event) { notifyPointerActivity(event, false); }, true);
+        function chromeTapIgnored(target) {
+          if (!target || !target.closest) return false;
+          return !!target.closest(
+            'a[href], button, input, textarea, select, [contenteditable="true"], #reader-selection-menu, .reader-selection-handle'
+          );
+        }
+        function hasActiveReaderSelection() {
+          var selection = window.getSelection && window.getSelection();
+          return !!selection && selection.toString().trim().length > 0;
+        }
+        function beginChromeTap(event) {
+          if (event.button !== undefined && event.button !== 0) return;
+          if (chromeTapIgnored(event.target)) {
+            chromeTapStart = null;
+            return;
+          }
+          chromeTapStart = {
+            pointerId: event.pointerId,
+            x: event.clientX || 0,
+            y: event.clientY || 0,
+            at: Date.now()
+          };
+        }
+        function finishChromeTap(event) {
+          if (!chromeTapStart) return;
+          if (event.pointerId !== undefined && chromeTapStart.pointerId !== undefined && event.pointerId !== chromeTapStart.pointerId) return;
+          var dx = (event.clientX || 0) - chromeTapStart.x;
+          var dy = (event.clientY || 0) - chromeTapStart.y;
+          var elapsed = Date.now() - chromeTapStart.at;
+          chromeTapStart = null;
+          if ((dx * dx + dy * dy) > 64 || elapsed > 650) return;
+          if (chromeTapIgnored(event.target) || hasActiveReaderSelection()) return;
+          notifyChromeTap();
+        }
+        function maybeNotifyChromeTapFromClick(event) {
+          if (Date.now() - lastChromeTapNotifiedAt < 250) return;
+          if (chromeTapIgnored(event.target) || hasActiveReaderSelection()) return;
+          notifyChromeTap();
+        }
+        document.addEventListener('pointerdown', beginChromeTap, true);
+        document.addEventListener('pointerup', finishChromeTap, true);
+        document.addEventListener('pointercancel', function () { chromeTapStart = null; }, true);
+        document.addEventListener('click', function (event) {
+          if (window.PointerEvent) {
+            maybeNotifyChromeTapFromClick(event);
+            return;
+          }
+          beginChromeTap(event);
+          finishChromeTap(event);
+        }, true);
       }
       if (window.readerDesktopKeyNavigationInstalled) return;
       window.readerDesktopKeyNavigationInstalled = true;

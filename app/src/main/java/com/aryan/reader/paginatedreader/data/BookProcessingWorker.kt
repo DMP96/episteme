@@ -31,11 +31,14 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.sp
 import androidx.work.CoroutineWorker
 import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.aryan.reader.applyBookReplacementsToHtmlDocument
 import com.aryan.reader.epub.epubContentFilePath
 import com.aryan.reader.paginatedreader.CssParser
+import com.aryan.reader.paginatedreader.AndroidHtmlResourceResolver
 import com.aryan.reader.paginatedreader.FontFaceInfo
 import com.aryan.reader.paginatedreader.MathMLRenderer
 import com.aryan.reader.paginatedreader.OptimizedCssRules
@@ -43,9 +46,12 @@ import com.aryan.reader.paginatedreader.RenderResult
 import com.aryan.reader.paginatedreader.androidHtmlToSemanticBlocks
 import com.aryan.reader.paginatedreader.loadFontFamilies
 import com.aryan.reader.paginatedreader.semanticBlockModule
+import com.aryan.reader.shared.ReaderBookReplacementPreferencesJson
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
@@ -56,8 +62,8 @@ import kotlinx.serialization.protobuf.ProtoNumber
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.io.File
-import java.net.URLDecoder
 import kotlin.math.abs
+import kotlin.coroutines.coroutineContext
 
 @OptIn(ExperimentalSerializationApi::class)
 @Serializable
@@ -78,7 +84,10 @@ data class BookProcessingInput(
     @ProtoNumber(5) val density: Float,
     @ProtoNumber(6) val constraintsMaxWidth: Int,
     @ProtoNumber(7) val constraintsMaxHeight: Int,
-    @ProtoNumber(8) val fontFaces: List<FontFaceInfo> = emptyList()
+    @ProtoNumber(8) val fontFaces: List<FontFaceInfo> = emptyList(),
+    @ProtoNumber(9) val styleConfigHash: Int = 0,
+    @ProtoNumber(10) val bookReplacementPreferencesJson: String = "",
+    @ProtoNumber(11) val bookReplacementFileId: String = ""
 )
 
 @OptIn(ExperimentalSerializationApi::class)
@@ -94,6 +103,13 @@ class BookProcessingWorker(
         private const val KEY_INPUT_FILE_PATH = "inputFilePath"
         private const val KEY_ESTIMATED_TOTAL_PAGES = "estimatedTotalPages"
         private const val KEY_START_CHAPTER_INDEX = "startChapterIndex"
+
+        private fun uniqueWorkName(bookId: String): String = "process_$bookId"
+
+        fun cancelForBook(context: Context, bookId: String) {
+            WorkManager.getInstance(context).cancelUniqueWork(uniqueWorkName(bookId))
+            Timber.i("Cancelled stale background processing for book: $bookId")
+        }
 
         fun enqueue(
             context: Context,
@@ -121,11 +137,11 @@ class BookProcessingWorker(
                 .build()
 
             WorkManager.getInstance(context).enqueueUniqueWork(
-                "process_$bookId",
-                androidx.work.ExistingWorkPolicy.KEEP,
+                uniqueWorkName(bookId),
+                ExistingWorkPolicy.REPLACE,
                 workRequest
             )
-            Timber.i("Enqueued background processing for book: $bookId")
+            Timber.i("Enqueued latest background processing for book: $bookId config=${processingInput.styleConfigHash}")
         }
     }
 
@@ -137,7 +153,6 @@ class BookProcessingWorker(
         Timber.i("Starting pre-scan to calculate image dimensions...")
         for (chapter in chapters) {
             val document = Jsoup.parse(chapter.htmlContent)
-            val chapterParentPath = File(chapter.absPath).parent ?: ""
 
             // Find all image tags (both <img> and <svg><image>)
             document.select("img, image").forEach { element ->
@@ -145,14 +160,10 @@ class BookProcessingWorker(
                 val src = element.attr(srcAttr).ifBlank { element.attr("xlink:href") }
 
                 if (src.isNotBlank()) {
-                    val decodedSrc = try {
-                        URLDecoder.decode(src, "UTF-8")
-                    } catch (_: Exception) {
-                        src
-                    }
-
-                    val imageFile = File(File(extractionBasePath, chapterParentPath), decodedSrc).canonicalFile
-                    val imagePath = imageFile.absolutePath
+                    val imagePath = AndroidHtmlResourceResolver
+                        .resolvePath(chapter.absPath, extractionBasePath, src)
+                        ?: return@forEach
+                    val imageFile = File(imagePath)
 
                     // If not already cached, read dimensions from disk
                     if (imageFile.exists() && !dimensionsCache.containsKey(imagePath)) {
@@ -196,6 +207,9 @@ class BookProcessingWorker(
                 return@withContext Result.failure()
             }
             val input = proto.decodeFromByteArray<BookProcessingInput>(inputFile.readBytes())
+            val bookReplacementPreferences = ReaderBookReplacementPreferencesJson.decodeOrEmpty(
+                input.bookReplacementPreferencesJson,
+            )
             Timber.i("Worker decoded input. Number of chapters received: ${input.chapters.size}")
 
             // Worker now reconstructs everything it needs for a pure light-theme processing run.
@@ -240,11 +254,13 @@ class BookProcessingWorker(
             Timber.i("Worker processing with up to $numCores threads, prioritizing around chapter $startChapterIndex.")
 
             chaptersToProcess.chunked(numCores).forEach { chunk ->
+                coroutineContext.ensureActive()
                 Timber.d("Processing a chunk of ${chunk.size} chapters.")
                 val deferreds = chunk.map { (index, chapter) ->
                     async {
+                        coroutineContext.ensureActive()
                         Timber.d("Async task started for chapter index $index.")
-                        if (db.bookCacheDao().getProcessedChapter(bookId, index) == null) {
+                        if (db.bookCacheDao().getProcessedChapter(bookId, index, input.styleConfigHash) == null) {
                             Timber.d("[BG_PROC] Caching chapter $index: ${chapter.title}")
                             val htmlToParse = chapter.htmlContent.ifBlank {
                                 val backingFile = File(extractionBasePath, epubContentFilePath(chapter.htmlFilePath))
@@ -290,6 +306,12 @@ class BookProcessingWorker(
                                 }
                                 Timber.d("Chapter $index (Background Worker): Finished processing MathML. SVG cache has ${svgResults.size} items. Keys: ${svgResults.keys.joinToString()}")
                             }
+                            applyBookReplacementsToHtmlDocument(
+                                document = document,
+                                preferences = bookReplacementPreferences,
+                                fileId = input.bookReplacementFileId,
+                            )
+                            coroutineContext.ensureActive()
                             val processedHtml = document.outerHtml()
                             Timber.d("Chapter $index (Background Worker): Processed HTML contains <math-placeholder>: ${processedHtml.contains("math-placeholder")}")
 
@@ -306,12 +328,14 @@ class BookProcessingWorker(
                                 imageDimensionsCache = imageDimensionsCache,
                                 mathSvgCache = svgResults
                             )
+                            coroutineContext.ensureActive()
                             val protoBytes = proto.encodeToByteArray(semanticBlocks)
                             ProcessedChapter(
                                 bookId = bookId,
                                 chapterIndex = index,
                                 contentBlocksProto = protoBytes,
-                                estimatedPageCount = estimateSemanticPageCount(semanticBlocks)
+                                estimatedPageCount = estimateSemanticPageCount(semanticBlocks),
+                                styleConfigHash = input.styleConfigHash
                             )
                         } else {
                             Timber.d("Chapter $index was already in the database. Skipping.")
@@ -341,6 +365,9 @@ class BookProcessingWorker(
             Timber.i("[BG_PROC] Finished processing all chapters for book $bookId.")
 
             return@withContext Result.success()
+        } catch (e: CancellationException) {
+            Timber.i("Background processing cancelled for book $bookId")
+            throw e
         } catch (e: Exception) {
             Timber.e(e, "Error in pagination worker for book $bookId")
             return@withContext Result.failure()

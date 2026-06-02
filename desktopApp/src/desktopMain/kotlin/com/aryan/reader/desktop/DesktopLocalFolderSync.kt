@@ -24,6 +24,7 @@ import com.aryan.reader.shared.pdf.SharedPdfAnnotationSidecarCodec
 import com.aryan.reader.shared.pdf.SharedPdfRichTextLog
 import com.aryan.reader.shared.pdf.SharedPdfRichTextSerializer
 import com.aryan.reader.shared.toSharedFolderBookMetadata
+import com.aryan.reader.shared.toStablePositionCfi
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -46,7 +47,8 @@ data class DesktopLocalFolderSyncResult(
     val metadataStats: DesktopFolderMetadataExtractionStats = DesktopFolderMetadataExtractionStats(),
     val idMigrations: Map<String, String> = emptyMap(),
     val removedBookIds: Set<String> = emptySet(),
-    val failedFolders: List<String> = emptyList()
+    val failedFolders: List<String> = emptyList(),
+    val processedFolderUris: List<String> = emptyList()
 )
 
 object DesktopLocalFolderSync {
@@ -56,10 +58,18 @@ object DesktopLocalFolderSync {
         if (!folder.isDirectory) return false
         return folder.walkTopDown()
             .onEnter { it == folder || it.shouldEnterSyncedFolder() }
+            .onFail { file, error ->
+                logDesktopFolderSync(
+                    "folder.supportedFiles.skipInaccessible path=\"${file.absolutePath.folderSyncPreview()}\" " +
+                        "error=${error.folderSyncSummary()}"
+                )
+            }
             .any { file ->
-                file.isFile &&
-                    file.shouldSyncBookFile() &&
-                    SharedFileCapabilities.fileTypeForName(file.name) in desktopSyncableTypes
+                runCatching {
+                    file.isFile &&
+                        file.shouldSyncBookFile() &&
+                        SharedFileCapabilities.fileTypeForName(file.name) in desktopSyncableTypes
+                }.getOrDefault(false)
             }
     }
 
@@ -68,9 +78,11 @@ object DesktopLocalFolderSync {
         shelfRefs: List<BookShelfRef>,
         targetFolder: File? = null,
         nowMillis: Long = System.currentTimeMillis(),
-        metadataOnly: Boolean = false
+        metadataOnly: Boolean = false,
+        extractMetadata: Boolean = true
     ): DesktopLocalFolderSyncResult {
         val requestedFolders = foldersToSync(state, targetFolder, nowMillis)
+            .filter { it.localSyncEnabled }
         val mode = if (metadataOnly) "metadata" else "full"
         logDesktopFolderSync(
             "sync.start mode=$mode target=\"${targetFolder?.absolutePath?.folderSyncPreview() ?: "ALL"}\" " +
@@ -84,6 +96,7 @@ object DesktopLocalFolderSync {
         val allMigrations = linkedMapOf<String, String>()
         val allRemovedBookIds = linkedSetOf<String>()
         val failedFolders = mutableListOf<String>()
+        val processedFolderUris = mutableListOf<String>()
 
         requestedFolders.forEach { folder ->
             val root = File(folder.uriString)
@@ -95,6 +108,7 @@ object DesktopLocalFolderSync {
                 failedFolders += folder.name
                 return@forEach
             }
+            processedFolderUris += folder.uriString
 
             logDesktopFolderSync(
                 "folder.start mode=$mode name=\"${folder.name.folderSyncPreview()}\" " +
@@ -138,8 +152,27 @@ object DesktopLocalFolderSync {
             logDesktopFolderSync(
                 "folder.sidecars.importCheck mode=$mode name=\"${folder.name.folderSyncPreview()}\" books=${syncedBooks.size}"
             )
-            importAnnotationSidecars(root, syncedBooks)
-            if (!metadataOnly) {
+            runCatching {
+                importAnnotationSidecars(root, syncedBooks)
+            }.onFailure { error ->
+                logDesktopFolderSync(
+                    "annotation.import.failed mode=$mode name=\"${folder.name.folderSyncPreview()}\" " +
+                        "root=\"${root.absolutePath.folderSyncPreview()}\" error=${error.folderSyncSummary()}"
+                )
+            }
+            syncedBooks.forEach { book ->
+                remoteMetadata[book.id]?.let { metadata ->
+                    runCatching {
+                        importDesktopPdfBookmarksMetadata(book, metadata.bookmarksJson, metadata.lastModifiedTimestamp)
+                    }.onFailure { error ->
+                        logDesktopFolderSync(
+                            "metadata.bookmarks.importFailed book=${book.id} " +
+                                "error=${error.folderSyncSummary()}"
+                        )
+                    }
+                }
+            }
+            if (!metadataOnly && extractMetadata) {
                 val metadataResult = DesktopFolderMetadataExtractor.enrichFolderBooks(
                     books = nextState.rawLibraryBooks,
                     sourceFolder = folder.uriString
@@ -173,7 +206,8 @@ object DesktopLocalFolderSync {
             metadataStats = totalMetadataStats,
             idMigrations = allMigrations,
             removedBookIds = allRemovedBookIds,
-            failedFolders = failedFolders
+            failedFolders = failedFolders,
+            processedFolderUris = processedFolderUris
         )
         logDesktopFolderSync(
             "sync.done mode=$mode failed=${failedFolders.size} new=${totalStats.newBooks} " +
@@ -188,8 +222,13 @@ object DesktopLocalFolderSync {
         savePdfAnnotationSidecar(book)
     }
 
+    fun deleteSyncDataFolder(root: File): Boolean {
+        val syncDir = File(root, LOCAL_FOLDER_SYNC_DATA_DIR)
+        return !syncDir.exists() || syncDir.isDirectory && syncDir.deleteRecursively()
+    }
+
     fun saveBookMetadata(book: BookItem) {
-        val metadata = book.toSharedFolderBookMetadata()
+        val metadata = book.toDesktopFolderBookMetadata()
         if (metadata == null) {
             logDesktopFolderSync(
                 "metadata.export.skipClean book=${book.id} title=\"${book.title.orEmpty().folderSyncPreview()}\" " +
@@ -242,11 +281,9 @@ object DesktopLocalFolderSync {
         val data = buildMap {
             if (annotationFile.isFile) {
                 val annotationJson = annotationFile.readText().trim()
-                val annotations = SharedPdfAnnotationSerializer.decode(annotationJson)
-                put(
-                    SharedPdfAnnotationSidecarCodec.KEY_PDF_ANNOTATIONS,
-                    SharedPdfAnnotationSidecarCodec.encodeAnnotationsElement(annotations)
-                )
+                desktopPdfAnnotationElementForSync(annotationJson)?.let { annotations ->
+                    put(SharedPdfAnnotationSidecarCodec.KEY_PDF_ANNOTATIONS, annotations)
+                }
             }
             if (bookmarkFile.isFile) {
                 val bookmarksJson = bookmarkFile.readText().trim()
@@ -267,7 +304,7 @@ object DesktopLocalFolderSync {
                             "file=\"${richTextFile.absolutePath.richSyncPreview()}\" rawLen=${richTextJson.length} " +
                             "textLen=${richTextDocument.text.length} spans=${richTextDocument.spans.size}"
                     )
-                    put("text", SharedPdfRichTextSerializer.encodeElement(richTextDocument))
+                    desktopPdfRichTextElementForSync(richTextJson)?.let { put("text", it) }
                 }
             }
         }
@@ -279,9 +316,9 @@ object DesktopLocalFolderSync {
             return
         }
         val timestamp = maxOf(
-            annotationFile.lastModifiedIfFile(),
+            annotationFile.lastModifiedIfSyncableAnnotations(),
             bookmarkFile.lastModifiedIfFile(),
-            richTextFile.lastModifiedIfFile(),
+            richTextFile.lastModifiedIfSyncableRichText(),
             System.currentTimeMillis()
         )
         val dataJson = desktopFolderSyncJson.encodeToString(
@@ -329,7 +366,15 @@ object DesktopLocalFolderSync {
         val rootPath = root.toPath().toAbsolutePath().normalize()
         return root.walkTopDown()
             .onEnter { it == root || it.shouldEnterSyncedFolder() }
-            .filter { it.isFile && it.shouldSyncBookFile() }
+            .onFail { file, error ->
+                logDesktopFolderSync(
+                    "folder.scan.skipInaccessible root=\"${root.absolutePath.folderSyncPreview()}\" " +
+                        "path=\"${file.absolutePath.folderSyncPreview()}\" error=${error.folderSyncSummary()}"
+                )
+            }
+            .filter { file ->
+                runCatching { file.isFile && file.shouldSyncBookFile() }.getOrDefault(false)
+            }
             .mapNotNull { file ->
                 val type = SharedFileCapabilities.fileTypeForName(file.name)
                     .takeIf { it in desktopSyncableTypes }
@@ -344,8 +389,8 @@ object DesktopLocalFolderSync {
                     sourceFolder = sourceFolder,
                     relativePath = relativePath,
                     type = type,
-                    size = file.length(),
-                    lastModified = file.lastModified()
+                    size = runCatching { file.length() }.getOrDefault(0L),
+                    lastModified = runCatching { file.lastModified() }.getOrDefault(0L)
                 )
             }
             .toList()
@@ -559,13 +604,18 @@ object DesktopLocalFolderSync {
             }
             if (sidecar.data.hasPdfAnnotationPayload()) {
                 val annotations = SharedPdfAnnotationSidecarCodec.annotationsFromData(sidecar.data)
-                annotationFile.parentFile?.mkdirs()
-                annotationFile.writeText(SharedPdfAnnotationSerializer.encode(annotations))
-                annotationFile.setLastModified(sidecar.timestamp)
-                logDesktopFolderSync(
-                    "annotation.import.writeAnnotations book=${book.id} count=${annotations.size} " +
-                        "file=\"${annotationFile.absolutePath.folderSyncPreview()}\""
-                )
+                if (annotations.isEmpty()) {
+                    if (annotationFile.isFile) annotationFile.delete()
+                    logDesktopFolderSync("annotation.import.deleteEmptyAnnotations book=${book.id}")
+                } else {
+                    annotationFile.parentFile?.mkdirs()
+                    annotationFile.writeText(SharedPdfAnnotationSerializer.encode(annotations))
+                    annotationFile.setLastModified(sidecar.timestamp)
+                    logDesktopFolderSync(
+                        "annotation.import.writeAnnotations book=${book.id} count=${annotations.size} " +
+                            "file=\"${annotationFile.absolutePath.folderSyncPreview()}\""
+                    )
+                }
             }
             sidecar.data["bookmarks"]?.let { bookmarks ->
                 bookmarkFile.parentFile?.mkdirs()
@@ -582,13 +632,18 @@ object DesktopLocalFolderSync {
                         "textLen=${richDocument.text.length} spans=${richDocument.spans.size} " +
                         "file=\"${richTextFile.absolutePath.richSyncPreview()}\""
                 )
-                richTextFile.parentFile?.mkdirs()
-                richTextFile.writeText(SharedPdfRichTextSerializer.encode(richDocument))
-                richTextFile.setLastModified(sidecar.timestamp)
-                logDesktopFolderSync(
-                    "annotation.import.writeText book=${book.id} textLen=${richDocument.text.length} " +
-                        "spans=${richDocument.spans.size} file=\"${richTextFile.absolutePath.folderSyncPreview()}\""
-                )
+                if (richDocument.text.isEmpty() && richDocument.spans.isEmpty()) {
+                    if (richTextFile.isFile) richTextFile.delete()
+                    logDesktopFolderSync("annotation.import.deleteEmptyText book=${book.id}")
+                } else {
+                    richTextFile.parentFile?.mkdirs()
+                    richTextFile.writeText(SharedPdfRichTextSerializer.encode(richDocument))
+                    richTextFile.setLastModified(sidecar.timestamp)
+                    logDesktopFolderSync(
+                        "annotation.import.writeText book=${book.id} textLen=${richDocument.text.length} " +
+                            "spans=${richDocument.spans.size} file=\"${richTextFile.absolutePath.folderSyncPreview()}\""
+                    )
+                }
             }
         }
     }
@@ -812,6 +867,56 @@ private fun File.canonicalOrAbsolute(): File {
 
 private fun File.lastModifiedIfFile(): Long {
     return if (isFile) lastModified() else 0L
+}
+
+private fun File.hasSyncablePdfAnnotations(): Boolean {
+    return isFile && desktopPdfAnnotationElementForSync(readText()) != null
+}
+
+private fun File.lastModifiedIfSyncableAnnotations(): Long {
+    return if (hasSyncablePdfAnnotations()) lastModified() else 0L
+}
+
+private fun File.hasSyncablePdfRichText(): Boolean {
+    return isFile && desktopPdfRichTextElementForSync(readText()) != null
+}
+
+private fun File.lastModifiedIfSyncableRichText(): Long {
+    return if (hasSyncablePdfRichText()) lastModified() else 0L
+}
+
+private fun BookItem.toDesktopFolderBookMetadata(): SharedFolderBookMetadata? {
+    val base = toSharedFolderBookMetadata()
+    val pdfBookmarksJson = desktopPdfBookmarksMetadataJson(this)
+    if (base == null && pdfBookmarksJson == null) return null
+
+    val timestamp = maxOf(
+        base?.lastModifiedTimestamp ?: 0L,
+        desktopPdfBookmarkMetadataTimestamp(this),
+        this.timestamp
+    )
+
+    return (base ?: SharedFolderBookMetadata(
+        bookId = id,
+        title = null,
+        author = null,
+        displayName = displayName,
+        type = type.name,
+        lastChapterIndex = readerPosition?.chapterIndex,
+        lastPage = readerPosition?.pageIndex ?: lastPageIndex,
+        lastPositionCfi = readerPosition?.toStablePositionCfi(),
+        progressPercentage = progressPercentage ?: 0f,
+        isRecent = isRecent,
+        lastModifiedTimestamp = timestamp,
+        bookmarksJson = null,
+        locatorBlockIndex = readerPosition?.blockIndex,
+        locatorCharOffset = readerPosition?.charOffset,
+        customName = null,
+        highlightsJson = null
+    )).copy(
+        lastModifiedTimestamp = timestamp,
+        bookmarksJson = pdfBookmarksJson ?: base?.bookmarksJson
+    )
 }
 
 private fun uniqueFolderSyncTempName(baseName: String): String {

@@ -74,6 +74,7 @@ data class ReaderSettings(
     val pageInfoMode: PageInfoMode = PageInfoMode.DEFAULT,
     val pageInfoPosition: PageInfoPosition = PageInfoPosition.BOTTOM,
     val pageSpreadMode: ReaderPageSpreadMode = ReaderPageSpreadMode.SINGLE,
+    val rightToLeftPagination: Boolean = false,
     val pdfVerticalPageGapVisible: Boolean = true,
     val pdfPageNumberOverlayVisible: Boolean = true,
     val pdfFirstPageStandaloneInSpread: Boolean = false,
@@ -173,7 +174,7 @@ data class PaginatedReaderState(
     val canGoNext: Boolean get() = ReaderSpreadLayout.canGoNext(currentPageIndex, pages.size, settings)
     val currentSpreadStartIndex: Int get() = ReaderSpreadLayout.normalizePageIndex(currentPageIndex, pages.size, settings)
     val visiblePages: List<ReaderPage>
-        get() = ReaderSpreadLayout.visiblePageIndices(currentPageIndex, pages.size, settings)
+        get() = ReaderSpreadLayout.visiblePageIndicesForDisplay(currentPageIndex, pages.size, settings)
             .mapNotNull { pages.getOrNull(it) }
 }
 
@@ -218,6 +219,11 @@ object ReaderSpreadLayout {
         }
     }
 
+    fun visiblePageIndicesForDisplay(pageIndex: Int, pageCount: Int, settings: ReaderSettings): List<Int> {
+        val indices = visiblePageIndices(pageIndex, pageCount, settings)
+        return if (settings.isRightToLeftPaginationEnabled()) indices.asReversed() else indices
+    }
+
     fun pageRangeLabel(pageIndex: Int, pageCount: Int, settings: ReaderSettings): String {
         val total = pageCount.coerceAtLeast(1)
         val pages = visiblePageIndices(pageIndex, total, settings).ifEmpty { listOf(0) }.sorted()
@@ -259,4 +265,8 @@ object ReaderSpreadLayout {
 fun ReaderSettings.isTwoPageSpreadEnabled(): Boolean {
     return readingMode == ReaderReadingMode.PAGINATED && 
         (pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE || pageSpreadMode == ReaderPageSpreadMode.TWO_PAGE_ADAPTIVE)
+}
+
+fun ReaderSettings.isRightToLeftPaginationEnabled(): Boolean {
+    return readingMode == ReaderReadingMode.PAGINATED && rightToLeftPagination
 }

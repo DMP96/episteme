@@ -89,6 +89,9 @@ fun SharedReaderScreenState.reduce(action: AppAction): SharedReaderScreenState {
                 appSeedColor = if (shouldClearSeed) null else appSeedColor
             )
         }
+        is AppAction.CustomReaderThemesChanged -> copy(
+            customReaderThemes = action.themes.sanitizeCustomReaderThemes()
+        )
         is AppAction.SyncEnabledChanged -> copy(isSyncEnabled = action.enabled)
         is AppAction.FolderSyncEnabledChanged -> copy(isFolderSyncEnabled = action.enabled)
         is AppAction.TabsEnabledChanged -> copy(
@@ -101,9 +104,11 @@ fun SharedReaderScreenState.reduce(action: AppAction): SharedReaderScreenState {
             if (bookId.isBlank()) {
                 this
             } else {
+                val currentTabIds = openTabIds.distinct()
+                val nextTabIds = if (bookId in currentTabIds) currentTabIds else currentTabIds + bookId
                 copy(
                     isTabsEnabled = true,
-                    openTabIds = (openTabIds - bookId) + bookId,
+                    openTabIds = nextTabIds,
                     activeTabBookId = bookId
                 )
             }

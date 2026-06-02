@@ -49,6 +49,35 @@ class ReaderExtrasModelsTest {
     }
 
     @Test
+    fun `reader ai one model setting matches Android model selection logic`() {
+        val oneModel = ReaderByokTextRequests.build(
+            settings = ReaderAiByokSettings(
+                geminiKey = "gemini_test",
+                groqKey = "gsk_test",
+                useOneModel = true,
+                modelForAll = "groq:qwen/qwen3-32b",
+                defineModel = "gemini:gemini-flash-lite-latest"
+            ),
+            feature = ReaderAiFeature.DEFINE,
+            text = "epistemic"
+        )
+        val perFeature = ReaderByokTextRequests.build(
+            settings = ReaderAiByokSettings(
+                geminiKey = "gemini_test",
+                groqKey = "gsk_test",
+                useOneModel = false,
+                modelForAll = "groq:qwen/qwen3-32b",
+                defineModel = "gemini:gemini-flash-lite-latest"
+            ),
+            feature = ReaderAiFeature.DEFINE,
+            text = "epistemic"
+        )
+
+        assertEquals("groq:qwen/qwen3-32b", assertIs<ReaderByokTextRequestResult.Ready>(oneModel).request.model.id)
+        assertEquals("gemini:gemini-flash-lite-latest", assertIs<ReaderByokTextRequestResult.Ready>(perFeature).request.model.id)
+    }
+
+    @Test
     fun `BYOK cloud tts is available only with gemini key and cloud tts model`() {
         assertFalse(ReaderAiByokSettings(geminiKey = "key").isCloudTtsAvailable)
         assertFalse(ReaderAiByokSettings(ttsModel = GEMINI_CLOUD_TTS_MODEL_ID).isCloudTtsAvailable)
@@ -110,6 +139,56 @@ class ReaderExtrasModelsTest {
         assertEquals("2 chunks, 2.0 KB", populated.currentVoiceLabel)
         assertFalse(empty.hasCurrentVoiceCachedAudio)
         assertTrue(populated.hasCurrentVoiceCachedAudio)
+    }
+
+    @Test
+    fun `cloud tts overlay is visible only for active reader playback`() {
+        assertFalse(readerCloudTtsControlsModel(ReaderCloudTtsState(isAvailable = true)).isVisible)
+        assertTrue(readerCloudTtsControlsModel(ReaderCloudTtsState(isLoading = true)).isVisible)
+        assertTrue(readerCloudTtsControlsModel(ReaderCloudTtsState(isPlaying = true)).isVisible)
+        assertTrue(readerCloudTtsControlsModel(ReaderCloudTtsState(isPaused = true)).isVisible)
+    }
+
+    @Test
+    fun `cloud tts overlay exposes chunk navigation only when a chunk can be skipped`() {
+        val chunks = List(3) { index ->
+            ReaderTtsChunk(
+                index = index,
+                pageIndex = index,
+                chapterIndex = 0,
+                chapterTitle = "Chapter",
+                text = "Part ${index + 1}.",
+                startOffset = index * 10,
+                endOffset = index * 10 + 7
+            )
+        }
+
+        val first = readerCloudTtsControlsModel(
+            ReaderCloudTtsState(
+                isPlaying = true,
+                progress = ReaderTtsProgress(chunks = chunks, currentChunkIndex = 0)
+            )
+        )
+        val middle = readerCloudTtsControlsModel(
+            ReaderCloudTtsState(
+                isPlaying = true,
+                progress = ReaderTtsProgress(chunks = chunks, currentChunkIndex = 1)
+            )
+        )
+        val loading = readerCloudTtsControlsModel(
+            ReaderCloudTtsState(
+                isLoading = true,
+                progress = ReaderTtsProgress(chunks = chunks, currentChunkIndex = 1)
+            )
+        )
+
+        assertFalse(first.canSkipPrevious)
+        assertTrue(first.canSkipNext)
+        assertTrue(first.canLocateCurrentChunk)
+        assertTrue(middle.canSkipPrevious)
+        assertTrue(middle.canSkipNext)
+        assertFalse(loading.canSkipPrevious)
+        assertFalse(loading.canSkipNext)
     }
 
     @Test
@@ -232,6 +311,142 @@ class ReaderExtrasModelsTest {
         assertEquals(visibleOffset, chunks.first().startOffset)
         assertTrue(chunks.first().text.startsWith("Second visible sentence."))
         assertFalse(chunks.any { it.text.startsWith("First hidden") })
+    }
+
+    @Test
+    fun `tts planner keeps synthetic desktop locators at android style chunk boundary`() {
+        val visibleLine = "Gilberte's either noticing or suffering by his peculations. Tears came to my eyes."
+        val source = "Hidden before this visual line. $visibleLine Later visible sentence."
+        val visibleStart = source.indexOf(visibleLine)
+        val book = SharedEpubBook(
+            id = "tts-desktop-line",
+            fileName = "tts-desktop-line.epub",
+            title = "TTS desktop line",
+            chapters = listOf(SharedEpubChapter("one", "One", source))
+        )
+        val page = ReaderPage(
+            pageIndex = 0,
+            chapterIndex = 0,
+            chapterTitle = "One",
+            text = source,
+            startOffset = 0,
+            endOffset = source.length
+        )
+        val session = ReaderSessionState(
+            reader = PaginatedReaderState(
+                book = book,
+                pages = listOf(page),
+                currentPageIndex = 0
+            ),
+            navigationLocator = ReaderLocator(
+                chapterIndex = 0,
+                pageIndex = 0,
+                startOffset = visibleStart,
+                endOffset = visibleStart,
+                textQuote = visibleLine,
+                cfi = "desktop:0:$visibleStart:$visibleStart"
+            )
+        )
+
+        val first = ReaderTtsPlanner.chunksFromCurrentLocation(session).first()
+
+        assertEquals(visibleStart, first.startOffset)
+        assertTrue(first.text.startsWith(visibleLine))
+        assertFalse(first.text.startsWith("Hidden before"))
+    }
+
+    @Test
+    fun `tts planner trims onward chunks with source offsets after sentence gaps`() {
+        val source = "First hidden sentence.\n\nSecond visible sentence starts on the top line."
+        val visibleOffset = source.indexOf("Second")
+        val book = SharedEpubBook(
+            id = "tts-visible-gap",
+            fileName = "tts-visible-gap.epub",
+            title = "TTS visible gap",
+            chapters = listOf(SharedEpubChapter("one", "One", source))
+        )
+        val session = ReaderEngine().createSession(book).copy(
+            navigationLocator = ReaderLocator(
+                chapterIndex = 0,
+                pageIndex = 0,
+                startOffset = visibleOffset,
+                endOffset = visibleOffset,
+                textQuote = "Second visible sentence starts on the top line."
+            )
+        )
+
+        val first = ReaderTtsPlanner.chunksFromCurrentLocation(session).first()
+
+        assertEquals(visibleOffset, first.startOffset)
+        assertTrue(first.text.startsWith("Second visible sentence starts"))
+        assertFalse(first.text.startsWith("cond visible"))
+    }
+
+    @Test
+    fun `tts planner matches android source cfi before slicing initial chunk`() {
+        val hidden = "Hidden block text that should never be trimmed into."
+        val visible = "Visible line starts here and should be spoken."
+        val visibleOffset = 20
+        val hiddenBlock = SemanticParagraph(
+            text = hidden,
+            spans = emptyList(),
+            style = CssStyle(),
+            elementId = null,
+            cfi = "/4/2",
+            startCharOffsetInSource = 0,
+            blockIndex = 0
+        )
+        val visibleBlock = SemanticParagraph(
+            text = visible,
+            spans = emptyList(),
+            style = CssStyle(),
+            elementId = null,
+            cfi = "/4/4",
+            startCharOffsetInSource = visibleOffset,
+            blockIndex = 1
+        )
+        val book = SharedEpubBook(
+            id = "tts-cfi-match",
+            fileName = "tts-cfi-match.epub",
+            title = "TTS CFI match",
+            chapters = listOf(
+                SharedEpubChapter(
+                    id = "one",
+                    title = "One",
+                    plainText = "$hidden\n$visible",
+                    semanticBlocks = listOf(hiddenBlock, visibleBlock)
+                )
+            )
+        )
+        val page = ReaderPage(
+            pageIndex = 0,
+            chapterIndex = 0,
+            chapterTitle = "One",
+            text = "$hidden\n$visible",
+            startOffset = 0,
+            endOffset = hidden.length + visible.length + visibleOffset
+        )
+        val session = ReaderSessionState(
+            reader = PaginatedReaderState(
+                book = book,
+                pages = listOf(page),
+                currentPageIndex = 0
+            ),
+            navigationLocator = ReaderLocator(
+                chapterIndex = 0,
+                pageIndex = 0,
+                startOffset = visibleOffset,
+                endOffset = visibleOffset,
+                textQuote = visible,
+                cfi = "/4/4:0"
+            )
+        )
+
+        val first = ReaderTtsPlanner.chunksFromCurrentLocation(session).first()
+
+        assertEquals("/4/4", first.sourceCfi)
+        assertTrue(first.text.startsWith("Visible line starts here"))
+        assertFalse(first.text.contains("Hidden block"))
     }
 
     @Test

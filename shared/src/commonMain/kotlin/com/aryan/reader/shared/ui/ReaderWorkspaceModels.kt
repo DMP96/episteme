@@ -39,7 +39,6 @@ enum class ReaderWorkspaceTopAction {
     APPEARANCE,
     READ_ALOUD,
     AI,
-    AUTO_SCROLL,
     TOOLS
 }
 
@@ -52,8 +51,46 @@ enum class ReaderWorkspaceBottomAction {
 data class ReaderWorkspaceChromeModel(
     val preferAutoHide: Boolean,
     val forceVisible: Boolean,
-    val forceVisibleReasons: Set<String> = emptySet()
+    val forceVisibleReasons: Set<String> = emptySet(),
+    val revealVisibleReasons: Set<String> = emptySet()
 )
+
+internal fun readerWorkspaceChromeVisible(
+    requestedVisible: Boolean,
+    lockedVisible: Boolean,
+    forcedVisible: Boolean
+): Boolean {
+    return lockedVisible || forcedVisible || requestedVisible
+}
+
+internal fun readerWorkspaceChromeVisibleAfterReaderTap(
+    requestedVisible: Boolean,
+    lockedVisible: Boolean,
+    forcedVisible: Boolean,
+    rightPanelClosedByTap: Boolean = false
+): Boolean {
+    return if (lockedVisible || forcedVisible || rightPanelClosedByTap) {
+        true
+    } else {
+        !requestedVisible
+    }
+}
+
+internal fun readerWorkspaceShouldCloseRightPanelAfterReaderTap(
+    rightPanelOpen: Boolean,
+    hasInspectorSections: Boolean,
+    closeRightPanelOnReaderTap: Boolean
+): Boolean {
+    return closeRightPanelOnReaderTap && rightPanelOpen && hasInspectorSections
+}
+
+internal fun readerWorkspaceLeftPanelVisible(
+    toggledOpen: Boolean,
+    chromeVisible: Boolean,
+    hasNavigationSections: Boolean
+): Boolean {
+    return toggledOpen && chromeVisible && hasNavigationSections
+}
 
 data class ReaderWorkspaceFileActionState(
     val canShare: Boolean = false,
@@ -94,7 +131,8 @@ fun epubReaderWorkspaceModel(
     extrasState: ReaderExtrasState,
     aiAvailable: Boolean,
     cloudTtsAvailable: Boolean = true,
-    externalLookupAvailable: Boolean = true
+    externalLookupAvailable: Boolean = true,
+    appThemeControlsAvailable: Boolean = false
 ): ReaderWorkspaceModel {
     val preferences = toolbarPreferences.sanitized()
     val leftSections = listOf(
@@ -104,16 +142,21 @@ fun epubReaderWorkspaceModel(
         ReaderWorkspaceLeftSection.IMAGES
     )
     val inspectorSections = buildList {
-        if (preferences.isVisible(ReaderTool.THEME) || preferences.isVisible(ReaderTool.FORMAT)) {
+        if (
+            appThemeControlsAvailable ||
+            preferences.isVisible(ReaderTool.THEME) ||
+            preferences.isVisible(ReaderTool.FORMAT) ||
+            preferences.isVisible(ReaderTool.VISUAL_OPTIONS) ||
+            preferences.isVisible(ReaderTool.READING_MODE)
+        ) {
             add(ReaderWorkspaceInspectorSection.APPEARANCE)
         }
-        if (preferences.isVisible(ReaderTool.READING_MODE)) {
-            add(ReaderWorkspaceInspectorSection.TOOLS)
-        }
         if (
-            (aiAvailable && preferences.isVisible(ReaderTool.AI_FEATURES)) ||
-            (cloudTtsAvailable && preferences.isVisible(ReaderTool.TTS_CONTROLS)) ||
-            preferences.isVisible(ReaderTool.AUTO_SCROLL)
+            (cloudTtsAvailable && (
+                preferences.isVisible(ReaderTool.TTS_CONTROLS) ||
+                    preferences.isVisible(ReaderTool.TTS_SETTINGS)
+                )) ||
+            preferences.isVisible(ReaderTool.TTS_REPLACEMENTS)
         ) {
             add(ReaderWorkspaceInspectorSection.AI_TTS)
         }
@@ -126,7 +169,6 @@ fun epubReaderWorkspaceModel(
         if (ReaderWorkspaceInspectorSection.APPEARANCE in inspectorSections) add(ReaderWorkspaceTopAction.APPEARANCE)
         if (cloudTtsAvailable && preferences.isVisible(ReaderTool.TTS_CONTROLS)) add(ReaderWorkspaceTopAction.READ_ALOUD)
         if (aiAvailable && preferences.isVisible(ReaderTool.AI_FEATURES)) add(ReaderWorkspaceTopAction.AI)
-        if (preferences.isVisible(ReaderTool.AUTO_SCROLL)) add(ReaderWorkspaceTopAction.AUTO_SCROLL)
         if (inspectorSections.isNotEmpty()) add(ReaderWorkspaceTopAction.TOOLS)
     }.distinct()
     val bottomActions = buildList {
@@ -149,7 +191,7 @@ fun epubReaderWorkspaceModel(
             richTextEditing = false,
             loading = false,
             errorMessage = null,
-            autoScroll = extrasState.autoScroll,
+            autoScroll = ReaderAutoScrollState(),
             ttsBusy = extrasState.cloudTts.isLoading || extrasState.cloudTts.isPlaying || extrasState.cloudTts.isPaused
         )
     )
@@ -211,7 +253,6 @@ fun pdfReaderWorkspaceModel(
         add(ReaderWorkspaceTopAction.APPEARANCE)
         if (cloudTtsAvailable) add(ReaderWorkspaceTopAction.READ_ALOUD)
         if (aiAvailable) add(ReaderWorkspaceTopAction.AI)
-        add(ReaderWorkspaceTopAction.AUTO_SCROLL)
         add(ReaderWorkspaceTopAction.TOOLS)
     }
     return ReaderWorkspaceModel(
@@ -234,7 +275,7 @@ fun pdfReaderWorkspaceModel(
             richTextEditing = richTextEditing,
             loading = loading,
             errorMessage = errorMessage,
-            autoScroll = extrasState.autoScroll,
+            autoScroll = ReaderAutoScrollState(),
             ttsBusy = extrasState.cloudTts.isLoading || extrasState.cloudTts.isPlaying || extrasState.cloudTts.isPaused
         )
     )
@@ -252,7 +293,7 @@ fun readerWorkspaceChromeModel(
     autoScroll: ReaderAutoScrollState,
     ttsBusy: Boolean
 ): ReaderWorkspaceChromeModel {
-    val reasons = buildSet {
+    val forceReasons = buildSet {
         if (searchActive) add("search")
         if (leftPanelOpen) add("left-panel")
         if (inspectorOpen) add("inspector")
@@ -261,11 +302,14 @@ fun readerWorkspaceChromeModel(
         if (loading) add("loading")
         if (!errorMessage.isNullOrBlank()) add("error")
         if (autoScroll.sanitized().enabled) add("auto-scroll")
+    }
+    val revealReasons = buildSet {
         if (ttsBusy) add("tts")
     }
     return ReaderWorkspaceChromeModel(
         preferAutoHide = preferAutoHide,
-        forceVisible = reasons.isNotEmpty(),
-        forceVisibleReasons = reasons
+        forceVisible = forceReasons.isNotEmpty(),
+        forceVisibleReasons = forceReasons,
+        revealVisibleReasons = revealReasons
     )
 }

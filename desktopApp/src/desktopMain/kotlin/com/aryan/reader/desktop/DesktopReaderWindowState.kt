@@ -1,19 +1,53 @@
 package com.aryan.reader.desktop
 
+import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.WindowPlacement
 import com.aryan.reader.shared.BookItem
 import com.aryan.reader.shared.ReaderCloudTtsState
 import com.aryan.reader.shared.ReaderExtrasState
 import com.aryan.reader.shared.RecapResult
 import com.aryan.reader.shared.SummarizationResult
+import com.aryan.reader.shared.reader.ReaderReadingMode
 import com.aryan.reader.shared.reader.ReaderSessionState
 import kotlinx.coroutines.Job
+
+internal const val DesktopReaderWindowDefaultWidthDp = 1120f
+internal const val DesktopReaderWindowDefaultHeightDp = 760f
+internal val DesktopReaderWindowDefaultSize = DpSize(
+    DesktopReaderWindowDefaultWidthDp.dp,
+    DesktopReaderWindowDefaultHeightDp.dp
+)
+
+internal fun DesktopWindowStateSnapshot.toReaderWindowPlacement(): WindowPlacement {
+    return when (placement) {
+        DesktopSavedWindowPlacement.FULLSCREEN -> WindowPlacement.Floating
+        else -> toWindowPlacement()
+    }
+}
+
+internal fun DesktopWindowStateSnapshot.toPersistableReaderWindowSnapshot(): DesktopWindowStateSnapshot? {
+    if (placement == DesktopSavedWindowPlacement.FULLSCREEN) return null
+    return sanitized()
+}
+
+internal fun shouldResetDesktopTextReaderWindowSurface(
+    previousMode: ReaderReadingMode,
+    currentMode: ReaderReadingMode,
+    usesNativeWebView: Boolean
+): Boolean {
+    return usesNativeWebView &&
+        previousMode == ReaderReadingMode.VERTICAL &&
+        currentMode == ReaderReadingMode.PAGINATED
+}
 
 internal data class DesktopReaderWindowState(
     val id: String,
     val opening: DesktopReaderOpening,
     val content: DesktopReaderWindowContent = DesktopReaderWindowContent.Opening,
     val focusRequestId: Long = 0L,
-    val fullscreen: Boolean = false
+    val fullscreen: Boolean = false,
+    val surfaceResetId: Long = 0L
 ) {
     val bookId: String
         get() = opening.bookId
@@ -57,7 +91,6 @@ internal sealed interface DesktopReaderWindowContent {
         val isSummaryLoading: Boolean = false,
         val isRecapLoading: Boolean = false,
         val recapProgressMessage: String? = null,
-        val showCloudTtsSettings: Boolean = false,
         val ttsJob: Job? = null
     ) : DesktopReaderWindowContent
 }

@@ -38,9 +38,18 @@ object ReaderHtmlDocumentBuilder {
         readerAiFeaturesEnabled: Boolean = true,
         cloudTtsEnabled: Boolean = true,
         externalLookupEnabled: Boolean = true,
-        textureDataUri: String? = null
+        textureDataUri: String? = null,
+        renderedChapterRange: IntRange? = null
     ): String {
-        val body = book.chapters.mapIndexed { index, chapter ->
+        val renderedChapterIndices = renderedChapterRange
+            ?.asSequence()
+            ?.filter { it in book.chapters.indices }
+            ?.distinct()
+            ?.toList()
+            ?.takeIf { it.isNotEmpty() }
+            ?: book.chapters.indices.toList()
+        val body = renderedChapterIndices.joinToString("\n") { index ->
+            val chapter = book.chapters[index]
             val chapterText = chapter.normalizedReaderText()
             val chapterHtml = chapter.toHtml(searchQuery, searchOptions)
                 .applyUserHighlights(
@@ -56,7 +65,7 @@ object ReaderHtmlDocumentBuilder {
               </div>
             </section>
             """.trimIndent()
-        }.joinToString("\n")
+        }
         return document(
             title = book.title,
             settings = settings,
@@ -133,6 +142,7 @@ object ReaderHtmlDocumentBuilder {
         textureDataUri: String? = null
     ): String {
         val appearance = settings.toDocumentAppearanceCss(textureDataUri)
+        val customFontCss = settings.readerCustomFontFaceCss()
         return """
             (function () {
               var root = document.documentElement;
@@ -144,6 +154,30 @@ object ReaderHtmlDocumentBuilder {
               root.style.setProperty('--reader-link-decoration', ${appearance.linkColors.decoration.toJsStringLiteral()});
               root.style.setProperty('--reader-link-bg', ${appearance.linkColors.background.toJsStringLiteral()});
               root.style.setProperty('--reader-highlight', ${appearance.highlight.toJsStringLiteral()});
+              root.style.setProperty('--reader-font-size', ${"${settings.fontSize}px".toJsStringLiteral()});
+              root.style.setProperty('--reader-line-height', ${settings.lineSpacing.toString().toJsStringLiteral()});
+              root.style.setProperty('--reader-page-width', ${"${settings.pageWidth}px".toJsStringLiteral()});
+              root.style.setProperty('--reader-margin', ${"${settings.margin}px".toJsStringLiteral()});
+              root.style.setProperty('--reader-margin-x', ${"${settings.resolvedHorizontalMargin}px".toJsStringLiteral()});
+              root.style.setProperty('--reader-margin-y', ${"${settings.resolvedVerticalMargin}px".toJsStringLiteral()});
+              root.style.setProperty('--reader-vertical-margin-y', ${"${settings.readerVerticalMarginY()}px".toJsStringLiteral()});
+              root.style.setProperty('--reader-vertical-page-width', 'max(0px, calc(100% - (var(--reader-margin-x) * 2)))');
+              root.style.setProperty('--reader-paragraph-spacing', ${settings.paragraphSpacing.toString().toJsStringLiteral()});
+              root.style.setProperty('--reader-image-scale', ${settings.readerImageScaleCss().toJsStringLiteral()});
+              root.style.setProperty('--reader-align', ${settings.readerTextAlignCss().toJsStringLiteral()});
+              root.style.setProperty('--reader-family', ${settings.readerFontFamilyCss().toJsStringLiteral()});
+              var customFontCss = ${customFontCss.toJsStringLiteral()};
+              var customFontStyle = document.getElementById('reader-custom-font-style');
+              if (customFontCss) {
+                if (!customFontStyle) {
+                  customFontStyle = document.createElement('style');
+                  customFontStyle.id = 'reader-custom-font-style';
+                  document.head.appendChild(customFontStyle);
+                }
+                customFontStyle.textContent = customFontCss;
+              } else if (customFontStyle && customFontStyle.parentNode) {
+                customFontStyle.parentNode.removeChild(customFontStyle);
+              }
               var textureStyle = document.getElementById('reader-texture-style');
               if (!textureStyle) {
                 textureStyle = document.createElement('style');
@@ -151,6 +185,28 @@ object ReaderHtmlDocumentBuilder {
                 document.head.appendChild(textureStyle);
               }
               textureStyle.textContent = ${appearance.textureOverlayCss.toJsStringLiteral()};
+            })();
+        """.trimIndent()
+    }
+
+    fun pageAnchorsUpdateScript(pages: List<ReaderPage>): String {
+        val pageAnchorJson = pages.toPageAnchorJson()
+        return """
+            (function () {
+              if (window.readerSetPageAnchors) {
+                window.readerSetPageAnchors($pageAnchorJson);
+              }
+            })();
+        """.trimIndent()
+    }
+
+    fun highlightPaletteUpdateScript(highlightPalette: ReaderHighlightPalette): String {
+        val highlightButtons = highlightPalette.toSelectionPaletteButtons()
+        return """
+            (function () {
+              var container = document.querySelector('#reader-selection-menu .reader-selection-colors');
+              if (!container) return;
+              container.innerHTML = ${highlightButtons.toJsStringLiteral()};
             })();
         """.trimIndent()
     }
@@ -210,29 +266,10 @@ object ReaderHtmlDocumentBuilder {
         textureDataUri: String?
     ): String {
         val appearance = settings.toDocumentAppearanceCss(textureDataUri)
-        val align = when (settings.textAlign) {
-            SharedReaderTextAlign.START -> "left"
-            SharedReaderTextAlign.RIGHT -> "right"
-            SharedReaderTextAlign.JUSTIFY -> "justify"
-            SharedReaderTextAlign.CENTER -> "center"
-        }
-        val customFontUrl = settings.customFontPath?.takeIf { it.isNotBlank() }?.toCssFontUrl()
-        val customFontCss = customFontUrl?.let {
-            "@font-face { font-family: 'ReaderCustomFont'; src: url('$it'); font-display: swap; }"
-        }.orEmpty()
-        val family = if (customFontUrl != null) {
-            "'ReaderCustomFont', Georgia, 'Times New Roman', serif"
-        } else {
-            when (settings.fontFamily) {
-                "Serif" -> "Georgia, 'Times New Roman', serif"
-                "Sans" -> "Inter, Segoe UI, Arial, sans-serif"
-                "Mono" -> "'Roboto Mono', Consolas, monospace"
-                else -> "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-            }
-        }
-        val highlightButtons = highlightPalette.sanitized().colors.joinToString("\n") { color ->
-            """<button type="button" class="reader-selection-color" data-action="highlight" data-color-id="${color.id}" title="Highlight ${color.id.escapeHtml()}" style="--selection-color:${color.color.toCssHex()}"><span></span></button>"""
-        }
+        val align = settings.readerTextAlignCss()
+        val customFontCss = settings.readerCustomFontFaceCss()
+        val family = settings.readerFontFamilyCss()
+        val highlightButtons = highlightPalette.toSelectionPaletteButtons()
         val defineButton = if (readerAiFeaturesEnabled) {
             readerSelectionActionButton("define", "Define", ReaderSelectionIconDefinePath)
         } else {
@@ -250,9 +287,10 @@ object ReaderHtmlDocumentBuilder {
         }
         val navigationAttributes = navigationLocator?.toNavigationAttributes().orEmpty()
         val pageAnchorJson = pageAnchors.toPageAnchorJson()
+        val verticalMarginY = settings.readerVerticalMarginY()
         return """
             <!doctype html>
-            <html>
+            <html class="${if (settings.readingMode == ReaderReadingMode.PAGINATED) "reader-paginated-root" else "reader-vertical-root"}">
             <head>
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -277,8 +315,11 @@ object ReaderHtmlDocumentBuilder {
                   --reader-margin: ${settings.margin}px;
                   --reader-margin-x: ${settings.resolvedHorizontalMargin}px;
                   --reader-margin-y: ${settings.resolvedVerticalMargin}px;
+                  --reader-vertical-margin-y: ${verticalMarginY}px;
+                  --reader-vertical-content-width: 92ch;
+                  --reader-vertical-page-width: max(0px, calc(100% - (var(--reader-margin-x) * 2)));
                   --reader-paragraph-spacing: ${settings.paragraphSpacing};
-                  --reader-image-scale: ${(settings.imageScale * 100f).roundToInt().coerceIn(50, 200)}%;
+                  --reader-image-scale: ${settings.readerImageScaleCss()};
                   --reader-align: $align;
                   --reader-family: $family;
                 }
@@ -293,6 +334,12 @@ object ReaderHtmlDocumentBuilder {
                 }
                 html {
                   scrollbar-color: var(--reader-scrollbar-thumb) var(--reader-scrollbar-track);
+                  scrollbar-width: thin;
+                }
+                html.reader-vertical-root {
+                  width: 100%;
+                  min-width: 0;
+                  overflow-y: scroll;
                   scrollbar-width: thin;
                 }
                 html::-webkit-scrollbar,
@@ -322,6 +369,14 @@ object ReaderHtmlDocumentBuilder {
                   position: relative;
                 }
                 body.reader-vertical {
+                  width: 100%;
+                  max-width: 100%;
+                  min-height: 100vh;
+                  min-height: 100dvh;
+                  min-width: 0;
+                  overflow-x: hidden;
+                  overflow-y: auto;
+                  padding: var(--reader-vertical-margin-y) 0;
                   scrollbar-gutter: stable;
                 }
                 body.reader-paginated {
@@ -334,6 +389,133 @@ object ReaderHtmlDocumentBuilder {
                   text-align: var(--reader-align);
                   position: relative;
                   z-index: 1;
+                }
+                body.reader-vertical .chapter {
+                  content-visibility: auto;
+                  contain-intrinsic-size: auto 1200px;
+                }
+                body.reader-vertical > .chapter,
+                body.reader-vertical > :not(.chapter):not(#reader-selection-menu):not(.reader-selection-handle):not(script):not(style),
+                body.reader-vertical > .chapter > :not(.reader-content),
+                body.reader-vertical > .chapter > .chapter-title,
+                body.reader-vertical > .chapter > .reader-content {
+                  box-sizing: border-box !important;
+                  min-width: 0 !important;
+                }
+                body.reader-vertical > .chapter {
+                  width: 100% !important;
+                  max-width: none !important;
+                  margin: 0 !important;
+                }
+                body.reader-vertical > :not(.chapter):not(#reader-selection-menu):not(.reader-selection-handle):not(script):not(style),
+                body.reader-vertical > .chapter > :not(.reader-content),
+                body.reader-vertical > .chapter > .chapter-title,
+                body.reader-vertical > .chapter > .reader-content {
+                  width: var(--reader-vertical-page-width) !important;
+                  max-width: none !important;
+                  margin-left: auto !important;
+                  margin-right: auto !important;
+                }
+                body.reader-vertical > :not(.chapter):not(#reader-selection-menu):not(.reader-selection-handle):not(script):not(style),
+                body.reader-vertical > .chapter > :not(.reader-content) {
+                  position: static !important;
+                  left: auto !important;
+                  right: auto !important;
+                  top: auto !important;
+                  bottom: auto !important;
+                  transform: none !important;
+                  float: none !important;
+                  clear: none !important;
+                }
+                body.reader-vertical .reader-content :where(h1, h2, h3, h4, h5, h6, hgroup, center, [class*="title" i], [id*="title" i], [class*="heading" i], [id*="heading" i], [class*="dedication" i], [id*="dedication" i]) {
+                  box-sizing: border-box !important;
+                  width: auto !important;
+                  max-width: 100% !important;
+                  min-width: 0 !important;
+                  margin-left: 0 !important;
+                  margin-right: 0 !important;
+                  padding-left: 0 !important;
+                  padding-right: 0 !important;
+                  text-indent: 0 !important;
+                  position: static !important;
+                  left: auto !important;
+                  right: auto !important;
+                  transform: none !important;
+                  float: none !important;
+                  clear: none !important;
+                }
+                body.reader-vertical .reader-content,
+                body.reader-vertical .reader-content p,
+                body.reader-vertical .reader-content li,
+                body.reader-vertical .reader-content div,
+                body.reader-vertical .reader-content h1,
+                body.reader-vertical .reader-content h2,
+                body.reader-vertical .reader-content h3,
+                body.reader-vertical .reader-content h4,
+                body.reader-vertical .reader-content h5,
+                body.reader-vertical .reader-content h6,
+                body.reader-vertical .reader-content blockquote {
+                  text-align: var(--reader-align) !important;
+                }
+                body.reader-vertical .reader-content p,
+                body.reader-vertical .reader-content div,
+                body.reader-vertical .reader-content h1,
+                body.reader-vertical .reader-content h2,
+                body.reader-vertical .reader-content h3,
+                body.reader-vertical .reader-content h4,
+                body.reader-vertical .reader-content h5,
+                body.reader-vertical .reader-content h6,
+                body.reader-vertical .reader-content blockquote,
+                body.reader-vertical .reader-content section,
+                body.reader-vertical .reader-content article,
+                body.reader-vertical .reader-content header,
+                body.reader-vertical .reader-content footer,
+                body.reader-vertical .reader-content aside,
+                body.reader-vertical .reader-content figure,
+                body.reader-vertical .reader-content table,
+                body.reader-vertical .reader-content pre {
+                  box-sizing: border-box !important;
+                  max-width: 100% !important;
+                  min-width: 0 !important;
+                  position: static !important;
+                  left: auto !important;
+                  right: auto !important;
+                  top: auto !important;
+                  bottom: auto !important;
+                  transform: none !important;
+                  float: none !important;
+                  clear: none !important;
+                }
+                body.reader-vertical .reader-content div,
+                body.reader-vertical .reader-content section,
+                body.reader-vertical .reader-content article,
+                body.reader-vertical .reader-content header,
+                body.reader-vertical .reader-content footer,
+                body.reader-vertical .reader-content aside,
+                body.reader-vertical .reader-content figure {
+                  width: auto !important;
+                  margin-left: 0 !important;
+                  margin-right: 0 !important;
+                }
+                body.reader-vertical .reader-content > p,
+                body.reader-vertical .reader-content > div,
+                body.reader-vertical .reader-content > h1,
+                body.reader-vertical .reader-content > h2,
+                body.reader-vertical .reader-content > h3,
+                body.reader-vertical .reader-content > h4,
+                body.reader-vertical .reader-content > h5,
+                body.reader-vertical .reader-content > h6,
+                body.reader-vertical .reader-content > blockquote,
+                body.reader-vertical .reader-content > section,
+                body.reader-vertical .reader-content > article,
+                body.reader-vertical .reader-content > header,
+                body.reader-vertical .reader-content > footer,
+                body.reader-vertical .reader-content > aside,
+                body.reader-vertical .reader-content > figure,
+                body.reader-vertical .reader-content > table,
+                body.reader-vertical .reader-content > pre {
+                  margin-left: 0 !important;
+                  margin-right: 0 !important;
                 }
                 body.reader-paginated .page {
                   box-sizing: border-box;
@@ -450,13 +632,21 @@ object ReaderHtmlDocumentBuilder {
                   overflow-x: auto;
                 }
                 #reader-selection-menu .reader-selection-color {
-                  width: 24px;
-                  height: 24px;
+                  width: 28px;
+                  height: 28px;
                   flex: 0 0 auto;
                   padding: 0;
                   border-radius: 999px;
                   background: var(--selection-color);
                   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--reader-fg) 18%, transparent);
+                }
+                #reader-selection-menu .reader-selection-spectrum {
+                  width: 28px;
+                  height: 28px;
+                  flex: 0 0 auto;
+                  padding: 0;
+                  border-radius: 999px;
+                  background: conic-gradient(#f44336, #ff7f00, #ffeb3b, #4caf50, #2196f3, #4b0082, #8b00ff, #f44336);
                 }
                 #reader-selection-menu .reader-selection-actions {
                   display: grid;
@@ -465,16 +655,21 @@ object ReaderHtmlDocumentBuilder {
                   padding: 5px 6px 2px;
                 }
                 #reader-selection-menu .reader-selection-action {
-                  min-height: 52px;
+                  min-height: 56px;
                   border-radius: 10px;
                   display: flex;
                   flex-direction: column;
                   align-items: center;
                   justify-content: center;
                   gap: 4px;
-                  padding: 6px 4px;
-                  line-height: 1;
+                  padding: 6px 4px 7px;
+                  line-height: 1.15;
                   white-space: nowrap;
+                }
+                #reader-selection-menu .reader-selection-action span:last-child {
+                  display: block;
+                  line-height: 1.2;
+                  padding-bottom: 1px;
                 }
                 #reader-selection-menu .reader-selection-icon {
                   display: grid;
@@ -568,13 +763,26 @@ object ReaderHtmlDocumentBuilder {
               </button>
               <script>
                 (function () {
+                  var readerDiagnosticsConsoleEnabled = ${SharedReaderDiagnosticsEnabled};
+                  function readerConsoleLog(line) {
+                    if (readerDiagnosticsConsoleEnabled) {
+                      try { console.log(line); } catch (error) {}
+                    }
+                  }
                   var menu = document.getElementById('reader-selection-menu');
                   var startHandle = document.getElementById('reader-selection-start-handle');
                   var endHandle = document.getElementById('reader-selection-end-handle');
                   var savedRange = null;
                   var readerPageAnchors = $pageAnchorJson;
+                  window.readerSetPageAnchors = function (anchors) {
+                    if (Array.isArray(anchors)) {
+                      readerPageAnchors = anchors;
+                    }
+                  };
                   var lastReportedPageIndex = -1;
                   var lastReportedStartOffset = -1;
+                  var pendingRestoreLocator = null;
+                  var pendingRestoreUntil = 0;
                   var reportTimer = null;
                   var selectionMenuTimer = null;
                   var readerCurrentHighlights = [];
@@ -597,7 +805,7 @@ object ReaderHtmlDocumentBuilder {
                   }
                   function readerTtsLog(message) {
                     var line = 'EPUB_TTS_HIGHLIGHT ' + message;
-                    try { console.log(line); } catch (error) {}
+                    readerConsoleLog(line);
                     if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
                       try { window.kmpJsBridge.callNative('readerTtsHighlightLog', JSON.stringify({ message: line })); } catch (error) {}
                     }
@@ -613,10 +821,66 @@ object ReaderHtmlDocumentBuilder {
                       } catch (error) {}
                     }
                     if (!delivered) {
-                      try { console.log(line); } catch (error) {}
+                      readerConsoleLog(line);
                     }
                   }
                   window.readerSelectionDebugLog = readerSelectionDebugLog;
+                  function readerHighlightFlowLog(message) {
+                    var line = 'EpistemeEpubHighlightFlow ' + message;
+                    var delivered = false;
+                    if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
+                      try {
+                        window.kmpJsBridge.callNative('readerHighlightFlowLog', JSON.stringify({ message: message }));
+                        delivered = true;
+                      } catch (error) {}
+                    }
+                    if (!delivered) {
+                      readerConsoleLog(line);
+                    }
+                  }
+                  window.readerHighlightFlowLog = readerHighlightFlowLog;
+                  function readerDesktopHighlightMapLog(message) {
+                    var line = 'EpistemeDesktopHighlightMap ' + message;
+                    var delivered = false;
+                    if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
+                      try {
+                        window.kmpJsBridge.callNative('readerDesktopHighlightMapLog', JSON.stringify({ message: message }));
+                        delivered = true;
+                      } catch (error) {}
+                    }
+                    if (!delivered) {
+                      readerConsoleLog(line);
+                    }
+                  }
+                  window.readerDesktopHighlightMapLog = readerDesktopHighlightMapLog;
+                  function readerDesktopPositionTraceLog(message) {
+                    var line = 'EpistemeDesktopPositionTrace ' + message;
+                    var delivered = false;
+                    if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
+                      try {
+                        window.kmpJsBridge.callNative('readerDesktopPositionTraceLog', JSON.stringify({ message: message }));
+                        delivered = true;
+                      } catch (error) {}
+                    }
+                    if (!delivered) {
+                      readerConsoleLog(line);
+                    }
+                  }
+                  window.readerDesktopPositionTraceLog = readerDesktopPositionTraceLog;
+                  function readerTtsStartTraceLog(message) {
+                    var line = 'EpistemeDesktopTtsStartTrace ' + message;
+                    var delivered = false;
+                    if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
+                      try {
+                        window.kmpJsBridge.callNative('readerTtsStartTraceLog', JSON.stringify({ message: message }));
+                        delivered = true;
+                      } catch (error) {}
+                    }
+                    if (!delivered) {
+                      readerConsoleLog(line);
+                    }
+                  }
+                  window.readerTtsStartTraceLog = readerTtsStartTraceLog;
                   function readerTtsPreview(value, limit) {
                     return String(value || '').replace(/\s+/g, ' ').trim().substring(0, limit || 120);
                   }
@@ -644,7 +908,7 @@ object ReaderHtmlDocumentBuilder {
                       } catch (error) {}
                     }
                     if (!delivered) {
-                      try { console.log(line); } catch (error) {}
+                      readerConsoleLog(line);
                     }
                   }
                   function readerGapLog(message) {
@@ -657,7 +921,7 @@ object ReaderHtmlDocumentBuilder {
                       } catch (error) {}
                     }
                     if (!delivered) {
-                      try { console.log(line); } catch (error) {}
+                      readerConsoleLog(line);
                     }
                   }
                   function readerPaginationLayoutLog(reason) {
@@ -763,14 +1027,172 @@ object ReaderHtmlDocumentBuilder {
                     var hosts = readerHostsForLocator(chapterIndex, startOffset, endOffset);
                     return hosts.length ? hosts[0] : null;
                   }
-                  function scrollToLocator(locator) {
+                  function readerBlockElementsForLocator(chapterIndex, blockIndex) {
+                    var parsedBlock = parseInt(blockIndex, 10);
+                    if (!Number.isFinite(parsedBlock)) return [];
+                    var chapterSelector = '[data-reader-chapter-index="' + selectorValue(chapterIndex) + '"]';
+                    var chapters = Array.prototype.slice.call(document.querySelectorAll(chapterSelector));
+                    var blockSelector = '[data-reader-block-index="' + selectorValue(parsedBlock) + '"]';
+                    return chapters.reduce(function (elements, chapter) {
+                      return elements.concat(Array.prototype.slice.call(chapter.querySelectorAll(blockSelector)));
+                    }, []);
+                  }
+                  function readerElementForBlockLocator(chapterIndex, blockIndex, charOffset) {
+                    var elements = readerBlockElementsForLocator(chapterIndex, blockIndex);
+                    if (!elements.length) return null;
+                    var parsedChar = parseInt(charOffset, 10);
+                    if (!Number.isFinite(parsedChar)) return elements[0];
+                    var fallback = null;
+                    for (var i = 0; i < elements.length; i++) {
+                      var element = elements[i];
+                      if (!fallback) fallback = element;
+                      var textStart = numberAttribute(element, 'data-reader-text-start', null);
+                      var textEnd = numberAttribute(element, 'data-reader-text-end', null);
+                      if (textStart === null || textEnd === null) continue;
+                      var host = element.closest ? element.closest('[data-reader-chapter-index]') : null;
+                      var pageStart = host ? numberAttribute(host, 'data-reader-page-start', null) : null;
+                      var pageEnd = host ? numberAttribute(host, 'data-reader-page-end', null) : null;
+                      if (pageStart !== null && pageEnd !== null && !((parsedChar >= pageStart && parsedChar < pageEnd) || (pageStart === pageEnd && parsedChar === pageStart))) continue;
+                      if ((parsedChar >= textStart && parsedChar < textEnd) || (textStart === textEnd && parsedChar === textStart)) {
+                        return element;
+                      }
+                    }
+                    return fallback;
+                  }
+                  function readerHostForBlockLocator(chapterIndex, blockIndex, charOffset) {
+                    var element = readerElementForBlockLocator(chapterIndex, blockIndex, charOffset);
+                    if (!element) return null;
+                    return element.closest ? element.closest('[data-reader-chapter-index]') : null;
+                  }
+                  function readerLocatorTrace(locator) {
                     locator = locator || {};
+                    return 'chapter=' + (locator.chapterIndex === undefined || locator.chapterIndex === null ? 'null' : locator.chapterIndex) +
+                      ' page=' + (locator.pageIndex === undefined || locator.pageIndex === null ? 'null' : locator.pageIndex) +
+                      ' offsets=' + (locator.startOffset === undefined || locator.startOffset === null ? 'null' : locator.startOffset) +
+                      '..' + (locator.endOffset === undefined || locator.endOffset === null ? 'null' : locator.endOffset) +
+                      ' block=' + (locator.blockIndex === undefined || locator.blockIndex === null ? 'null' : locator.blockIndex) +
+                      ' char=' + (locator.charOffset === undefined || locator.charOffset === null ? 'null' : locator.charOffset) +
+                      ' cfi=' + readerTtsPreview(locator.cfi, 160);
+                  }
+                  function stableReaderCfi(cfi) {
+                    if (cfi === undefined || cfi === null) return null;
+                    var value = String(cfi);
+                    if (value.indexOf('desktop-scroll:') !== 0) return value;
+                    var parts = value.split(':');
+                    if (parts.length < 4) return value;
+                    var stable = parts.slice(3).join(':');
+                    return stable || value;
+                  }
+                  function stableDesktopCfi(chapterIndex, startOffset, endOffset) {
+                    return 'desktop:' + chapterIndex + ':' + startOffset + ':' + (endOffset === undefined || endOffset === null ? startOffset : endOffset);
+                  }
+                  function locatorStartOffset(locator) {
+                    locator = locator || {};
+                    var start = parseInt(locator.startOffset, 10);
+                    if (Number.isFinite(start)) return start;
+                    var charOffset = parseInt(locator.charOffset, 10);
+                    if (Number.isFinite(charOffset)) return charOffset;
+                    var cfi = stableReaderCfi(locator.cfi);
+                    if (cfi && cfi.indexOf('desktop:') === 0) {
+                      var parts = cfi.split(':');
+                      var parsed = parseInt(parts[2], 10);
+                      if (Number.isFinite(parsed)) return parsed;
+                    }
+                    if (cfi && cfi.indexOf('android-locator:') === 0) {
+                      var androidParts = cfi.split(':');
+                      var androidChar = parseInt(androidParts[3], 10);
+                      if (Number.isFinite(androidChar)) return androidChar;
+                    }
+                    return null;
+                  }
+                  function prepareVerticalScrollMeasurement(targetChapter) {
+                    if (!isVerticalReaderDocument()) return;
+                    var chapters = Array.prototype.slice.call(document.querySelectorAll('[data-reader-chapter-index]'));
+                    chapters.forEach(function (chapter) {
+                      chapter.style.contentVisibility = 'visible';
+                      chapter.style.containIntrinsicSize = 'auto';
+                    });
+                    if (targetChapter) {
+                      targetChapter.style.contentVisibility = 'visible';
+                      targetChapter.style.containIntrinsicSize = 'auto';
+                    }
+                    if (document.body) void document.body.offsetHeight;
+                    if (targetChapter) void targetChapter.offsetHeight;
+                  }
+                  function scrollToTopWithTrace(targetTop, strategy, locator, extra) {
+                    var before = verticalScrollMetrics();
+                    var top = Math.max(0, Math.round(Number(targetTop) || 0));
+                    window.scrollTo({ top: top, left: 0, behavior: 'auto' });
+                    var after = verticalScrollMetrics();
+                    var clamped = Math.abs(after.scrollY - top) > 2 && (top > after.maxScroll + 2 || top < 0);
+                    readerDesktopPositionTraceLog(
+                      'event=web_scroll_to_locator_done mode=' + (isVerticalReaderDocument() ? 'vertical' : 'paginated') +
+                      ' strategy=' + strategy +
+                      ' targetY=' + top +
+                      ' beforeY=' + before.scrollY +
+                      ' afterY=' + after.scrollY +
+                      ' maxScroll=' + after.maxScroll +
+                      ' clamped=' + clamped +
+                      ' ' + readerLocatorTrace(locator) +
+                      (extra ? ' ' + extra : '')
+                    );
+                    return { targetY: top, beforeY: before.scrollY, afterY: after.scrollY, maxScroll: after.maxScroll, clamped: clamped };
+                  }
+                  function shouldCenterScrollTarget(options) {
+                    return !!(options && options.align === 'center' && isVerticalReaderDocument());
+                  }
+                  function scrollTargetTopFromRect(rect, options) {
+                    var documentTop = (rect ? rect.top : 0) + window.scrollY;
+                    if (shouldCenterScrollTarget(options)) {
+                      var viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+                      if (viewportHeight > 0) {
+                        var rectHeight = rect && Number.isFinite(rect.height) ? Math.max(0, Math.min(rect.height, viewportHeight)) : 0;
+                        return documentTop - Math.round((viewportHeight - rectHeight) / 2);
+                      }
+                    }
+                    return documentTop - 24;
+                  }
+                  function scrollTargetTopFromY(documentY, options) {
+                    var top = Number(documentY) || 0;
+                    if (shouldCenterScrollTarget(options)) {
+                      var viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+                      if (viewportHeight > 0) return top - Math.round(viewportHeight / 2);
+                    }
+                    return top - 24;
+                  }
+                  function scrollTraceExtra(extra, options) {
+                    if (!shouldCenterScrollTarget(options)) return extra;
+                    return extra ? extra + ' align=center' : 'align=center';
+                  }
+                  function shouldTrackScrollRestore(options) {
+                    return !(options && options.trackRestore === false);
+                  }
+                  function scrollToLocator(locator, options) {
+                    locator = locator || {};
+                    options = options || {};
+                    if (isVerticalReaderDocument()) {
+                      if (shouldTrackScrollRestore(options)) {
+                        pendingRestoreLocator = locator;
+                        pendingRestoreUntil = Date.now() + 5000;
+                      } else {
+                        clearPendingRestoreLocator('transient_scroll');
+                      }
+                    }
+                    readerDesktopPositionTraceLog(
+                      'event=web_scroll_to_locator_start mode=' + (isVerticalReaderDocument() ? 'vertical' : 'paginated') +
+                      ' ' + readerLocatorTrace(locator) +
+                      (shouldCenterScrollTarget(options) ? ' align=center' : '')
+                    );
+                    if (scrollToVerticalPage(locator, options)) return;
                     var chapterIndex = locator.chapterIndex;
                     if (chapterIndex === undefined || chapterIndex === null || chapterIndex === '') {
                       chapterIndex = document.body.getAttribute('data-reader-active-chapter-index');
                     }
-                    if (chapterIndex === null || chapterIndex === '') return;
-                    var activeStart = locator.startOffset;
+                    if (chapterIndex === null || chapterIndex === '') {
+                      readerDesktopPositionTraceLog('event=web_scroll_to_locator_skip reason=missing_chapter ' + readerLocatorTrace(locator));
+                      return;
+                    }
+                    var activeStart = locatorStartOffset(locator);
                     if (activeStart === undefined || activeStart === null) {
                       activeStart = numberAttribute(document.body, 'data-reader-active-start-offset', null);
                     }
@@ -779,33 +1201,55 @@ object ReaderHtmlDocumentBuilder {
                       ? document.querySelector('[data-reader-page-index="' + selectorValue(requestedPageIndex) + '"]')
                       : null;
                     if (!chapter) chapter = readerHostForLocator(chapterIndex, activeStart, locator.endOffset);
-                    if (!chapter) return;
-                    var exactCfi = locator.cfi
-                      ? chapter.querySelector('[data-reader-cfi="' + selectorValue(locator.cfi) + '"]')
+                    if (!chapter) {
+                      readerDesktopPositionTraceLog(
+                        'event=web_scroll_to_locator_skip reason=missing_host requestedChapter=' + chapterIndex +
+                        ' activeStart=' + activeStart + ' ' + readerLocatorTrace(locator)
+                      );
+                      return;
+                    }
+                    prepareVerticalScrollMeasurement(chapter);
+                    var stableCfi = stableReaderCfi(locator.cfi);
+                    var locatorCfiBase = stableCfi ? String(stableCfi).split('|')[0].split(':')[0] : null;
+                    var exactCfi = locatorCfiBase
+                      ? chapter.querySelector('[data-reader-cfi="' + selectorValue(locatorCfiBase) + '"]')
                       : null;
-                    if (exactCfi) {
+                    if (exactCfi && (activeStart === undefined || activeStart === null)) {
                       var cfiRect = exactCfi.getBoundingClientRect();
-                      window.scrollTo({ top: Math.max(0, cfiRect.top + window.scrollY - 24), left: 0, behavior: 'auto' });
+                      scrollToTopWithTrace(scrollTargetTopFromRect(cfiRect, options), 'exact_cfi', locator, scrollTraceExtra('requestedChapter=' + chapterIndex, options));
                       return;
                     }
                     var exact = activeStart === null
                       ? null
                       : chapter.querySelector('[data-reader-start-offset="' + selectorValue(activeStart) + '"]');
-                    var target = exact || chapter;
+                    var blockIndex = parseInt(locator.blockIndex, 10);
+                    var exactBlock = Number.isFinite(blockIndex)
+                      ? chapter.querySelector('[data-reader-block-index="' + selectorValue(blockIndex) + '"]')
+                      : null;
+                    var target = exact || exactBlock || chapter;
                     var content = chapter.querySelector('.reader-content') || chapter;
                     if (!exact && activeStart !== null && content) {
                       var parsedStart = parseInt(activeStart, 10);
                       var parsedEnd = parseInt(locator.endOffset === undefined || locator.endOffset === null ? activeStart : locator.endOffset, 10);
                       if (Number.isFinite(parsedStart)) {
                         var rangeEnd = Number.isFinite(parsedEnd) && parsedEnd > parsedStart ? parsedEnd : parsedStart + 1;
-                        var exactRange = rangeForOffsets(parseInt(chapterIndex, 10), parsedStart, rangeEnd, locator.cfi);
+                        var exactRange = rangeForOffsets(parseInt(chapterIndex, 10), parsedStart, rangeEnd, stableCfi);
                         if (exactRange) {
                           var rangeRects = exactRange.getClientRects();
-                          var rangeRect = rangeRects.length ? rangeRects[0] : exactRange.getBoundingClientRect();
+                          var rangeRect = shouldCenterScrollTarget(options) ? exactRange.getBoundingClientRect() : (rangeRects.length ? rangeRects[0] : exactRange.getBoundingClientRect());
                           exactRange.detach && exactRange.detach();
                           if (rangeRect && (rangeRect.top !== 0 || rangeRect.bottom !== 0)) {
-                            window.scrollTo({ top: Math.max(0, rangeRect.top + window.scrollY - 24), left: 0, behavior: 'auto' });
-                            return;
+                            var exactResult = scrollToTopWithTrace(scrollTargetTopFromRect(rangeRect, options), 'exact_range', locator, scrollTraceExtra('requestedChapter=' + chapterIndex, options));
+                            if (!exactResult.clamped || !isVerticalReaderDocument()) {
+                              return;
+                            }
+                            readerDesktopPositionTraceLog(
+                              'event=web_scroll_to_locator_clamped strategy=exact_range requestedChapter=' + chapterIndex +
+                              ' targetY=' + exactResult.targetY +
+                              ' afterY=' + exactResult.afterY +
+                              ' maxScroll=' + exactResult.maxScroll +
+                              ' fallback=content_ratio'
+                            );
                           }
                         }
                       }
@@ -815,48 +1259,25 @@ object ReaderHtmlDocumentBuilder {
                         var ratio = Math.max(0, Math.min(1, (activeStart - contentStart) / (contentEnd - contentStart)));
                         var contentRect = content.getBoundingClientRect();
                         var approximateY = contentRect.top + window.scrollY + (content.scrollHeight * ratio);
-                        window.scrollTo({ top: Math.max(0, approximateY - 24), left: 0, behavior: 'auto' });
+                        scrollToTopWithTrace(scrollTargetTopFromY(approximateY, options), 'content_ratio', locator, scrollTraceExtra('requestedChapter=' + chapterIndex + ' ratio=' + ratio.toFixed(4), options));
                         return;
                       }
                     }
                     var rect = target.getBoundingClientRect();
-                    window.scrollTo({ top: Math.max(0, rect.top + window.scrollY - 24), left: 0, behavior: 'auto' });
+                    scrollToTopWithTrace(scrollTargetTopFromRect(rect, options), exact ? 'exact_marker' : (exactBlock ? 'exact_block' : 'host_top'), locator, scrollTraceExtra('requestedChapter=' + chapterIndex, options));
                   }
                   function scrollToActiveLocator() {
                     scrollToLocator({
                       chapterIndex: document.body.getAttribute('data-reader-active-chapter-index'),
-                      startOffset: numberAttribute(document.body, 'data-reader-active-start-offset', null)
+                      pageIndex: numberAttribute(document.body, 'data-reader-active-page-index', null),
+                      startOffset: numberAttribute(document.body, 'data-reader-active-start-offset', null),
+                      endOffset: numberAttribute(document.body, 'data-reader-active-end-offset', null),
+                      blockIndex: numberAttribute(document.body, 'data-reader-active-block-index', null),
+                      charOffset: numberAttribute(document.body, 'data-reader-active-char-offset', null),
+                      cfi: document.body.getAttribute('data-reader-active-cfi')
                     });
                   }
                   window.readerScrollToLocator = scrollToLocator;
-                  var readerAutoScrollFrame = null;
-                  var readerAutoScrollLastTime = 0;
-                  var readerAutoScrollSpeed = 36;
-                  function readerAutoScrollStep(timestamp) {
-                    if (readerAutoScrollFrame === null) return;
-                    if (!readerAutoScrollLastTime) readerAutoScrollLastTime = timestamp;
-                    var elapsed = Math.max(0, timestamp - readerAutoScrollLastTime);
-                    readerAutoScrollLastTime = timestamp;
-                    window.scrollBy(0, readerAutoScrollSpeed * elapsed / 1000);
-                    if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) {
-                      window.readerAutoScroll.stop();
-                      return;
-                    }
-                    readerAutoScrollFrame = window.requestAnimationFrame(readerAutoScrollStep);
-                  }
-                  window.readerAutoScroll = {
-                    start: function (speed) {
-                      readerAutoScrollSpeed = Math.max(12, Math.min(160, Number(speed) || 36));
-                      if (readerAutoScrollFrame !== null) window.cancelAnimationFrame(readerAutoScrollFrame);
-                      readerAutoScrollLastTime = 0;
-                      readerAutoScrollFrame = window.requestAnimationFrame(readerAutoScrollStep);
-                    },
-                    stop: function () {
-                      if (readerAutoScrollFrame !== null) window.cancelAnimationFrame(readerAutoScrollFrame);
-                      readerAutoScrollFrame = null;
-                      readerAutoScrollLastTime = 0;
-                    }
-                  };
                   function textNodesUnder(root, includeWhitespace) {
                     includeWhitespace = includeWhitespace === undefined ? true : includeWhitespace;
                     var nodes = [];
@@ -925,12 +1346,108 @@ object ReaderHtmlDocumentBuilder {
                     }
                     return range;
                   }
-                  function firstVisibleOffsetInContent(content) {
+                  function readerProbeY() {
+                    var height = window.innerHeight || document.documentElement.clientHeight || 0;
+                    if (height <= 0) return 8;
+                    return Math.max(1, Math.min(height - 1, 8));
+                  }
+                  function firstVisibleOffsetInContent(content, preferredY) {
                     var nodes = textNodesUnder(content, false);
                     var contentStart = numberAttribute(content, 'data-reader-content-start', 0);
                     var offset = contentStart;
-                    var viewportTop = Math.max(8, window.innerHeight * 0.08);
+                    var viewportTop = Number.isFinite(preferredY) ? preferredY : readerProbeY();
                     var viewportBottom = window.innerHeight - 8;
+                    var fallback = null;
+                    function visibleResult(node, localOffset, rawOffset) {
+                      var sourceOffset = boundaryOffsetWithinContent(content, node, localOffset);
+                      return { offset: sourceOffset === null ? rawOffset : sourceOffset, textNode: node };
+                    }
+                    function usableLineRect(rect) {
+                      return rect && rect.width > 0 && rect.height > 0;
+                    }
+                    function firstVisibleLineRect() {
+                      var best = null;
+                      function better(candidate, current) {
+                        if (!current) return true;
+                        var candidateCrossesTop = candidate.top <= viewportTop + 0.5 && candidate.bottom >= viewportTop;
+                        var currentCrossesTop = current.top <= viewportTop + 0.5 && current.bottom >= viewportTop;
+                        if (candidateCrossesTop !== currentCrossesTop) return candidateCrossesTop;
+                        if (candidateCrossesTop) {
+                          if (Math.abs(candidate.top - current.top) > 0.5) return candidate.top > current.top;
+                        } else if (Math.abs(candidate.top - current.top) > 0.5) {
+                          return candidate.top < current.top;
+                        }
+                        return candidate.left < current.left;
+                      }
+                      for (var ln = 0; ln < nodes.length; ln++) {
+                        var lineWhole = document.createRange();
+                        lineWhole.selectNodeContents(nodes[ln]);
+                        var lineRects = lineWhole.getClientRects();
+                        lineWhole.detach && lineWhole.detach();
+                        for (var lr = 0; lr < lineRects.length; lr++) {
+                          var rect = lineRects[lr];
+                          if (!usableLineRect(rect)) continue;
+                          if (rect.bottom < viewportTop || rect.top > viewportBottom) continue;
+                          if (better(rect, best)) best = rect;
+                        }
+                      }
+                      return best;
+                    }
+                    function sameVisualLine(rect, lineRect) {
+                      if (!usableLineRect(rect) || !usableLineRect(lineRect)) return false;
+                      var rectMid = (rect.top + rect.bottom) / 2;
+                      var lineMid = (lineRect.top + lineRect.bottom) / 2;
+                      var tolerance = Math.max(2, Math.min(8, lineRect.height * 0.35));
+                      return Math.abs(rectMid - lineMid) <= tolerance;
+                    }
+                    function firstVisibleLineStart(targetLineRect) {
+                      var lineOffset = contentStart;
+                      var best = null;
+                      var direction = 'ltr';
+                      try { direction = window.getComputedStyle(content).direction || 'ltr'; } catch (error) {}
+                      for (var ln = 0; ln < nodes.length; ln++) {
+                        var lineNode = nodes[ln];
+                        var lineText = lineNode.nodeValue || '';
+                        for (var li = 0; li < lineText.length; li++) {
+                          if (!lineText[li] || /^\s$/.test(lineText[li])) continue;
+                          var lineRange = document.createRange();
+                          lineRange.setStart(lineNode, li);
+                          lineRange.setEnd(lineNode, Math.min(li + 1, lineText.length));
+                          var charLineRect = lineRange.getBoundingClientRect();
+                          lineRange.detach && lineRange.detach();
+                          if (sameVisualLine(charLineRect, targetLineRect)) {
+                            var visualEdge = direction === 'rtl' ? -charLineRect.right : charLineRect.left;
+                            if (!best || visualEdge < best.visualEdge - 0.5 || (
+                              Math.abs(visualEdge - best.visualEdge) <= 0.5 && lineOffset + li < best.rawOffset
+                            )) {
+                              best = {
+                                node: lineNode,
+                                localOffset: li,
+                                rawOffset: lineOffset + li,
+                                visualEdge: visualEdge,
+                                rect: charLineRect
+                              };
+                            }
+                          }
+                        }
+                        lineOffset += lineText.length;
+                      }
+                      if (!best) return null;
+                      var result = visibleResult(best.node, best.localOffset, best.rawOffset);
+                      readerTtsStartTraceLog(
+                        'event=web_line_start_choice offset=' + result.offset +
+                        ' rawOffset=' + best.rawOffset +
+                        ' lineTop=' + Math.round(targetLineRect.top) +
+                        ' lineBottom=' + Math.round(targetLineRect.bottom) +
+                        ' charLeft=' + Math.round(best.rect.left) +
+                        ' charRight=' + Math.round(best.rect.right) +
+                        ' text="' + readerTtsPreview(snippetFromContentOffset(content, result.offset), 120) + '"'
+                      );
+                      return result;
+                    }
+                    var topLineRect = firstVisibleLineRect();
+                    var topLineStart = topLineRect ? firstVisibleLineStart(topLineRect) : null;
+                    if (topLineStart) return topLineStart;
                     for (var n = 0; n < nodes.length; n++) {
                       var node = nodes[n];
                       var text = node.nodeValue || '';
@@ -957,12 +1474,12 @@ object ReaderHtmlDocumentBuilder {
                         var charRect = charRange.getBoundingClientRect();
                         charRange.detach && charRange.detach();
                         if (charRect.bottom >= viewportTop && charRect.top <= viewportBottom) {
-                          return { offset: offset + i, textNode: node };
+                          return visibleResult(node, i, offset + i);
                         }
                       }
                       offset += text.length;
                     }
-                    return { offset: contentStart, textNode: null };
+                    return fallback || { offset: contentStart, textNode: null };
                   }
                   function snippetFromContentOffset(content, startOffset) {
                     var nodes = textNodesUnder(content, false);
@@ -993,32 +1510,279 @@ object ReaderHtmlDocumentBuilder {
                     }
                     return best;
                   }
+                  function isVerticalReaderDocument() {
+                    return !!(document.body && document.body.classList.contains('reader-vertical'));
+                  }
+                  function renderedVerticalPageAnchors() {
+                    if (!isVerticalReaderDocument() || !readerPageAnchors.length) return readerPageAnchors;
+                    var hosts = Array.prototype.slice.call(document.querySelectorAll('[data-reader-chapter-index]'));
+                    if (!hosts.length) return readerPageAnchors;
+                    var renderedChapters = {};
+                    hosts.forEach(function (host) {
+                      var chapterIndex = numberAttribute(host, 'data-reader-chapter-index', null);
+                      if (chapterIndex !== null) renderedChapters[chapterIndex] = true;
+                    });
+                    var filtered = readerPageAnchors.filter(function (page) {
+                      return !!renderedChapters[page.chapterIndex];
+                    });
+                    return filtered.length ? filtered : readerPageAnchors;
+                  }
+                  function verticalScrollMetrics() {
+                    var scrollY = Math.round(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0);
+                    var scrollHeight = Math.round(Math.max(
+                      document.body ? document.body.scrollHeight : 0,
+                      document.documentElement ? document.documentElement.scrollHeight : 0
+                    ));
+                    var clientHeight = Math.round(document.documentElement.clientHeight || window.innerHeight || 0);
+                    var maxScroll = Math.max(0, scrollHeight - clientHeight);
+                    return {
+                      scrollY: Math.max(0, Math.min(scrollY, maxScroll)),
+                      scrollHeight: scrollHeight,
+                      clientHeight: clientHeight,
+                      maxScroll: maxScroll
+                    };
+                  }
+                  function pageForVerticalScroll() {
+                    if (!isVerticalReaderDocument() || !readerPageAnchors.length) return null;
+                    var anchors = renderedVerticalPageAnchors();
+                    if (!anchors.length) return null;
+                    var metrics = verticalScrollMetrics();
+                    if (anchors.length === 1 || metrics.maxScroll <= 0) return anchors[0];
+                    var ratio = Math.max(0, Math.min(1, metrics.scrollY / metrics.maxScroll));
+                    var index = Math.round((anchors.length - 1) * ratio);
+                    return anchors[Math.max(0, Math.min(anchors.length - 1, index))];
+                  }
+                  function scrollToVerticalPage(locator, options) {
+                    if (!isVerticalReaderDocument() || !locator) return false;
+                    var cfi = String(locator.cfi || '');
+                    if (cfi.indexOf('desktop-scroll-page:') !== 0) return false;
+                    var pageIndex = parseInt(locator.pageIndex, 10);
+                    if (!Number.isFinite(pageIndex) || !readerPageAnchors.length) return false;
+                    var chapterIndex = parseInt(locator.chapterIndex, 10);
+                    var startOffset = parseInt(locator.startOffset, 10);
+                    if (Number.isFinite(chapterIndex) && Number.isFinite(startOffset)) {
+                      var chapter = readerHostForLocator(chapterIndex, startOffset, locator.endOffset);
+                      if (chapter) {
+                        prepareVerticalScrollMeasurement(chapter);
+                        var content = chapter.querySelector('.reader-content') || chapter;
+                        var contentStart = numberAttribute(content, 'data-reader-content-start', numberAttribute(chapter, 'data-reader-page-start', 0));
+                        var contentEnd = numberAttribute(content, 'data-reader-content-end', numberAttribute(chapter, 'data-reader-page-end', contentStart));
+                        var targetY = chapter.getBoundingClientRect().top + window.scrollY;
+                        if (contentEnd > contentStart && startOffset > contentStart) {
+                          var ratioInContent = Math.max(0, Math.min(1, (startOffset - contentStart) / (contentEnd - contentStart)));
+                          var contentRect = content.getBoundingClientRect();
+                          targetY = contentRect.top + window.scrollY + (content.scrollHeight * ratioInContent);
+                        }
+                        scrollToTopWithTrace(scrollTargetTopFromY(targetY, options), 'vertical_page_content', locator, scrollTraceExtra('ratioSource=content', options));
+                        return true;
+                      }
+                    }
+                    var anchors = renderedVerticalPageAnchors();
+                    if (!anchors.length) return false;
+                    var metrics = verticalScrollMetrics();
+                    var anchorPosition = anchors.findIndex(function (page) { return page.pageIndex === pageIndex; });
+                    var ratio = anchorPosition >= 0
+                      ? anchorPosition / Math.max(1, anchors.length - 1)
+                      : pageIndex / Math.max(1, readerPageAnchors.length - 1);
+                    ratio = Math.max(0, Math.min(1, ratio));
+                    scrollToTopWithTrace(Math.round(metrics.maxScroll * ratio), 'vertical_page_ratio', locator, 'ratio=' + ratio.toFixed(4));
+                    return true;
+                  }
                   function readerHostIsVisible(host) {
                     if (!host) return false;
                     var rect = host.getBoundingClientRect();
                     return rect.bottom >= 8 && rect.top <= window.innerHeight - 8;
                   }
-                  function positionFromReaderHost(host, preferredOffset) {
+                  function readerHostVisibilityScore(host, probeY) {
+                    if (!host) return null;
+                    var rect = host.getBoundingClientRect();
+                    var viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+                    var visibleTop = Math.max(0, rect.top);
+                    var visibleBottom = Math.min(viewportHeight, rect.bottom);
+                    var visibleHeight = Math.max(0, visibleBottom - visibleTop);
+                    var containsProbe = rect.top <= probeY && rect.bottom >= probeY;
+                    var distance = containsProbe ? 0 : Math.min(Math.abs(rect.top - probeY), Math.abs(rect.bottom - probeY));
+                    return {
+                      visibleHeight: visibleHeight,
+                      containsProbe: containsProbe,
+                      distance: distance,
+                      top: Math.round(rect.top),
+                      bottom: Math.round(rect.bottom)
+                    };
+                  }
+                  function bestVisibleReaderHost() {
+                    var chapters = Array.prototype.slice.call(document.querySelectorAll('[data-reader-chapter-index]'));
+                    if (!chapters.length) return null;
+                    var probeY = readerProbeY();
+                    var probeX = Math.max(0, Math.min((window.innerWidth || 0) - 1, Math.round((window.innerWidth || 0) / 2)));
+                    var probeElement = document.elementFromPoint(probeX, probeY);
+                    var probeHost = nearestReaderHost(probeElement);
+                    if (probeHost && readerHostIsVisible(probeHost)) {
+                      return { host: probeHost, probeY: probeY, source: 'element_from_point', score: readerHostVisibilityScore(probeHost, probeY) };
+                    }
+                    var best = null;
+                    chapters.forEach(function (chapter) {
+                      if (!readerHostIsVisible(chapter)) return;
+                      var score = readerHostVisibilityScore(chapter, probeY);
+                      if (!score || score.visibleHeight <= 0) return;
+                      if (!best ||
+                        (score.containsProbe && !best.score.containsProbe) ||
+                        (score.containsProbe === best.score.containsProbe && score.distance < best.score.distance) ||
+                        (score.containsProbe === best.score.containsProbe && score.distance === best.score.distance && score.visibleHeight > best.score.visibleHeight)
+                      ) {
+                        best = { host: chapter, probeY: probeY, source: 'visibility_score', score: score };
+                      }
+                    });
+                    return best;
+                  }
+                  function positionFromReaderHost(host, preferredOffset, preferredY, source) {
                     if (!host) return null;
                     var content = host.querySelector('.reader-content') || host;
                     var chapterIndex = numberAttribute(host, 'data-reader-chapter-index', 0);
                     var pageStart = numberAttribute(host, 'data-reader-page-start', null);
                     var pageEnd = numberAttribute(host, 'data-reader-page-end', null);
-                    var visible = firstVisibleOffsetInContent(content);
+                    var visible = firstVisibleOffsetInContent(content, preferredY);
                     var usePreferredOffset = Number.isFinite(preferredOffset) &&
                       (pageStart === null || preferredOffset >= pageStart) &&
                       (pageEnd === null || preferredOffset <= pageEnd);
                     var offset = usePreferredOffset ? preferredOffset : visible.offset;
-                    var page = pageForLocator(chapterIndex, offset) || readerPageAnchors[0];
+                    var renderedAnchors = renderedVerticalPageAnchors();
+                    var page = pageForLocator(chapterIndex, offset) || pageForVerticalScroll() || renderedAnchors[0] || readerPageAnchors[0];
                     if (!page) return null;
+                    var positionCfi = readerCfiPointForOffset(content, offset, false) || stableDesktopCfi(chapterIndex, offset, offset);
+                    var blockPosition = readerBlockPositionForOffset(content, offset, false);
+                    var metrics = isVerticalReaderDocument() ? verticalScrollMetrics() : null;
+                    if (isVerticalReaderDocument()) {
+                      positionCfi = stableReaderCfi(positionCfi) || stableDesktopCfi(chapterIndex, offset, offset);
+                    }
+                    readerDesktopHighlightMapLog(
+                      'web_position_payload mode=' + (isVerticalReaderDocument() ? 'vertical' : 'paginated') +
+                      ' page=' + page.pageIndex +
+                      ' chapter=' + chapterIndex +
+                      ' offsets=' + offset + '..' + offset +
+                      ' block=' + (blockPosition ? blockPosition.blockIndex : 'null') +
+                      ' char=' + (blockPosition ? blockPosition.charOffset : 'null') +
+                      ' chapterId=' + readerTtsPreview(host.getAttribute('data-reader-chapter-id'), 80) +
+                      ' href=' + readerTtsPreview(host.getAttribute('data-reader-chapter-href'), 120) +
+                      ' cfi=' + readerTtsPreview(positionCfi, 160) +
+                      ' text="' + readerTtsPreview(snippetFromContentOffset(content, offset), 120) + '"'
+                    );
+                    readerDesktopPositionTraceLog(
+                      'event=web_position_payload mode=' + (isVerticalReaderDocument() ? 'vertical' : 'paginated') +
+                      ' source=' + (source || 'unknown') +
+                      ' page=' + page.pageIndex +
+                      ' chapter=' + chapterIndex +
+                      ' offsets=' + offset + '..' + offset +
+                      ' preferredOffset=' + (Number.isFinite(preferredOffset) ? preferredOffset : 'null') +
+                      ' preferredY=' + (Number.isFinite(preferredY) ? Math.round(preferredY) : 'null') +
+                      ' visibleNode=' + (visible.textNode ? readerElementLabel(visible.textNode.parentElement) : 'null') +
+                      ' scrollY=' + (metrics ? metrics.scrollY : 'null') +
+                      ' maxScroll=' + (metrics ? metrics.maxScroll : 'null') +
+                      ' block=' + (blockPosition ? blockPosition.blockIndex : 'null') +
+                      ' char=' + (blockPosition ? blockPosition.charOffset : 'null') +
+                      ' cfi=' + readerTtsPreview(positionCfi, 160) +
+                      ' text="' + readerTtsPreview(snippetFromContentOffset(content, offset), 120) + '"'
+                    );
+                    readerTtsStartTraceLog(
+                      'event=web_position_payload mode=' + (isVerticalReaderDocument() ? 'vertical' : 'paginated') +
+                      ' source=' + (source || 'unknown') +
+                      ' page=' + page.pageIndex +
+                      ' chapter=' + chapterIndex +
+                      ' offsets=' + offset + '..' + offset +
+                      ' preferredY=' + (Number.isFinite(preferredY) ? Math.round(preferredY) : 'null') +
+                      ' visibleNode=' + (visible.textNode ? readerElementLabel(visible.textNode.parentElement) : 'null') +
+                      ' block=' + (blockPosition ? blockPosition.blockIndex : 'null') +
+                      ' char=' + (blockPosition ? blockPosition.charOffset : 'null') +
+                      ' cfi=' + readerTtsPreview(positionCfi, 160) +
+                      ' text="' + readerTtsPreview(snippetFromContentOffset(content, offset), 160) + '"'
+                    );
                     return {
                       pageIndex: page.pageIndex,
                       chapterIndex: chapterIndex,
+                      chapterId: host.getAttribute('data-reader-chapter-id'),
+                      href: host.getAttribute('data-reader-chapter-href'),
                       startOffset: offset,
                       endOffset: offset,
+                      blockIndex: blockPosition ? blockPosition.blockIndex : null,
+                      charOffset: blockPosition ? blockPosition.charOffset : null,
                       textQuote: snippetFromContentOffset(content, offset),
-                      cfi: 'desktop:' + chapterIndex + ':' + offset + ':' + offset
+                      cfi: positionCfi
                     };
+                  }
+                  function locatorChapterIndex(locator) {
+                    locator = locator || {};
+                    var chapterIndex = parseInt(locator.chapterIndex, 10);
+                    if (Number.isFinite(chapterIndex)) return chapterIndex;
+                    var cfi = stableReaderCfi(locator.cfi);
+                    if (cfi && cfi.indexOf('desktop:') === 0) {
+                      var desktopParts = cfi.split(':');
+                      var desktopChapter = parseInt(desktopParts[1], 10);
+                      if (Number.isFinite(desktopChapter)) return desktopChapter;
+                    }
+                    if (cfi && cfi.indexOf('android-locator:') === 0) {
+                      var androidParts = cfi.split(':');
+                      var androidChapter = parseInt(androidParts[1], 10);
+                      if (Number.isFinite(androidChapter)) return androidChapter;
+                    }
+                    return null;
+                  }
+                  function positionMatchesRestoreLocator(position, locator) {
+                    if (!position || !locator) return false;
+                    var chapterIndex = locatorChapterIndex(locator);
+                    if (chapterIndex !== null && position.chapterIndex !== chapterIndex) return false;
+                    var requestedPage = parseInt(locator.pageIndex, 10);
+                    var requestedOffset = locatorStartOffset(locator);
+                    if (requestedOffset !== null) {
+                      if (Math.abs(position.startOffset - requestedOffset) <= 512) return true;
+                      if (Number.isFinite(requestedPage) && position.pageIndex === requestedPage) return true;
+                      return false;
+                    }
+                    return Number.isFinite(requestedPage) ? position.pageIndex === requestedPage : true;
+                  }
+                  function pendingRestoreVisiblePosition() {
+                    if (!pendingRestoreLocator || !isVerticalReaderDocument()) return null;
+                    if (Date.now() > pendingRestoreUntil) {
+                      readerDesktopPositionTraceLog(
+                        'event=web_restore_guard_expired ' + readerLocatorTrace(pendingRestoreLocator)
+                      );
+                      pendingRestoreLocator = null;
+                      pendingRestoreUntil = 0;
+                      return null;
+                    }
+                    var chapterIndex = locatorChapterIndex(pendingRestoreLocator);
+                    var requestedOffset = locatorStartOffset(pendingRestoreLocator);
+                    if (chapterIndex === null || requestedOffset === null) return null;
+                    var chapter = readerHostForLocator(chapterIndex, requestedOffset, pendingRestoreLocator.endOffset);
+                    if (!chapter || !readerHostIsVisible(chapter)) return null;
+                    var range = rangeForOffsets(chapterIndex, requestedOffset, requestedOffset + 1, stableReaderCfi(pendingRestoreLocator.cfi));
+                    var preferredY = readerProbeY();
+                    var visible = false;
+                    if (range) {
+                      var rects = range.getClientRects();
+                      var rect = rects.length ? rects[0] : range.getBoundingClientRect();
+                      range.detach && range.detach();
+                      if (rect && rect.bottom >= 8 && rect.top <= (window.innerHeight || document.documentElement.clientHeight || 0) - 8) {
+                        visible = true;
+                        preferredY = Math.max(8, Math.min((window.innerHeight || document.documentElement.clientHeight || 0) - 8, Math.round(rect.top)));
+                      }
+                    }
+                    if (!visible) return null;
+                    readerDesktopPositionTraceLog(
+                      'event=web_restore_guard_visible chapter=' + chapterIndex +
+                      ' offset=' + requestedOffset +
+                      ' preferredY=' + preferredY +
+                      ' ' + readerLocatorTrace(pendingRestoreLocator)
+                    );
+                    return positionFromReaderHost(chapter, requestedOffset, preferredY, 'restore_locator_visible');
+                  }
+                  function clearPendingRestoreLocator(reason) {
+                    if (!pendingRestoreLocator) return;
+                    readerDesktopPositionTraceLog(
+                      'event=web_restore_guard_cleared reason=' + reason +
+                      ' pending=' + readerLocatorTrace(pendingRestoreLocator)
+                    );
+                    pendingRestoreLocator = null;
+                    pendingRestoreUntil = 0;
                   }
                   function currentVisiblePosition() {
                     var activePageIndex = numberAttribute(document.body, 'data-reader-active-page-index', null);
@@ -1026,25 +1790,74 @@ object ReaderHtmlDocumentBuilder {
                       var activePage = document.querySelector('.page[data-reader-page-index="' + selectorValue(activePageIndex) + '"]');
                       if (readerHostIsVisible(activePage)) {
                         var activeStart = numberAttribute(document.body, 'data-reader-active-start-offset', null);
-                        var activePosition = positionFromReaderHost(activePage, activeStart);
+                        var activePosition = positionFromReaderHost(activePage, activeStart, readerProbeY(), 'active_page');
                         if (activePosition) return activePosition;
                       }
                     }
-                    var chapters = document.querySelectorAll('[data-reader-chapter-index]');
-                    for (var i = 0; i < chapters.length; i++) {
-                      var chapter = chapters[i];
-                      if (!readerHostIsVisible(chapter)) continue;
-                      var position = positionFromReaderHost(chapter, null);
+                    var best = bestVisibleReaderHost();
+                    if (best && best.host) {
+                      readerDesktopPositionTraceLog(
+                        'event=web_visible_host_selected source=' + best.source +
+                        ' chapter=' + numberAttribute(best.host, 'data-reader-chapter-index', -1) +
+                        ' probeY=' + best.probeY +
+                        ' visibleHeight=' + (best.score ? Math.round(best.score.visibleHeight) : 'null') +
+                        ' containsProbe=' + (best.score ? best.score.containsProbe : false) +
+                        ' distance=' + (best.score ? Math.round(best.score.distance) : 'null') +
+                        ' rect=' + (best.score ? best.score.top + '..' + best.score.bottom : 'null')
+                      );
+                      var position = positionFromReaderHost(best.host, null, best.probeY, best.source);
                       if (position) return position;
                     }
                     return null;
                   }
                   function reportVisiblePage() {
-                    var position = currentVisiblePosition();
-                    if (!position) return;
-                    if (position.pageIndex === lastReportedPageIndex && Math.abs(position.startOffset - lastReportedStartOffset) < 8) return;
+                    var position = pendingRestoreVisiblePosition() || currentVisiblePosition();
+                    if (!position) {
+                      readerDesktopPositionTraceLog('event=web_position_report_skip reason=no_position');
+                      return;
+                    }
+                    if (pendingRestoreLocator) {
+                      if (!positionMatchesRestoreLocator(position, pendingRestoreLocator)) {
+                        readerDesktopPositionTraceLog(
+                          'event=web_position_report_skip reason=pending_restore page=' + position.pageIndex +
+                          ' chapter=' + position.chapterIndex +
+                          ' offsets=' + position.startOffset + '..' + position.endOffset +
+                          ' pending=' + readerLocatorTrace(pendingRestoreLocator)
+                        );
+                        return;
+                      }
+                      readerDesktopPositionTraceLog(
+                        'event=web_restore_guard_resolved page=' + position.pageIndex +
+                        ' chapter=' + position.chapterIndex +
+                        ' offsets=' + position.startOffset + '..' + position.endOffset +
+                        ' pending=' + readerLocatorTrace(pendingRestoreLocator)
+                      );
+                      pendingRestoreLocator = null;
+                      pendingRestoreUntil = 0;
+                    }
+                    if (position.pageIndex === lastReportedPageIndex && Math.abs(position.startOffset - lastReportedStartOffset) < 8) {
+                      return;
+                    }
                     lastReportedPageIndex = position.pageIndex;
                     lastReportedStartOffset = position.startOffset;
+                    readerDesktopPositionTraceLog(
+                      'event=web_position_report_send page=' + position.pageIndex +
+                      ' chapter=' + position.chapterIndex +
+                      ' offsets=' + position.startOffset + '..' + position.endOffset +
+                      ' block=' + (position.blockIndex === null || position.blockIndex === undefined ? 'null' : position.blockIndex) +
+                      ' char=' + (position.charOffset === null || position.charOffset === undefined ? 'null' : position.charOffset) +
+                      ' cfi=' + readerTtsPreview(position.cfi, 160) +
+                      ' text="' + readerTtsPreview(position.textQuote, 120) + '"'
+                    );
+                    readerTtsStartTraceLog(
+                      'event=web_position_report_send page=' + position.pageIndex +
+                      ' chapter=' + position.chapterIndex +
+                      ' offsets=' + position.startOffset + '..' + position.endOffset +
+                      ' block=' + (position.blockIndex === null || position.blockIndex === undefined ? 'null' : position.blockIndex) +
+                      ' char=' + (position.charOffset === null || position.charOffset === undefined ? 'null' : position.charOffset) +
+                      ' cfi=' + readerTtsPreview(position.cfi, 160) +
+                      ' text="' + readerTtsPreview(position.textQuote, 160) + '"'
+                    );
                     if (window.kmpJsBridge) {
                       window.kmpJsBridge.callNative('readerPositionChanged', JSON.stringify(position));
                     }
@@ -1055,26 +1868,26 @@ object ReaderHtmlDocumentBuilder {
                   function fallbackReaderLinkNavigation(payload, reason) {
                     try {
                       var encoded = encodeURIComponent(JSON.stringify(payload));
-                      console.log('READER_LINK fallback_navigation href=' + payload.href + ' reason=' + reason);
+                      readerConsoleLog('READER_LINK fallback_navigation href=' + payload.href + ' reason=' + reason);
                       window.location.href = 'readerlink://click?payload=' + encoded;
                     } catch (error) {
-                      console.log('READER_LINK fallback_navigation_error href=' + payload.href + ' error=' + error);
+                      readerConsoleLog('READER_LINK fallback_navigation_error href=' + payload.href + ' error=' + error);
                     }
                   }
                   function sendReaderLinkClick(payload, attempt) {
                     if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
                       try {
                         window.kmpJsBridge.callNative('readerLinkClicked', JSON.stringify(payload));
-                        console.log('READER_LINK bridge_sent href=' + payload.href + ' attempt=' + attempt);
+                        readerConsoleLog('READER_LINK bridge_sent href=' + payload.href + ' attempt=' + attempt);
                         window.setTimeout(function () {
                           fallbackReaderLinkNavigation(payload, 'post_bridge');
                         }, 260);
                         return true;
                       } catch (error) {
-                        console.log('READER_LINK bridge_error href=' + payload.href + ' attempt=' + attempt + ' error=' + error);
+                        readerConsoleLog('READER_LINK bridge_error href=' + payload.href + ' attempt=' + attempt + ' error=' + error);
                       }
                     } else {
-                      console.log('READER_LINK bridge_missing href=' + payload.href + ' attempt=' + attempt);
+                      readerConsoleLog('READER_LINK bridge_missing href=' + payload.href + ' attempt=' + attempt);
                     }
                     if (attempt < 3) {
                       window.setTimeout(function () {
@@ -1082,7 +1895,7 @@ object ReaderHtmlDocumentBuilder {
                       }, attempt === 0 ? 60 : 220);
                       return true;
                     }
-                    console.log('READER_LINK bridge_gave_up href=' + payload.href);
+                    readerConsoleLog('READER_LINK bridge_gave_up href=' + payload.href);
                     fallbackReaderLinkNavigation(payload, 'bridge_gave_up');
                     return false;
                   }
@@ -1093,7 +1906,7 @@ object ReaderHtmlDocumentBuilder {
                         window.kmpJsBridge.callNative('readerHighlightClicked', JSON.stringify({ id: highlightId }));
                         return true;
                       } catch (error) {
-                        console.log('READER_HIGHLIGHT bridge_error id=' + highlightId + ' error=' + error);
+                        readerConsoleLog('READER_HIGHLIGHT bridge_error id=' + highlightId + ' error=' + error);
                       }
                     }
                     return false;
@@ -1103,8 +1916,16 @@ object ReaderHtmlDocumentBuilder {
                     if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
                       try {
                         window.kmpJsBridge.callNative('readerHighlightCreated', JSON.stringify(payload));
+                        readerHighlightFlowLog(
+                          'bridge_send_success attempt=' + attempt +
+                          ' cfi="' + readerTtsPreview(payload && payload.cfi, 120) + '"' +
+                          ' color=' + ((payload && payload.colorId) || 'null') +
+                          ' chapter=' + ((payload && payload.chapterIndex) !== undefined ? payload.chapterIndex : 'null') +
+                          ' textChars=' + (((payload && payload.text) || '').length)
+                        );
                         return true;
                       } catch (error) {
+                        readerHighlightFlowLog('bridge_send_error attempt=' + attempt + ' error=' + readerTtsPreview(error, 180));
                         readerSelectionDebugLog('highlight_bridge_error attempt=' + attempt + ' error=' + readerTtsPreview(error, 180));
                       }
                     }
@@ -1114,6 +1935,7 @@ object ReaderHtmlDocumentBuilder {
                       }, attempt === 0 ? 80 : 240);
                       return true;
                     }
+                    readerHighlightFlowLog('bridge_send_missing attempts=' + (attempt + 1));
                     readerSelectionDebugLog('highlight_bridge_missing attempts=' + (attempt + 1));
                     return false;
                   }
@@ -1613,15 +2435,55 @@ object ReaderHtmlDocumentBuilder {
                     }
                   }
                   function sendSelectionAction(action, text) {
+                    var payload = {
+                      action: action,
+                      text: text
+                    };
+                    var actionRange = savedRange;
+                    if (!actionRange) {
+                      var actionSelection = window.getSelection && window.getSelection();
+                      if (actionSelection && actionSelection.rangeCount > 0) actionRange = actionSelection.getRangeAt(0);
+                    }
+                    var actionSegments = selectionSegmentsForRange(actionRange);
+                    if (actionSegments.length) {
+                      var firstSegment = actionSegments[0];
+                      var lastSegment = actionSegments[actionSegments.length - 1];
+                      var sameChapter = actionSegments.every(function (segment) {
+                        return segment.chapterIndex === firstSegment.chapterIndex;
+                      });
+                      if (sameChapter) {
+                        var pageIndex = firstSegment.pageIndex;
+                        if (pageIndex < 0 && firstSegment.startOffset !== null) {
+                          var anchorPage = pageForLocator(firstSegment.chapterIndex, firstSegment.startOffset);
+                          if (anchorPage) pageIndex = anchorPage.pageIndex;
+                        }
+                        var cfi = readerHighlightCfiForRange(
+                          firstSegment,
+                          lastSegment,
+                          firstSegment.chapterIndex,
+                          firstSegment.startOffset,
+                          lastSegment.endOffset
+                        );
+                        payload.locator = {
+                          chapterIndex: firstSegment.chapterIndex,
+                          chapterId: firstSegment.chapterId,
+                          href: firstSegment.chapterHref || null,
+                          pageIndex: pageIndex >= 0 ? pageIndex : null,
+                          startOffset: firstSegment.startOffset,
+                          endOffset: lastSegment.endOffset,
+                          blockIndex: firstSegment.blockIndex,
+                          charOffset: firstSegment.charOffset,
+                          textQuote: text,
+                          cfi: cfi
+                        };
+                      }
+                    }
                     if (window.kmpJsBridge && window.kmpJsBridge.callNative) {
                       try {
-                        window.kmpJsBridge.callNative('readerSelectionAction', JSON.stringify({
-                          action: action,
-                          text: text
-                        }));
+                        window.kmpJsBridge.callNative('readerSelectionAction', JSON.stringify(payload));
                         return true;
                       } catch (error) {
-                        console.log('READER_SELECTION_ACTION bridge_error action=' + action + ' error=' + error);
+                        readerConsoleLog('READER_SELECTION_ACTION bridge_error action=' + action + ' error=' + error);
                       }
                     }
                     fallbackSelectionAction(action, text);
@@ -1693,6 +2555,92 @@ object ReaderHtmlDocumentBuilder {
                     }
                     return text;
                   }
+                  function readerTextBlock(node) {
+                    var parent = node && node.parentElement;
+                    return parent && parent.closest
+                      ? parent.closest('p, li, blockquote, pre, h1, h2, h3, h4, h5, h6, td, th, figcaption, div, section')
+                      : null;
+                  }
+                  function contentStartOffset(content) {
+                    var pageHost = content && content.closest ? content.closest('[data-reader-page-start]') : null;
+                    return numberAttribute(content, 'data-reader-content-start', numberAttribute(pageHost, 'data-reader-page-start', 0));
+                  }
+                  function normalizedOffsetForBoundary(root, container, offset) {
+                    if (!root || !container) return null;
+                    var nodes = textNodesUnder(root, true);
+                    if (!nodes.length) return 0;
+                    var boundary = document.createRange();
+                    try {
+                      boundary.setStart(container, offset);
+                      boundary.collapse(true);
+                    } catch (error) {
+                      boundary.detach && boundary.detach();
+                      return null;
+                    }
+                    var state = {
+                      cursor: 0,
+                      sawText: false,
+                      inWhitespace: false,
+                      previousBlock: null
+                    };
+                    function applyBlockBoundary(node) {
+                      var currentBlock = readerTextBlock(node);
+                      if (state.previousBlock && currentBlock && currentBlock !== state.previousBlock && state.sawText && !state.inWhitespace) {
+                        state.inWhitespace = true;
+                        state.cursor += 1;
+                      }
+                      if (currentBlock) state.previousBlock = currentBlock;
+                    }
+                    function consumeNormalizedText(value, limit) {
+                      var safeLimit = Math.max(0, Math.min(value.length, limit));
+                      for (var i = 0; i < safeLimit; i++) {
+                        if (/^\s$/.test(value[i])) {
+                          if (!state.sawText) continue;
+                          if (!state.inWhitespace) {
+                            state.inWhitespace = true;
+                            state.cursor += 1;
+                          }
+                          continue;
+                        }
+                        if (state.inWhitespace) state.inWhitespace = false;
+                        state.sawText = true;
+                        state.cursor += 1;
+                      }
+                    }
+                    try {
+                      for (var n = 0; n < nodes.length; n++) {
+                        var node = nodes[n];
+                        var value = node.nodeValue || '';
+                        if (node === container) {
+                          applyBlockBoundary(node);
+                          consumeNormalizedText(value, offset);
+                          return state.cursor;
+                        }
+                        var nodeRange = document.createRange();
+                        var endsBeforeBoundary = false;
+                        var startsAfterBoundary = false;
+                        try {
+                          nodeRange.selectNodeContents(node);
+                          endsBeforeBoundary = nodeRange.compareBoundaryPoints(Range.END_TO_START, boundary) <= 0;
+                          startsAfterBoundary = nodeRange.compareBoundaryPoints(Range.START_TO_START, boundary) >= 0;
+                        } catch (error) {
+                          startsAfterBoundary = true;
+                        } finally {
+                          nodeRange.detach && nodeRange.detach();
+                        }
+                        if (endsBeforeBoundary) {
+                          applyBlockBoundary(node);
+                          consumeNormalizedText(value, value.length);
+                          continue;
+                        }
+                        if (startsAfterBoundary) return state.cursor;
+                        return state.cursor;
+                      }
+                      return state.cursor;
+                    } finally {
+                      boundary.detach && boundary.detach();
+                    }
+                  }
                   function explicitTextHostForBoundary(root, container) {
                     if (!root || !container) return null;
                     var element = container.nodeType === Node.TEXT_NODE ? container.parentElement : container;
@@ -1701,6 +2649,66 @@ object ReaderHtmlDocumentBuilder {
                     if (host && (host === root || root.contains(host))) return host;
                     return null;
                   }
+                  function readerTextHostForOffset(content, offset, preferEnd) {
+                    if (!content || !Number.isFinite(offset)) return null;
+                    var hosts = Array.prototype.slice.call(content.querySelectorAll('[data-reader-text-start][data-reader-text-end][data-reader-cfi]'));
+                    for (var i = 0; i < hosts.length; i++) {
+                      var host = hosts[i];
+                      var start = numberAttribute(host, 'data-reader-text-start', null);
+                      var end = numberAttribute(host, 'data-reader-text-end', null);
+                      var cfi = host.getAttribute && host.getAttribute('data-reader-cfi');
+                      if (start === null || end === null || !cfi || cfi.charAt(0) !== '/') continue;
+                      if (preferEnd) {
+                        if (offset > start && offset <= end) return host;
+                      } else if (offset >= start && offset < end) {
+                        return host;
+                      }
+                    }
+                    return null;
+                  }
+                  function readerCfiPointForOffset(content, offset, preferEnd) {
+                    var host = readerTextHostForOffset(content, offset, preferEnd);
+                    if (!host) return null;
+                    var baseCfi = String(host.getAttribute('data-reader-cfi') || '').split(':')[0];
+                    var hostStart = numberAttribute(host, 'data-reader-text-start', null);
+                    var hostEnd = numberAttribute(host, 'data-reader-text-end', null);
+                    if (!baseCfi || hostStart === null || hostEnd === null) return null;
+                    var localOffset = Math.max(0, Math.min(offset - hostStart, Math.max(0, hostEnd - hostStart)));
+                    return baseCfi + ':' + localOffset;
+                  }
+                  function readerBlockPositionForOffset(content, offset, preferEnd) {
+                    if (!content || !Number.isFinite(offset)) return null;
+                    var hosts = Array.prototype.slice.call(content.querySelectorAll('[data-reader-text-start][data-reader-text-end][data-reader-block-index]'));
+                    var host = null;
+                    for (var i = 0; i < hosts.length; i++) {
+                      var candidate = hosts[i];
+                      var start = numberAttribute(candidate, 'data-reader-text-start', null);
+                      var end = numberAttribute(candidate, 'data-reader-text-end', null);
+                      if (start === null || end === null || end < start) continue;
+                      if (preferEnd) {
+                        if (offset > start && offset <= end) {
+                          host = candidate;
+                          break;
+                        }
+                      } else if (offset >= start && offset < end) {
+                        host = candidate;
+                        break;
+                      }
+                    }
+                    if (!host) return null;
+                    var blockIndex = numberAttribute(host, 'data-reader-block-index', null);
+                    if (blockIndex === null) return null;
+                    return {
+                      blockIndex: blockIndex,
+                      charOffset: offset
+                    };
+                  }
+                  function readerHighlightCfiForRange(startSegment, endSegment, chapterIndex, startOffset, endOffset) {
+                    var startPoint = readerCfiPointForOffset(startSegment && startSegment.content, startOffset, false);
+                    var endPoint = readerCfiPointForOffset(endSegment && endSegment.content, endOffset, true);
+                    if (startPoint && endPoint) return startPoint + '|' + endPoint;
+                    return 'desktop:' + chapterIndex + ':' + startOffset + ':' + endOffset;
+                  }
                   function absoluteOffsetForBoundary(root, container, offset) {
                     var host = explicitTextHostForBoundary(root, container);
                     if (!host) return null;
@@ -1708,6 +2716,12 @@ object ReaderHtmlDocumentBuilder {
                     if (hostStart === null) return null;
                     var localOffset = offsetForBoundary(host, container, offset);
                     return localOffset === null ? null : hostStart + localOffset;
+                  }
+                  function boundaryOffsetWithinContent(content, container, offset) {
+                    var explicitOffset = absoluteOffsetForBoundary(content, container, offset);
+                    if (explicitOffset !== null) return explicitOffset;
+                    var normalizedOffset = normalizedOffsetForBoundary(content, container, offset);
+                    return normalizedOffset === null ? null : contentStartOffset(content) + normalizedOffset;
                   }
                   function trimSourceOffsets(rawStart, rawEnd, text) {
                     if (rawStart === null || rawEnd === null || rawEnd < rawStart) return { start: null, end: null };
@@ -1723,8 +2737,8 @@ object ReaderHtmlDocumentBuilder {
                   }
                   function rangeOffsetsWithinContent(content, range) {
                     if (!content || !range) return { start: null, end: null };
-                    var rawStart = absoluteOffsetForBoundary(content, range.startContainer, range.startOffset);
-                    var rawEnd = absoluteOffsetForBoundary(content, range.endContainer, range.endOffset);
+                    var rawStart = boundaryOffsetWithinContent(content, range.startContainer, range.startOffset);
+                    var rawEnd = boundaryOffsetWithinContent(content, range.endContainer, range.endOffset);
                     return trimSourceOffsets(rawStart, rawEnd, range.toString());
                   }
                   function rangeIntersectsRange(range, candidate) {
@@ -1757,7 +2771,12 @@ object ReaderHtmlDocumentBuilder {
                     var contentRange = document.createRange();
                     try {
                       contentRange.selectNodeContents(content);
-                      if (!rangeIntersectsRange(range, contentRange)) return null;
+                      var boundaryInside = nodeInside(content, range.startContainer) || nodeInside(content, range.endContainer);
+                      var intersectsContent = boundaryInside;
+                      if (!intersectsContent && range.intersectsNode) {
+                        try { intersectsContent = range.intersectsNode(content); } catch (error) {}
+                      }
+                      if (!intersectsContent && !rangeIntersectsRange(range, contentRange)) return null;
                       var clipped = document.createRange();
                       if (nodeInside(content, range.startContainer)) {
                         clipped.setStart(range.startContainer, range.startOffset);
@@ -1794,24 +2813,52 @@ object ReaderHtmlDocumentBuilder {
                       var content = container && container.closest ? container.closest('.reader-content') : null;
                       if (content) contents = [content];
                     }
-                    return contents.map(function (content) {
+                    var diagnostics = {
+                      noRange: 0,
+                      badOffsets: [],
+                      missingHost: 0,
+                      blankText: 0
+                    };
+                    var segments = contents.map(function (content) {
                       var segmentRange = clippedRangeForContent(content, range);
-                      if (!segmentRange) return null;
+                      if (!segmentRange) {
+                        diagnostics.noRange += 1;
+                        return null;
+                      }
                       var offsets = rangeOffsetsWithinContent(content, segmentRange);
                       if (offsets.start === null || offsets.end === null || offsets.end <= offsets.start) {
+                        if (diagnostics.badOffsets.length < 4) {
+                          diagnostics.badOffsets.push(
+                            'start=' + offsets.start +
+                            ',end=' + offsets.end +
+                            ',textChars=' + segmentRange.toString().trim().length
+                          );
+                        }
                         segmentRange.detach && segmentRange.detach();
                         return null;
                       }
                       var readerHost = content.closest ? content.closest('[data-reader-chapter-index]') : null;
                       if (!readerHost) {
+                        diagnostics.missingHost += 1;
                         segmentRange.detach && segmentRange.detach();
                         return null;
                       }
                       var segmentText = segmentRange.toString().trim();
                       if (!segmentText) {
+                        diagnostics.blankText += 1;
                         segmentRange.detach && segmentRange.detach();
                         return null;
                       }
+                      var blockPosition = readerBlockPositionForOffset(content, offsets.start, false);
+                      readerDesktopHighlightMapLog(
+                        'web_selection_segment chapter=' + parseInt(readerHost.getAttribute('data-reader-chapter-index') || '0', 10) +
+                        ' page=' + parseInt(readerHost.getAttribute('data-reader-page-index') || '-1', 10) +
+                        ' offsets=' + offsets.start + '..' + offsets.end +
+                        ' block=' + (blockPosition ? blockPosition.blockIndex : 'null') +
+                        ' char=' + (blockPosition ? blockPosition.charOffset : offsets.start) +
+                        ' textChars=' + segmentText.length +
+                        ' text="' + readerTtsPreview(segmentText, 120) + '"'
+                      );
                       return {
                         range: segmentRange,
                         content: content,
@@ -1822,9 +2869,23 @@ object ReaderHtmlDocumentBuilder {
                         chapterHref: readerHost.getAttribute('data-reader-chapter-href'),
                         pageIndex: parseInt(readerHost.getAttribute('data-reader-page-index') || '-1', 10),
                         startOffset: offsets.start,
-                        endOffset: offsets.end
+                        endOffset: offsets.end,
+                        blockIndex: blockPosition ? blockPosition.blockIndex : null,
+                        charOffset: blockPosition ? blockPosition.charOffset : offsets.start
                       };
                     }).filter(Boolean);
+                    if (!segments.length) {
+                      readerHighlightFlowLog(
+                        'selection_segments_rejected contents=' + contents.length +
+                        ' noRange=' + diagnostics.noRange +
+                        ' badOffsets=' + diagnostics.badOffsets.length +
+                        ' missingHost=' + diagnostics.missingHost +
+                        ' blankText=' + diagnostics.blankText +
+                        ' common=' + selectionDebugNode(range.commonAncestorContainer) +
+                        ' badOffsetSamples="' + diagnostics.badOffsets.join('; ') + '"'
+                      );
+                    }
+                    return segments;
                   }
                   function rangeMatchesStoredOffsets(content, range, startOffset, endOffset) {
                     var offsets = rangeOffsetsWithinContent(content, range);
@@ -1935,8 +2996,9 @@ object ReaderHtmlDocumentBuilder {
                     }
                     function textHostForOffset(offset, preferEnd) {
                       if (sourceCfi) {
+                        var sourceCfiBases = readerCfiBases(sourceCfi);
                         var cfiHosts = hosts.filter(function (host) {
-                          return host.getAttribute && host.getAttribute('data-reader-cfi') === sourceCfi;
+                          return readerHostMatchesCfi(host, sourceCfiBases);
                         });
                         var cfiBest = null;
                         var cfiBestSpan = Number.MAX_SAFE_INTEGER;
@@ -2107,6 +3169,72 @@ object ReaderHtmlDocumentBuilder {
                     );
                     return range;
                   }
+                  function readerCfiPointBase(cfiPoint) {
+                    return String(cfiPoint || '').split(':')[0];
+                  }
+                  function readerCfiBases(sourceCfi) {
+                    var stable = stableReaderCfi(sourceCfi);
+                    if (!stable) return [];
+                    var seen = {};
+                    return String(stable).split('|').map(function (part) {
+                      return readerCfiPointBase(part);
+                    }).filter(function (base) {
+                      if (!base || base.charAt(0) !== '/' || seen[base]) return false;
+                      seen[base] = true;
+                      return true;
+                    });
+                  }
+                  function readerHostMatchesCfi(host, cfiBases) {
+                    if (!host || !host.getAttribute || !cfiBases || !cfiBases.length) return false;
+                    return cfiBases.indexOf(host.getAttribute('data-reader-cfi')) >= 0;
+                  }
+                  function readerElementForSourceCfi(root, sourceCfi) {
+                    if (!root || !root.querySelector) return null;
+                    var bases = readerCfiBases(sourceCfi);
+                    for (var i = 0; i < bases.length; i++) {
+                      var element = root.querySelector('[data-reader-cfi="' + selectorValue(bases[i]) + '"]');
+                      if (element) return element;
+                    }
+                    return null;
+                  }
+                  function readerCfiPointLocalOffset(cfiPoint) {
+                    var parts = String(cfiPoint || '').split(':');
+                    if (parts.length < 2) return 0;
+                    var parsed = parseInt(parts[1], 10);
+                    return Number.isFinite(parsed) ? parsed : 0;
+                  }
+                  function readerHostElementForCfiPoint(chapterIndex, cfiPoint) {
+                    var baseCfi = readerCfiPointBase(cfiPoint);
+                    if (!baseCfi || baseCfi.charAt(0) !== '/') return null;
+                    var chapterSelector = '[data-reader-chapter-index="' + selectorValue(chapterIndex) + '"]';
+                    var hosts = Array.prototype.slice.call(document.querySelectorAll(chapterSelector));
+                    for (var i = 0; i < hosts.length; i++) {
+                      var content = hosts[i].querySelector('.reader-content') || hosts[i];
+                      var cfiHost = content.querySelector('[data-reader-cfi="' + selectorValue(baseCfi) + '"]');
+                      if (cfiHost) return cfiHost;
+                    }
+                    return null;
+                  }
+                  function readerContentOffsetForCfiPoint(chapterIndex, cfiPoint) {
+                    var cfiHost = readerHostElementForCfiPoint(chapterIndex, cfiPoint);
+                    if (!cfiHost) return null;
+                    var hostStart = numberAttribute(cfiHost, 'data-reader-text-start', null);
+                    var hostEnd = numberAttribute(cfiHost, 'data-reader-text-end', null);
+                    if (hostStart === null || hostEnd === null || hostEnd < hostStart) return null;
+                    var localOffset = Math.max(0, readerCfiPointLocalOffset(cfiPoint));
+                    return Math.max(hostStart, Math.min(hostEnd, hostStart + localOffset));
+                  }
+                  function readerOffsetsForSourceCfi(chapterIndex, sourceCfi, expectedText) {
+                    if (!sourceCfi || sourceCfi.charAt(0) !== '/') return null;
+                    var parts = String(sourceCfi).split('|');
+                    var startPoint = parts[0];
+                    var endPoint = parts[parts.length - 1] || startPoint;
+                    var startOffset = readerContentOffsetForCfiPoint(chapterIndex, startPoint);
+                    var endOffset = readerContentOffsetForCfiPoint(chapterIndex, endPoint);
+                    if (startOffset === null || endOffset === null || endOffset < startOffset) return null;
+                    if (endOffset === startOffset && expectedText) endOffset = startOffset + String(expectedText).length;
+                    return { startOffset: startOffset, endOffset: endOffset };
+                  }
                   function applyHighlightObject(highlight) {
                     if (!highlight) return;
                     var locator = highlight.locator || {};
@@ -2114,17 +3242,69 @@ object ReaderHtmlDocumentBuilder {
                     if (chapterIndex === undefined || chapterIndex === null) chapterIndex = highlight.chapterIndex;
                     var startOffset = locator.startOffset;
                     var endOffset = locator.endOffset;
+                    var sourceCfi = locator.cfi || highlight.cfi;
+                    var expectedText = locator.textQuote || highlight.text || '';
+                    var sourceCfiIsStructural = sourceCfi && String(sourceCfi).charAt(0) === '/';
+                    readerDesktopHighlightMapLog(
+                      'web_apply_start id=' + (highlight.id || '') +
+                      ' chapter=' + chapterIndex +
+                      ' page=' + locator.pageIndex +
+                      ' offsets=' + startOffset + '..' + endOffset +
+                      ' block=' + locator.blockIndex +
+                      ' char=' + locator.charOffset +
+                      ' textChars=' + String(expectedText || '').length +
+                      ' cfi=' + readerTtsPreview(sourceCfi, 160)
+                    );
+                    var cfiOffsets = readerOffsetsForSourceCfi(chapterIndex, sourceCfi, expectedText);
+                    if (cfiOffsets) {
+                      startOffset = cfiOffsets.startOffset;
+                      endOffset = cfiOffsets.endOffset;
+                      readerDesktopHighlightMapLog(
+                        'web_apply_cfi_offsets id=' + (highlight.id || '') +
+                        ' offsets=' + startOffset + '..' + endOffset
+                      );
+                    } else if (sourceCfiIsStructural) {
+                      readerDesktopHighlightMapLog(
+                        'web_apply_cfi_offsets_missing id=' + (highlight.id || '') +
+                        ' cfi=' + readerTtsPreview(sourceCfi, 160)
+                      );
+                      startOffset = null;
+                      endOffset = null;
+                    }
+                    if (startOffset === undefined || startOffset === null || endOffset === undefined || endOffset === null || endOffset <= startOffset) {
+                      var blockChar = parseInt(locator.charOffset, 10);
+                      if (Number.isFinite(blockChar) && expectedText) {
+                        startOffset = blockChar;
+                        endOffset = blockChar + String(expectedText).length;
+                        readerDesktopHighlightMapLog(
+                          'web_apply_block_offsets id=' + (highlight.id || '') +
+                          ' offsets=' + startOffset + '..' + endOffset +
+                          ' block=' + locator.blockIndex
+                        );
+                      }
+                    }
+                    var hasPreciseOffsets = !(chapterIndex === undefined || chapterIndex === null || startOffset === undefined || startOffset === null || endOffset === undefined || endOffset === null || endOffset <= startOffset);
                     if (chapterIndex === undefined || chapterIndex === null || startOffset === undefined || startOffset === null || endOffset === undefined || endOffset === null || endOffset <= startOffset) {
+                      readerDesktopHighlightMapLog(
+                        'web_apply_fallback_request id=' + (highlight.id || '') +
+                        ' reason=invalid_offsets chapter=' + chapterIndex +
+                        ' offsets=' + startOffset + '..' + endOffset
+                      );
+                      if (sourceCfiIsStructural) return;
                       applyHighlightTextFallback(highlight);
                       return;
                     }
                     var targetChapters = readerHostsForLocator(chapterIndex, startOffset, endOffset);
                     if (!targetChapters.length) {
+                      readerDesktopHighlightMapLog(
+                        'web_apply_fallback_request id=' + (highlight.id || '') +
+                        ' reason=no_target_chapters chapter=' + chapterIndex +
+                        ' offsets=' + startOffset + '..' + endOffset
+                      );
+                      if (hasPreciseOffsets) return;
                       applyHighlightTextFallback(highlight);
                       return;
                     }
-                    var sourceCfi = locator.cfi || highlight.cfi;
-                    var expectedText = locator.textQuote || highlight.text || '';
                     var expectedNormalized = readerTtsNormalized(expectedText);
                     var applied = false;
                     targetChapters.forEach(function (targetChapter) {
@@ -2152,7 +3332,7 @@ object ReaderHtmlDocumentBuilder {
                         var content = chapter ? (chapter.querySelector('.reader-content') || chapter) : null;
                         var searchRoot = content;
                         if (content && sourceCfi) {
-                          searchRoot = content.querySelector('[data-reader-cfi="' + selectorValue(sourceCfi) + '"]') || content;
+                          searchRoot = readerElementForSourceCfi(content, sourceCfi) || content;
                         }
                         if (content && searchRoot === content) {
                           var hosts = Array.prototype.slice.call(content.querySelectorAll('[data-reader-text-start][data-reader-text-end]'));
@@ -2196,10 +3376,25 @@ object ReaderHtmlDocumentBuilder {
                         marker.setAttribute('data-cfi', sourceCfi || highlight.cfi || ('desktop:' + chapterIndex + ':' + startOffset + ':' + endOffset));
                         return marker;
                       });
+                      readerDesktopHighlightMapLog(
+                        'web_apply_segment id=' + (highlight.id || '') +
+                        ' chapter=' + chapterIndex +
+                        ' page=' + numberAttribute(targetChapter, 'data-reader-page-index', 'null') +
+                        ' segment=' + segmentStart + '..' + segmentEnd +
+                        ' expectedChars=' + expectedNormalized.length +
+                        ' actualChars=' + actualNormalized.length +
+                        ' root=' + readerElementLabel(targetChapter)
+                      );
                       applied = true;
                       range.detach && range.detach();
                     });
                     if (!applied) {
+                      readerDesktopHighlightMapLog(
+                        'web_apply_fallback_request id=' + (highlight.id || '') +
+                        ' reason=no_segments_applied chapter=' + chapterIndex +
+                        ' offsets=' + startOffset + '..' + endOffset
+                      );
+                      if (hasPreciseOffsets) return;
                       applyHighlightTextFallback(highlight);
                     }
                   }
@@ -2209,18 +3404,42 @@ object ReaderHtmlDocumentBuilder {
                     if (chapterIndex === undefined || chapterIndex === null) chapterIndex = highlight.chapterIndex;
                     var expectedText = readerTtsNormalized(locator.textQuote || highlight.text || '');
                     if (!expectedText) return false;
-                    var root = chapterIndex === undefined || chapterIndex === null
+                    var blockElement = chapterIndex === undefined || chapterIndex === null
+                      ? null
+                      : readerElementForBlockLocator(chapterIndex, locator.blockIndex, locator.charOffset);
+                    var root = blockElement || (chapterIndex === undefined || chapterIndex === null
                       ? document.body
-                      : readerHostForLocator(chapterIndex, locator.startOffset, locator.endOffset);
+                      : readerHostForLocator(chapterIndex, locator.startOffset, locator.endOffset));
                     if (!root) root = document.body;
                     var content = root.querySelector ? (root.querySelector('.reader-content') || root) : root;
+                    var sourceCfi = locator.cfi || highlight.cfi;
+                    var cfiPoint = sourceCfi ? String(sourceCfi).split('|')[0] : null;
+                    var cfiHost = readerHostElementForCfiPoint(chapterIndex, cfiPoint);
+                    if (cfiHost) content = cfiHost;
+                    readerDesktopHighlightMapLog(
+                      'web_text_fallback_start id=' + ((highlight && highlight.id) || '') +
+                      ' chapter=' + chapterIndex +
+                      ' root=' + readerElementLabel(content) +
+                      ' expectedChars=' + expectedText.length +
+                      ' cfi=' + readerTtsPreview(sourceCfi, 160)
+                    );
                     var range = normalizedRangeForText(content, expectedText, false);
-                    if (!range || range.collapsed) return false;
+                    if (!range || range.collapsed) {
+                      readerDesktopHighlightMapLog(
+                        'web_text_fallback_result id=' + ((highlight && highlight.id) || '') +
+                        ' applied=false reason=' + (!range ? 'no_range' : 'collapsed')
+                      );
+                      return false;
+                    }
                     wrapRangeTextSegments(range, function () {
                       var marker = createReaderHighlightMarker(highlight.id, highlight.colorId || 'yellow', null, null);
                       marker.setAttribute('data-cfi', locator.cfi || highlight.cfi || '');
                       return marker;
                     });
+                    readerDesktopHighlightMapLog(
+                      'web_text_fallback_result id=' + ((highlight && highlight.id) || '') +
+                      ' applied=true text="' + readerTtsPreview(range.toString(), 120) + '"'
+                    );
                     range.detach && range.detach();
                     return true;
                   }
@@ -2323,7 +3542,7 @@ object ReaderHtmlDocumentBuilder {
                       var content = chapter ? (chapter.querySelector('.reader-content') || chapter) : null;
                       var searchRoot = content;
                       if (content && sourceCfi) {
-                        searchRoot = content.querySelector('[data-reader-cfi="' + selectorValue(sourceCfi) + '"]') || content;
+                        searchRoot = readerElementForSourceCfi(content, sourceCfi) || content;
                       }
                       var textRange = normalizedRangeForText(searchRoot, expectedNormalized, true);
                       if (textRange && !textRange.collapsed) {
@@ -2349,7 +3568,7 @@ object ReaderHtmlDocumentBuilder {
                   window.readerSetTtsLocator = function (locator, follow) {
                     try {
                       applyTtsLocator(locator);
-                      if (follow && locator) scrollToLocator(locator);
+                      if (follow && locator) scrollToLocator(locator, { align: 'center', trackRestore: false });
                     } catch (error) {
                       readerTtsLog('locator_exception error=' + readerTtsPreview(error, 180));
                     }
@@ -2369,11 +3588,31 @@ object ReaderHtmlDocumentBuilder {
                     var range = selection.getRangeAt(0);
                     var text = selection.toString().trim();
                     if (!text) return;
+                    readerHighlightFlowLog(
+                      'selection_begin mode=' + selectionDebugMode() +
+                      ' color=' + (colorId || 'yellow') +
+                      ' textChars=' + text.length +
+                      ' range=' + selectionDebugRange(range)
+                    );
                     var segments = selectionSegmentsForRange(range);
                     if (!segments.length) {
+                      readerHighlightFlowLog(
+                        'selection_segments_missing mode=' + selectionDebugMode() +
+                        ' text="' + readerTtsPreview(text, 120) + '"' +
+                        ' range=' + selectionDebugRange(range)
+                      );
                       readerSelectionDebugLog('highlight_selection_segments_missing text="' + readerTtsPreview(text, 120) + '"');
                       return;
                     }
+                    readerHighlightFlowLog(
+                      'selection_segments count=' + segments.length +
+                      ' details="' + segments.map(function (segment) {
+                        return 'chapter=' + segment.chapterIndex +
+                          ',page=' + segment.pageIndex +
+                          ',offsets=' + segment.startOffset + '..' + segment.endOffset +
+                          ',chars=' + segment.text.length;
+                      }).join('; ') + '"'
+                    );
                     var firstSegment = segments[0];
                     var lastSegment = segments[segments.length - 1];
                     var sameChapter = segments.every(function (segment) {
@@ -2389,7 +3628,16 @@ object ReaderHtmlDocumentBuilder {
                         var anchorPage = pageForLocator(chapterIndex, startOffset);
                         if (anchorPage) pageIndex = anchorPage.pageIndex;
                       }
-                      var cfi = 'desktop:' + chapterIndex + ':' + startOffset + ':' + endOffset;
+                      var cfi = readerHighlightCfiForRange(firstSegment, lastSegment, chapterIndex, startOffset, endOffset);
+                      readerDesktopHighlightMapLog(
+                        'web_payload_build sameChapter=true chapter=' + chapterIndex +
+                        ' page=' + pageIndex +
+                        ' offsets=' + startOffset + '..' + endOffset +
+                        ' block=' + firstSegment.blockIndex +
+                        ' char=' + firstSegment.charOffset +
+                        ' textChars=' + text.length +
+                        ' cfi=' + readerTtsPreview(cfi, 160)
+                      );
                       payloads.push({
                         cfi: cfi,
                         text: text,
@@ -2402,13 +3650,24 @@ object ReaderHtmlDocumentBuilder {
                           pageIndex: pageIndex >= 0 ? pageIndex : null,
                           startOffset: startOffset,
                           endOffset: endOffset,
+                          blockIndex: firstSegment.blockIndex,
+                          charOffset: firstSegment.charOffset,
                           textQuote: text,
                           cfi: cfi
                         }
                       });
                     } else {
                       segments.forEach(function (segment) {
-                        var cfi = 'desktop:' + segment.chapterIndex + ':' + segment.startOffset + ':' + segment.endOffset;
+                        var cfi = readerHighlightCfiForRange(segment, segment, segment.chapterIndex, segment.startOffset, segment.endOffset);
+                        readerDesktopHighlightMapLog(
+                          'web_payload_build sameChapter=false chapter=' + segment.chapterIndex +
+                          ' page=' + segment.pageIndex +
+                          ' offsets=' + segment.startOffset + '..' + segment.endOffset +
+                          ' block=' + segment.blockIndex +
+                          ' char=' + segment.charOffset +
+                          ' textChars=' + segment.text.length +
+                          ' cfi=' + readerTtsPreview(cfi, 160)
+                        );
                         payloads.push({
                           cfi: cfi,
                           text: segment.text,
@@ -2421,18 +3680,34 @@ object ReaderHtmlDocumentBuilder {
                             pageIndex: segment.pageIndex >= 0 ? segment.pageIndex : null,
                             startOffset: segment.startOffset,
                             endOffset: segment.endOffset,
+                            blockIndex: segment.blockIndex,
+                            charOffset: segment.charOffset,
                             textQuote: segment.text,
                             cfi: cfi
                           }
                         });
                       });
                     }
+                    readerHighlightFlowLog(
+                      'payloads_built count=' + payloads.length +
+                      ' sameChapter=' + sameChapter +
+                      ' details="' + payloads.map(function (payload) {
+                        var locator = payload.locator || {};
+                        return 'cfi=' + readerTtsPreview(payload.cfi, 80) +
+                          ',color=' + payload.colorId +
+                          ',chapter=' + payload.chapterIndex +
+                          ',page=' + locator.pageIndex +
+                          ',offsets=' + locator.startOffset + '..' + locator.endOffset +
+                          ',textChars=' + (payload.text || '').length;
+                      }).join('; ') + '"'
+                    );
                     try {
                       if (sameChapter) {
                         var payload = payloads[0];
                         var localRange = range.cloneRange ? range.cloneRange() : range;
+                        var wrappedSingle = false;
                         try {
-                          wrapRangeTextSegments(localRange, function () {
+                          wrappedSingle = wrapRangeTextSegments(localRange, function () {
                             var marker = createReaderHighlightMarker(null, colorId || 'yellow', payload.locator.startOffset, payload.locator.endOffset);
                             marker.setAttribute('data-cfi', payload.cfi);
                             return marker;
@@ -2440,17 +3715,27 @@ object ReaderHtmlDocumentBuilder {
                         } finally {
                           if (localRange !== range && localRange.detach) localRange.detach();
                         }
+                        readerHighlightFlowLog(
+                          'local_wrap_done sameChapter=true wrapped=' + wrappedSingle +
+                          ' cfi="' + readerTtsPreview(payload.cfi, 120) + '"'
+                        );
                       } else {
                         segments.forEach(function (segment, index) {
                           var payload = payloads[index];
-                          wrapRangeTextSegments(segment.range, function () {
+                          var wrappedSegment = wrapRangeTextSegments(segment.range, function () {
                             var marker = createReaderHighlightMarker(null, colorId || 'yellow', segment.startOffset, segment.endOffset);
                             marker.setAttribute('data-cfi', payload.cfi);
                             return marker;
                           });
+                          readerHighlightFlowLog(
+                            'local_wrap_done sameChapter=false segment=' + index +
+                            ' wrapped=' + wrappedSegment +
+                            ' cfi="' + readerTtsPreview(payload.cfi, 120) + '"'
+                          );
                         });
                       }
                     } catch (error) {
+                      readerHighlightFlowLog('local_wrap_error error=' + readerTtsPreview(error, 180));
                       readerSelectionDebugLog('highlight_local_wrap_error error=' + readerTtsPreview(error, 180));
                     } finally {
                       segments.forEach(function (segment) {
@@ -2460,6 +3745,7 @@ object ReaderHtmlDocumentBuilder {
                     payloads.forEach(function (payload) {
                       if (payload.text.length > 0) sendReaderHighlightCreated(payload, 0);
                     });
+                    readerHighlightFlowLog('selection_end sentPayloads=' + payloads.length);
                     scheduleReaderHighlightReconcile();
                     selection.removeAllRanges();
                     hideMenu();
@@ -2500,6 +3786,7 @@ object ReaderHtmlDocumentBuilder {
                     }
                     if (action === 'copy') copyText(text);
                     if (action === 'highlight') highlightRange(target.getAttribute('data-color-id') || 'yellow');
+                    if (action === 'palette') sendSelectionAction('palette', text);
                     if (action === 'define') sendSelectionAction('define', text);
                     if (action === 'speak') sendSelectionAction('speak', text);
                     if (action === 'web-search') sendSelectionAction('web-search', text);
@@ -2580,7 +3867,11 @@ object ReaderHtmlDocumentBuilder {
                   }, true);
                   document.addEventListener('scroll', scheduleVisiblePageReport, true);
                   window.addEventListener('scroll', scheduleVisiblePageReport, { passive: true });
+                  window.addEventListener('wheel', function () { clearPendingRestoreLocator('wheel'); }, { passive: true });
+                  window.addEventListener('touchstart', function () { clearPendingRestoreLocator('touchstart'); }, { passive: true });
+                  window.addEventListener('keydown', function () { clearPendingRestoreLocator('keydown'); });
                   document.addEventListener('pointerdown', function (event) {
+                    clearPendingRestoreLocator('pointerdown');
                     if (event.button === 0 && !menu.contains(event.target)) {
                       selectionPointerDown = true;
                       hideMenu();
@@ -2606,10 +3897,10 @@ object ReaderHtmlDocumentBuilder {
     }
 
     private fun SharedEpubChapter.toHtml(searchQuery: String, searchOptions: ReaderSearchOptions): String {
-        htmlContent.takeIf { it.isNotBlank() }?.let { return it }
         semanticBlocks.takeIf { it.isNotEmpty() }?.let { blocks ->
             return blocks.joinToString("") { it.toHtml(searchQuery, searchOptions) }
         }
+        htmlContent.takeIf { it.isNotBlank() }?.let { return it }
         return normalizedReaderText().textToParagraphHtml(searchQuery, searchOptions)
     }
 
@@ -2779,7 +4070,7 @@ object ReaderHtmlDocumentBuilder {
                 val tag = if (isOrdered) "ol" else "ul"
                 "<$tag${styleAttribute()}>${items.joinToString("") { it.toHtml(searchQuery, searchOptions) }}</$tag>"
             }
-            is SemanticImage -> "<figure${imageAnchorAttributes()}${styleAttribute()}><img src=\"${path.escapeHtml()}\" alt=\"${altText.orEmpty().escapeHtml()}\"${imageSizeAttribute()}></figure>"
+            is SemanticImage -> "<figure${imageAnchorAttributes()}${styleAttribute()}><img src=\"${path.escapeHtml()}\" alt=\"${altText.orEmpty().escapeHtml()}\" loading=\"lazy\" decoding=\"async\"${imageSizeAttribute()}></figure>"
             is SemanticMath -> svgContent ?: "<pre${styleAttribute()}>${altText.orEmpty().highlightAndEscape(searchQuery, searchOptions)}</pre>"
             is SemanticSpacer -> if (isExplicitLineBreak) "<br>" else "<div${styleAttribute("height:1em")}></div>"
             is SemanticTable -> rows.joinToString("", "<table${styleAttribute()}><tbody>", "</tbody></table>") { row ->
@@ -2855,6 +4146,7 @@ object ReaderHtmlDocumentBuilder {
         val end = (start + text.length).coerceAtLeast(start)
         return buildString {
             append(" data-reader-text-start=\"$start\" data-reader-text-end=\"$end\"")
+            append(" data-reader-block-index=\"$blockIndex\"")
             elementId?.takeIf { it.isNotBlank() }?.let {
                 append(" id=\"${it.escapeHtml()}\" data-reader-element-id=\"${it.escapeHtml()}\"")
             }
@@ -3169,6 +4461,45 @@ object ReaderHtmlDocumentBuilder {
         )
     }
 
+    private fun ReaderSettings.readerTextAlignCss(): String {
+        return when (textAlign) {
+            SharedReaderTextAlign.START -> "left"
+            SharedReaderTextAlign.RIGHT -> "right"
+            SharedReaderTextAlign.JUSTIFY -> "justify"
+            SharedReaderTextAlign.CENTER -> "center"
+        }
+    }
+
+    private fun ReaderSettings.readerCustomFontUrl(): String? {
+        return customFontPath?.takeIf { it.isNotBlank() }?.toCssFontUrl()
+    }
+
+    private fun ReaderSettings.readerCustomFontFaceCss(): String {
+        val customFontUrl = readerCustomFontUrl() ?: return ""
+        return "@font-face { font-family: 'ReaderCustomFont'; src: url('$customFontUrl'); font-display: swap; }"
+    }
+
+    private fun ReaderSettings.readerFontFamilyCss(): String {
+        return if (readerCustomFontUrl() != null) {
+            "'ReaderCustomFont', Georgia, 'Times New Roman', serif"
+        } else {
+            when (fontFamily) {
+                "Serif" -> "Georgia, 'Times New Roman', serif"
+                "Sans" -> "Inter, Segoe UI, Arial, sans-serif"
+                "Mono" -> "'Roboto Mono', Consolas, monospace"
+                else -> "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+            }
+        }
+    }
+
+    private fun ReaderSettings.readerVerticalMarginY(): Int {
+        return (resolvedVerticalMargin / 3f).roundToInt().coerceIn(0, 56)
+    }
+
+    private fun ReaderSettings.readerImageScaleCss(): String {
+        return "${(imageScale * 100f).roundToInt().coerceIn(50, 200)}%"
+    }
+
     private fun String.toCssFontUrl(): String {
         val trimmed = trim()
         val normalizedInput = trimmed.replace("\\", "/")
@@ -3266,9 +4597,10 @@ object ReaderHtmlDocumentBuilder {
         contentEndOffset: Int
     ): String {
         val rangedHighlights = highlights
-            .mapNotNull { it.toRenderHighlight(contentStartOffset, contentEndOffset) }
+            .mapNotNull { it.toRenderHighlight(this, contentStartOffset, contentEndOffset) }
             .distinctBy { "${it.absoluteStart}:${it.absoluteEnd}:${it.id}" }
             .sortedWith(compareByDescending<RenderedHighlight> { it.relativeStart }.thenByDescending { it.relativeEnd })
+        val rangedHighlightIds = rangedHighlights.map { it.id }.toSet()
 
         val rangedHtml = rangedHighlights.fold(this) { html, highlight ->
             val htmlRange = html.htmlRangeForHighlight(highlight) ?: return@fold html
@@ -3282,6 +4614,7 @@ object ReaderHtmlDocumentBuilder {
         }
 
         return highlights
+            .filterNot { it.id in rangedHighlightIds }
             .filterNot { it.locator.withFallbacks(chapterIndex = it.chapterIndex, cfi = it.cfi, textQuote = it.text).hasTextRange }
             .fold(rangedHtml) { html, highlight ->
                 val text = highlight.text.trim().takeIf { it.isNotBlank() } ?: return@fold html
@@ -3420,6 +4753,41 @@ object ReaderHtmlDocumentBuilder {
         }.firstOrNull()
     }
 
+    private fun String.findTextBlockRangeByCfi(cfiPath: String): HtmlTextBlockRange? {
+        return findTextBlockRangeByAttribute("data-reader-cfi", cfiPath)
+    }
+
+    private fun String.findTextBlockRangeByBlockIndex(blockIndex: Int): HtmlTextBlockRange? {
+        return findTextBlockRangeByAttribute("data-reader-block-index", blockIndex.toString())
+    }
+
+    private fun String.findTextBlockRangeByAttribute(attributeName: String, attributeValue: String): HtmlTextBlockRange? {
+        return textBlockStartPattern.findAll(this).mapNotNull { match ->
+            val openingTag = substring(match.range.first, match.range.last + 1)
+            if (openingTag.htmlAttributeValue(attributeName) != attributeValue) return@mapNotNull null
+            val tagName = match.groupValues[1]
+            val blockStart = match.groupValues[2].toIntOrNull() ?: return@mapNotNull null
+            val blockEnd = match.groupValues[3].toIntOrNull() ?: return@mapNotNull null
+            val contentStart = match.range.last + 1
+            val closingTag = "</$tagName>"
+            val contentEnd = indexOf(closingTag, startIndex = contentStart, ignoreCase = true)
+            if (contentEnd < contentStart) return@mapNotNull null
+            HtmlTextBlockRange(
+                startOffset = blockStart,
+                endOffset = blockEnd,
+                contentStartIndex = contentStart,
+                contentEndIndex = contentEnd
+            )
+        }.firstOrNull()
+    }
+
+    private fun String.htmlAttributeValue(attributeName: String): String? {
+        return Regex("""\b${Regex.escape(attributeName)}="([^"]*)"""")
+            .find(this)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
+
     private fun String.htmlIndexForTextOffset(
         targetOffset: Int,
         startIndex: Int = 0,
@@ -3462,18 +4830,54 @@ object ReaderHtmlDocumentBuilder {
         return if (textOffset == targetOffset) boundaryAfterText ?: startIndex else null
     }
 
-    private fun UserHighlight.toRenderHighlight(contentStartOffset: Int, contentEndOffset: Int): RenderedHighlight? {
+    private fun UserHighlight.toRenderHighlight(
+        html: String,
+        contentStartOffset: Int,
+        contentEndOffset: Int
+    ): RenderedHighlight? {
         val normalizedLocator = locator.withFallbacks(chapterIndex = chapterIndex, cfi = cfi, textQuote = text)
+        val sourceCfi = normalizedLocator.cfi ?: cfi
+        html.absoluteRangeForSourceCfi(sourceCfi, normalizedLocator.textQuote ?: text)
+            ?.toRenderedHighlight(
+                source = this,
+                cfi = sourceCfi,
+                contentStartOffset = contentStartOffset,
+                contentEndOffset = contentEndOffset
+            )
+            ?.let { return it }
+        html.absoluteRangeForBlockLocator(normalizedLocator, normalizedLocator.textQuote ?: text)
+            ?.toRenderedHighlight(
+                source = this,
+                cfi = sourceCfi,
+                contentStartOffset = contentStartOffset,
+                contentEndOffset = contentEndOffset
+            )
+            ?.let { return it }
         val start = normalizedLocator.startOffset ?: return null
         val end = normalizedLocator.endOffset ?: start
+        if (end < start) return null
+        return HtmlAbsoluteTextRange(start, end).toRenderedHighlight(
+            source = this,
+            cfi = sourceCfi,
+            contentStartOffset = contentStartOffset,
+            contentEndOffset = contentEndOffset
+        )
+    }
+
+    private fun HtmlAbsoluteTextRange.toRenderedHighlight(
+        source: UserHighlight,
+        cfi: String,
+        contentStartOffset: Int,
+        contentEndOffset: Int
+    ): RenderedHighlight? {
         if (end < start) return null
         val boundedStart = start.coerceAtLeast(contentStartOffset)
         val boundedEnd = end.coerceAtMost(contentEndOffset)
         if (boundedEnd <= boundedStart) return null
         return RenderedHighlight(
-            id = id,
-            cfi = normalizedLocator.cfi ?: cfi,
-            color = color,
+            id = source.id,
+            cfi = cfi,
+            color = source.color,
             absoluteStart = boundedStart,
             absoluteEnd = boundedEnd,
             relativeStart = boundedStart - contentStartOffset,
@@ -3481,27 +4885,224 @@ object ReaderHtmlDocumentBuilder {
         )
     }
 
+    private fun String.absoluteRangeForSourceCfi(cfi: String?, quote: String): HtmlAbsoluteTextRange? {
+        val points = cfi
+            ?.takeIf { it.startsWith("/") || it.contains("|/") }
+            ?.split('|')
+            ?.mapNotNull { it.toHtmlSourceCfiPointOrNull() }
+            ?: return null
+        val startPoint = points.firstOrNull() ?: return null
+        val endPoint = points.lastOrNull() ?: startPoint
+        val startBlock = findTextBlockRangeByCfi(startPoint.path) ?: return null
+        val endBlock = findTextBlockRangeByCfi(endPoint.path) ?: startBlock
+        val start = startBlock.htmlCfiOffsetToAbsolute(startPoint.offset)
+        var end = endBlock.htmlCfiOffsetToAbsolute(endPoint.offset)
+        if (end == start && quote.isNotBlank()) {
+            end = start + quote.length
+        }
+        return if (end > start) HtmlAbsoluteTextRange(start, end) else null
+    }
+
+    private fun String.absoluteRangeForBlockLocator(locator: ReaderLocator, quote: String): HtmlAbsoluteTextRange? {
+        val blockIndex = locator.blockIndex ?: return null
+        val block = findTextBlockRangeByBlockIndex(blockIndex) ?: return null
+        val blockLength = block.endOffset - block.startOffset
+        val startOffset = locator.startOffset ?: locator.charOffset ?: return null
+        val rawEnd = locator.endOffset
+            ?: quote.takeIf { it.isNotBlank() }?.let { startOffset + it.length }
+            ?: return null
+        val start = block.htmlScopedOffsetToAbsoluteOrNull(startOffset, blockLength) ?: return null
+        val end = block.htmlScopedOffsetToAbsoluteOrNull(rawEnd, blockLength) ?: return null
+        return if (end > start) HtmlAbsoluteTextRange(start, end) else null
+    }
+
+    private fun HtmlTextBlockRange.htmlCfiOffsetToAbsolute(offset: Int): Int {
+        val blockLength = endOffset - startOffset
+        return when {
+            offset in 0..blockLength -> startOffset + offset
+            offset in startOffset..endOffset -> offset
+            else -> startOffset + offset.coerceIn(0, blockLength)
+        }
+    }
+
+    private fun HtmlTextBlockRange.htmlScopedOffsetToAbsoluteOrNull(offset: Int, blockLength: Int): Int? {
+        return when {
+            offset in 0..blockLength -> startOffset + offset
+            offset in startOffset..endOffset -> offset
+            else -> null
+        }
+    }
+
     private fun UserHighlight.belongsToPage(page: ReaderPage): Boolean {
         val normalizedLocator = locator.withFallbacks(chapterIndex = chapterIndex, cfi = cfi, textQuote = text)
         val locatorChapterIndex = normalizedLocator.chapterIndex ?: chapterIndex
         if (locatorChapterIndex != page.chapterIndex) return false
-        if (normalizedLocator.hasTextRange) {
-            val start = normalizedLocator.startOffset ?: return false
-            val end = normalizedLocator.endOffset ?: start
+        return page.containsHighlightLocator(normalizedLocator, cfi)
+    }
+
+    private fun ReaderPage.containsHighlightLocator(locator: ReaderLocator, fallbackCfi: String): Boolean {
+        if (containsBlockLocator(locator)) return true
+        if (containsSourceCfiLocator(locator, fallbackCfi)) return true
+        if (locator.hasTextRange) {
+            if (locator.hasHtmlStructuralScope(fallbackCfi)) return false
+            val start = locator.startOffset ?: return false
+            val end = locator.endOffset ?: start
             return if (start == end) {
-                start in page.startOffset..page.endOffset
+                start in startOffset..endOffset
             } else {
-                start < page.endOffset && end > page.startOffset
+                start < endOffset && end > startOffset
             }
         }
-        normalizedLocator.pageIndex?.let { return it == page.pageIndex }
-        val prefix = "desktop:${page.chapterIndex}:"
-        val desktopPageIndex = cfi
+        locator.pageIndex?.let { return it == pageIndex }
+        val prefix = "desktop:${chapterIndex}:"
+        val desktopPageIndex = fallbackCfi
             .takeIf { it.startsWith(prefix) }
             ?.removePrefix(prefix)
             ?.substringBefore(':')
             ?.toIntOrNull()
-        return desktopPageIndex == null || desktopPageIndex < 0 || desktopPageIndex == page.pageIndex
+        return desktopPageIndex != null && desktopPageIndex >= 0 && desktopPageIndex == pageIndex
+    }
+
+    private fun ReaderLocator.hasHtmlStructuralScope(fallbackCfi: String): Boolean {
+        val sourceCfi = cfi?.takeIf { it.isNotBlank() } ?: fallbackCfi
+        return blockIndex != null || sourceCfi.startsWith("/")
+    }
+
+    private fun ReaderPage.containsBlockLocator(locator: ReaderLocator): Boolean {
+        val blockIndex = locator.blockIndex ?: return false
+        val blocks = semanticBlocks.flattenHtmlSemanticBlocks()
+        if (blocks.isEmpty()) return false
+        val matchingBlocks = blocks.filter { it.blockIndex == blockIndex }
+        if (matchingBlocks.isEmpty()) return false
+        val charOffset = locator.charOffset ?: return true
+        val offsetFallsOnPage = if (startOffset == endOffset) {
+            charOffset == startOffset
+        } else {
+            charOffset >= startOffset && charOffset < endOffset
+        }
+        if (!offsetFallsOnPage) return false
+        return matchingBlocks.filterIsInstance<SemanticTextBlock>().any { block ->
+            val start = block.startCharOffsetInSource
+            val end = start + block.text.length
+            charOffset in start until end || (block.text.isEmpty() && charOffset == start)
+        }
+    }
+
+    private fun ReaderPage.containsSourceCfiLocator(locator: ReaderLocator, fallbackCfi: String): Boolean {
+        val cfi = (locator.cfi?.takeIf { it.isNotBlank() } ?: fallbackCfi)
+            .takeIf { it.startsWith("/") || it.contains("|/") }
+            ?: return false
+        val blocks = semanticBlocks.flattenHtmlSemanticBlocks().filterIsInstance<SemanticTextBlock>()
+        if (blocks.isEmpty()) return false
+        val parts = cfi.split('|').mapNotNull { it.toHtmlSourceCfiPointOrNull() }
+        val startPoint = parts.firstOrNull() ?: return false
+        val endPoint = parts.lastOrNull() ?: startPoint
+        val quoteLength = locator.textQuote?.length ?: 0
+        return blocks.any { block ->
+            val blockPath = block.cfi?.substringBefore(':')?.takeIf { it.startsWith("/") } ?: return@any false
+            val startMatches = htmlSourceCfiPathsEquivalent(startPoint.path, blockPath)
+            val endMatches = htmlSourceCfiPathsEquivalent(endPoint.path, blockPath)
+            val isIntermediate = parts.size > 1 &&
+                !startMatches &&
+                !endMatches &&
+                htmlSourceCfiPathStrictlyBetween(blockPath, startPoint.path, endPoint.path)
+            if (!startMatches && !endMatches && !isIntermediate) return@any false
+            val blockStart = block.startCharOffsetInSource
+            val blockEnd = blockStart + block.text.length
+            val rangeStart = when {
+                startMatches -> htmlSourceCfiOffsetToAbsolute(startPoint.offset, blockStart, block.text.length)
+                isIntermediate || endMatches -> blockStart
+                else -> blockStart
+            }
+            val rangeEnd = when {
+                endMatches && parts.size > 1 -> htmlSourceCfiOffsetToAbsolute(endPoint.offset, blockStart, block.text.length)
+                startMatches && parts.size == 1 && quoteLength > 0 ->
+                    htmlSourceCfiOffsetToAbsolute(startPoint.offset, blockStart, block.text.length) + quoteLength
+                startMatches && parts.size == 1 -> htmlSourceCfiOffsetToAbsolute(startPoint.offset, blockStart, block.text.length)
+                isIntermediate -> blockEnd
+                else -> blockEnd
+            }
+            if (rangeStart == rangeEnd) {
+                rangeStart in startOffset..endOffset
+            } else {
+                minOf(rangeStart, rangeEnd) < endOffset && maxOf(rangeStart, rangeEnd) > startOffset
+            }
+        }
+    }
+
+    private fun htmlSourceCfiOffsetToAbsolute(offset: Int, blockStart: Int, textLength: Int): Int {
+        val blockEnd = blockStart + textLength
+        return when {
+            offset in 0..textLength -> blockStart + offset
+            offset in blockStart..blockEnd -> offset
+            else -> blockStart + offset.coerceIn(0, textLength)
+        }
+    }
+
+    private data class HtmlSourceCfiPoint(
+        val path: String,
+        val offset: Int
+    )
+
+    private fun String.toHtmlSourceCfiPointOrNull(): HtmlSourceCfiPoint? {
+        val value = trim()
+        if (!value.startsWith("/")) return null
+        val separator = value.lastIndexOf(':')
+        return if (separator > 0 && separator < value.lastIndex) {
+            HtmlSourceCfiPoint(value.substring(0, separator), value.substring(separator + 1).toIntOrNull() ?: 0)
+        } else {
+            HtmlSourceCfiPoint(value, 0)
+        }
+    }
+
+    private fun htmlSourceCfiPathsEquivalent(first: String, second: String): Boolean {
+        if (first == second || first.startsWith("$second/") || second.startsWith("$first/")) return true
+        val firstParts = first.split('/').filter { it.isNotEmpty() }
+        val secondParts = second.split('/').filter { it.isNotEmpty() }
+        if (firstParts == secondParts) return true
+        return firstParts.size == secondParts.size &&
+            firstParts.isNotEmpty() &&
+            firstParts.drop(1) == secondParts.drop(1)
+    }
+
+    private fun htmlSourceCfiPathStrictlyBetween(candidate: String, start: String, end: String): Boolean {
+        val candidateParts = candidate.htmlSourceCfiNumericPathParts() ?: return false
+        val startParts = start.htmlSourceCfiNumericPathParts() ?: return false
+        val endParts = end.htmlSourceCfiNumericPathParts() ?: return false
+        return htmlSourceCfiComparePathParts(candidateParts, startParts) > 0 &&
+            htmlSourceCfiComparePathParts(candidateParts, endParts) < 0
+    }
+
+    private fun String.htmlSourceCfiNumericPathParts(): List<Int>? {
+        val parts = split('/').filter { it.isNotEmpty() }
+        if (parts.isEmpty()) return null
+        return parts.map { it.toIntOrNull() ?: return null }
+    }
+
+    private fun htmlSourceCfiComparePathParts(first: List<Int>, second: List<Int>): Int {
+        val length = minOf(first.size, second.size)
+        for (index in 0 until length) {
+            val comparison = first[index].compareTo(second[index])
+            if (comparison != 0) return comparison
+        }
+        return first.size.compareTo(second.size)
+    }
+
+    private fun List<SemanticBlock>.flattenHtmlSemanticBlocks(): List<SemanticBlock> {
+        return flatMap { it.flattenHtmlSemanticBlock() }
+    }
+
+    private fun SemanticBlock.flattenHtmlSemanticBlock(): List<SemanticBlock> {
+        return when (this) {
+            is SemanticList -> listOf(this) + items
+            is SemanticTable -> listOf(this) + rows.flatMap { row -> row.flatMap { cell -> cell.content.flattenHtmlSemanticBlocks() } }
+            is SemanticFlexContainer -> listOf(this) + children.flattenHtmlSemanticBlocks()
+            is SemanticWrappingBlock -> listOf(this, floatedImage) + paragraphsToWrap
+            is SemanticImage,
+            is SemanticMath,
+            is SemanticSpacer,
+            is SemanticTextBlock -> listOf(this)
+        }
     }
 
     private val UserHighlight.locatedChapterIndex: Int
@@ -3513,6 +5114,8 @@ object ReaderHtmlDocumentBuilder {
             pageIndex?.let { add("data-reader-active-page-index=\"$it\"") }
             startOffset?.let { add("data-reader-active-start-offset=\"$it\"") }
             endOffset?.let { add("data-reader-active-end-offset=\"$it\"") }
+            blockIndex?.let { add("data-reader-active-block-index=\"$it\"") }
+            charOffset?.let { add("data-reader-active-char-offset=\"$it\"") }
             cfi?.takeIf { it.isNotBlank() }?.let { add("data-reader-active-cfi=\"${it.escapeHtml()}\"") }
         }
         return if (attributes.isEmpty()) "" else " " + attributes.joinToString(" ")
@@ -3528,6 +5131,19 @@ object ReaderHtmlDocumentBuilder {
     private fun readerSelectionActionButton(action: String, label: String, pathData: String): String {
         val safeLabel = label.escapeHtml()
         return """<button type="button" class="reader-selection-action" data-action="${action.escapeHtml()}" aria-label="$safeLabel"><span class="reader-selection-icon" aria-hidden="true">${readerSelectionSvg(pathData)}</span><span>$safeLabel</span></button>"""
+    }
+
+    private fun ReaderHighlightPalette.toSelectionColorButtons(): String {
+        return sanitized().colors.joinToString("\n") { color ->
+            """<button type="button" class="reader-selection-color" data-action="highlight" data-color-id="${color.id}" title="Highlight ${color.id.escapeHtml()}" style="--selection-color:${color.color.toCssHex()}"><span></span></button>"""
+        }
+    }
+
+    private fun ReaderHighlightPalette.toSelectionPaletteButtons(): String {
+        return listOf(
+            toSelectionColorButtons(),
+            """<button type="button" class="reader-selection-spectrum" data-action="palette" title="Customize highlight palette" aria-label="Customize highlight palette"><span></span></button>"""
+        ).joinToString("\n")
     }
 
     private fun readerSelectionSvg(pathData: String): String {
@@ -3554,6 +5170,11 @@ object ReaderHtmlDocumentBuilder {
         val endOffset: Int,
         val contentStartIndex: Int,
         val contentEndIndex: Int
+    )
+
+    private data class HtmlAbsoluteTextRange(
+        val start: Int,
+        val end: Int
     )
 
     private val textBlockStartPattern = Regex(

@@ -12,8 +12,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -178,7 +176,18 @@ fun SharedHomeScreen(
     showActiveTabs: Boolean = true,
     modifier: Modifier = Modifier
 ) {
-    val model = state.toNonReaderHomeLayoutModel()
+    val model = remember(
+        state.recentBooks,
+        state.openTabs,
+        state.openTabIds,
+        state.activeTabBookId,
+        state.isTabsEnabled,
+        state.pinnedHomeBookIds,
+        state.selectedBookIds,
+        state.rawLibraryBooks
+    ) {
+        state.toNonReaderHomeLayoutModel()
+    }
     NonReaderScreenScaffold(
         title = readerString("nav_home", "Home"),
         subtitle = readerString("desktop_home_subtitle", "Continue reading and recent books"),
@@ -323,12 +332,15 @@ fun SharedLibraryScreen(
     onShowBookInfo: (BookItem) -> Unit = {},
     onEditBook: (BookItem) -> Unit = {},
     onCreateShelf: () -> Unit = {},
+    onCreateShelfWithBooks: (String, Set<String>) -> Unit = { _, _ -> },
     onCreateSmartShelf: () -> Unit = {},
     onRenameShelf: (Shelf) -> Unit = {},
     onDeleteShelf: (Shelf) -> Unit = {},
     onRemoveFolder: (Shelf) -> Unit = {},
     onTagSelectedBooks: () -> Unit = {},
     onAddSelectedBooksToShelf: () -> Unit = {},
+    onAddBooksToShelf: (Set<String>) -> Unit = {},
+    onManageShelfBooks: ((Shelf) -> Unit)? = null,
     onImportFolder: () -> Unit = {},
     onSyncFolderMetadata: () -> Unit = {},
     onScanFolders: () -> Unit = {},
@@ -337,7 +349,15 @@ fun SharedLibraryScreen(
     useImportEmptyStateWhenLibraryEmpty: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    val organization = state.toNonReaderLibraryOrganizationModel()
+    val organization = remember(
+        state.rawLibraryBooks,
+        state.shelves,
+        state.allTags,
+        state.syncedFolders,
+        state.libraryFilters
+    ) {
+        state.toNonReaderLibraryOrganizationModel()
+    }
     val activeLibraryTab = selectedTab.visibleLibraryTab(platform)
     var showFilters by remember { mutableStateOf(false) }
     var viewMode by remember { mutableStateOf(BookViewMode.COVERS) }
@@ -399,8 +419,10 @@ fun SharedLibraryScreen(
                         Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             LibraryToolbar(
                                 state = state,
+                                selectedTab = activeLibraryTab,
                                 viewMode = viewMode,
                                 showFilters = showFilters,
+                                platform = platform,
                                 onViewModeChange = { viewMode = it },
                                 onToggleFilters = { showFilters = !showFilters },
                                 onStateChange = onStateChange,
@@ -419,11 +441,14 @@ fun SharedLibraryScreen(
                                 onImportBooks = onImportBooks,
                                 onImportFolder = onImportFolder,
                                 useImportEmptyStateWhenLibraryEmpty = useImportEmptyStateWhenLibraryEmpty,
+                                onCreateShelf = onCreateShelf,
                                 onOpenBook = onOpenBook,
                                 onToggleSelection = onToggleSelection,
                                 onShowBookInfo = onShowBookInfo,
                                 onEditBook = onEditBook,
                                 onTogglePinned = onTogglePinned,
+                                onAddBooksToShelf = onAddBooksToShelf,
+                                onManageShelfBooks = onManageShelfBooks,
                                 onRenameShelf = onRenameShelf,
                                 onDeleteShelf = onDeleteShelf,
                                 onRemoveFolder = onRemoveFolder,
@@ -443,8 +468,10 @@ fun SharedLibraryScreen(
                         )
                         LibraryToolbar(
                             state = state,
+                            selectedTab = activeLibraryTab,
                             viewMode = viewMode,
                             showFilters = showFilters,
+                            platform = platform,
                             onViewModeChange = { viewMode = it },
                             onToggleFilters = { showFilters = !showFilters },
                             onStateChange = onStateChange,
@@ -463,11 +490,14 @@ fun SharedLibraryScreen(
                             onImportBooks = onImportBooks,
                             onImportFolder = onImportFolder,
                             useImportEmptyStateWhenLibraryEmpty = useImportEmptyStateWhenLibraryEmpty,
+                            onCreateShelf = onCreateShelf,
                             onOpenBook = onOpenBook,
                             onToggleSelection = onToggleSelection,
                             onShowBookInfo = onShowBookInfo,
                             onEditBook = onEditBook,
                             onTogglePinned = onTogglePinned,
+                            onAddBooksToShelf = onAddBooksToShelf,
+                            onManageShelfBooks = onManageShelfBooks,
                             onRenameShelf = onRenameShelf,
                             onDeleteShelf = onDeleteShelf,
                             onRemoveFolder = onRemoveFolder,
@@ -904,8 +934,10 @@ private fun LibraryNavItem(
 @Composable
 private fun LibraryToolbar(
     state: SharedReaderScreenState,
+    selectedTab: NonReaderLibraryTab,
     viewMode: BookViewMode,
     showFilters: Boolean,
+    platform: ReaderPlatform,
     onViewModeChange: (BookViewMode) -> Unit,
     onToggleFilters: () -> Unit,
     onStateChange: (SharedReaderScreenState) -> Unit,
@@ -913,13 +945,129 @@ private fun LibraryToolbar(
     onImportFolder: () -> Unit,
     onCreateShelf: () -> Unit
 ) {
+    BoxWithConstraints {
+        val layout = libraryCommandBarLayoutForWidth(maxWidth.value, platform)
+        if (layout == LibraryCommandBarLayout.INLINE) {
+            DesktopLibraryCommandBar(
+                state = state,
+                selectedTab = selectedTab,
+                viewMode = viewMode,
+                showFilters = showFilters,
+                platform = platform,
+                onViewModeChange = onViewModeChange,
+                onToggleFilters = onToggleFilters,
+                onStateChange = onStateChange,
+                onImportBooks = onImportBooks,
+                onImportFolder = onImportFolder,
+                onCreateShelf = onCreateShelf
+            )
+        } else {
+            StackedLibraryCommandBar(
+                state = state,
+                selectedTab = selectedTab,
+                viewMode = viewMode,
+                showFilters = showFilters,
+                platform = platform,
+                onViewModeChange = onViewModeChange,
+                onToggleFilters = onToggleFilters,
+                onStateChange = onStateChange,
+                onImportBooks = onImportBooks,
+                onImportFolder = onImportFolder,
+                onCreateShelf = onCreateShelf
+            )
+        }
+    }
+}
+
+@Composable
+private fun DesktopLibraryCommandBar(
+    state: SharedReaderScreenState,
+    selectedTab: NonReaderLibraryTab,
+    viewMode: BookViewMode,
+    showFilters: Boolean,
+    platform: ReaderPlatform,
+    onViewModeChange: (BookViewMode) -> Unit,
+    onToggleFilters: () -> Unit,
+    onStateChange: (SharedReaderScreenState) -> Unit,
+    onImportBooks: () -> Unit,
+    onImportFolder: () -> Unit,
+    onCreateShelf: () -> Unit
+) {
+    val showCreateShelfPrimaryAction = NonReaderLibraryPrimaryAction.NEW_SHELF in
+        primaryLibraryActionsForTab(selectedTab, platform)
+
+    Surface(
+        shape = RoundedCornerShape(SharedUiTokens.surfaceRadius),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = sharedSubtleBorder(alpha = 0.5f)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            LibrarySearchField(
+                state = state,
+                onStateChange = onStateChange,
+                modifier = Modifier.weight(1f).widthIn(min = 260.dp)
+            )
+            SortMenu(
+                sortOrder = state.sortOrder,
+                onSortOrderChange = { onStateChange(state.reduce(LibraryAction.SortChanged(it))) }
+            )
+            LibraryFilterButton(
+                filters = state.libraryFilters,
+                showFilters = showFilters,
+                onToggleFilters = onToggleFilters
+            )
+            Button(onClick = onImportBooks) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(readerString("desktop_import_files", "Import files"))
+            }
+            OutlinedButton(onClick = onImportFolder) {
+                Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(readerString("fab_add_folder", "Add folder"))
+            }
+            if (showCreateShelfPrimaryAction) {
+                Button(onClick = onCreateShelf) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(readerString("fab_new_shelf", "New shelf"))
+                }
+            }
+            LibraryMoreActionsMenu(
+                viewMode = viewMode,
+                onViewModeChange = onViewModeChange,
+                onCreateShelf = onCreateShelf,
+                showCreateShelfAction = !showCreateShelfPrimaryAction
+            )
+        }
+    }
+}
+
+@Composable
+private fun StackedLibraryCommandBar(
+    state: SharedReaderScreenState,
+    selectedTab: NonReaderLibraryTab,
+    viewMode: BookViewMode,
+    showFilters: Boolean,
+    platform: ReaderPlatform,
+    onViewModeChange: (BookViewMode) -> Unit,
+    onToggleFilters: () -> Unit,
+    onStateChange: (SharedReaderScreenState) -> Unit,
+    onImportBooks: () -> Unit,
+    onImportFolder: () -> Unit,
+    onCreateShelf: () -> Unit
+) {
+    val showCreateShelfPrimaryAction = NonReaderLibraryPrimaryAction.NEW_SHELF in
+        primaryLibraryActionsForTab(selectedTab, platform)
+
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        SharedStableOutlinedTextField(
-            value = state.searchQuery,
-            onValueChange = { onStateChange(state.reduce(LibraryAction.SearchChanged(it))) },
-            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-            label = { Text(readerString("library_search_placeholder", "Search books, authors, or tags")) },
-            singleLine = true,
+        LibrarySearchField(
+            state = state,
+            onStateChange = onStateChange,
             modifier = Modifier.fillMaxWidth()
         )
         Row(
@@ -927,52 +1075,135 @@ private fun LibraryToolbar(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            SortMenu(sortOrder = state.sortOrder, onSortOrderChange = { onStateChange(state.reduce(LibraryAction.SortChanged(it))) })
-            OutlinedButton(onClick = { onViewModeChange(if (viewMode == BookViewMode.COVERS) BookViewMode.LIST else BookViewMode.COVERS) }) {
-                Icon(if (viewMode == BookViewMode.COVERS) Icons.AutoMirrored.Filled.List else Icons.Default.Book, contentDescription = null, modifier = Modifier.size(18.dp))
+            SortMenu(
+                sortOrder = state.sortOrder,
+                onSortOrderChange = { onStateChange(state.reduce(LibraryAction.SortChanged(it))) }
+            )
+            LibraryFilterButton(
+                filters = state.libraryFilters,
+                showFilters = showFilters,
+                onToggleFilters = onToggleFilters
+            )
+            Button(onClick = onImportBooks) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(
-                    if (viewMode == BookViewMode.COVERS) {
-                        readerString("desktop_list_view", "List")
-                    } else {
-                        readerString("desktop_cover_view", "Covers")
-                    }
-                )
-            }
-            OutlinedButton(onClick = onToggleFilters) {
-                Icon(Icons.Default.FilterList, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(if (showFilters) readerString("desktop_hide_filters", "Hide filters") else readerString("filter_library", "Filters"))
-                if (state.libraryFilters.isActive) {
-                    Spacer(Modifier.width(8.dp))
-                    Surface(
-                        shape = RoundedCornerShape(50),
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                    ) {
-                        Text(
-                            state.libraryFilters.activeFilterBadge(),
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                        )
-                    }
-                }
-            }
-            OutlinedButton(onClick = onCreateShelf) {
-                Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(readerString("fab_new_shelf", "New shelf"))
+                Text(readerString("desktop_import_files", "Import files"))
             }
             OutlinedButton(onClick = onImportFolder) {
                 Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text(readerString("fab_add_folder", "Add folder"))
             }
-            Button(onClick = onImportBooks) {
-                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(readerString("desktop_import_files", "Import files"))
+            if (showCreateShelfPrimaryAction) {
+                Button(onClick = onCreateShelf) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(readerString("fab_new_shelf", "New shelf"))
+                }
+            }
+            LibraryMoreActionsMenu(
+                viewMode = viewMode,
+                onViewModeChange = onViewModeChange,
+                onCreateShelf = onCreateShelf,
+                showCreateShelfAction = !showCreateShelfPrimaryAction
+            )
+        }
+    }
+}
+
+@Composable
+private fun LibrarySearchField(
+    state: SharedReaderScreenState,
+    onStateChange: (SharedReaderScreenState) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    SharedStableOutlinedTextField(
+        value = state.searchQuery,
+        onValueChange = { onStateChange(state.reduce(LibraryAction.SearchChanged(it))) },
+        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+        label = { Text(readerString("library_search_placeholder", "Search books, authors, or tags")) },
+        singleLine = true,
+        modifier = modifier
+    )
+}
+
+@Composable
+private fun LibraryFilterButton(
+    filters: LibraryFilters,
+    showFilters: Boolean,
+    onToggleFilters: () -> Unit
+) {
+    OutlinedButton(onClick = onToggleFilters) {
+        Icon(Icons.Default.FilterList, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(if (showFilters) readerString("desktop_hide_filters", "Hide filters") else readerString("filter_library", "Filters"))
+        if (filters.isActive) {
+            Spacer(Modifier.width(8.dp))
+            Surface(
+                shape = RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+            ) {
+                Text(
+                    filters.activeFilterBadge(),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryMoreActionsMenu(
+    viewMode: BookViewMode,
+    onViewModeChange: (BookViewMode) -> Unit,
+    onCreateShelf: () -> Unit,
+    showCreateShelfAction: Boolean = true
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }) {
+            Icon(
+                Icons.Default.MoreVert,
+                contentDescription = readerString("desktop_more", "More"),
+                modifier = Modifier.size(20.dp)
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                leadingIcon = {
+                    Icon(
+                        if (viewMode == BookViewMode.COVERS) Icons.AutoMirrored.Filled.List else Icons.Default.Book,
+                        contentDescription = null
+                    )
+                },
+                text = {
+                    Text(
+                        if (viewMode == BookViewMode.COVERS) {
+                            readerString("desktop_list_view", "List")
+                        } else {
+                            readerString("desktop_cover_view", "Covers")
+                        }
+                    )
+                },
+                onClick = {
+                    expanded = false
+                    onViewModeChange(
+                        if (viewMode == BookViewMode.COVERS) BookViewMode.LIST else BookViewMode.COVERS
+                    )
+                }
+            )
+            if (showCreateShelfAction) {
+                DropdownMenuItem(
+                    leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                    text = { Text(readerString("fab_new_shelf", "New shelf")) },
+                    onClick = {
+                        expanded = false
+                        onCreateShelf()
+                    }
+                )
             }
         }
     }
@@ -990,11 +1221,14 @@ private fun LibraryContent(
     onImportBooks: () -> Unit,
     onImportFolder: () -> Unit,
     useImportEmptyStateWhenLibraryEmpty: Boolean = false,
+    onCreateShelf: () -> Unit,
     onOpenBook: (BookItem) -> Unit,
     onToggleSelection: (String) -> Unit,
     onShowBookInfo: (BookItem) -> Unit,
     onEditBook: (BookItem) -> Unit,
     onTogglePinned: (BookItem) -> Unit,
+    onAddBooksToShelf: (Set<String>) -> Unit,
+    onManageShelfBooks: ((Shelf) -> Unit)?,
     onRenameShelf: (Shelf) -> Unit,
     onDeleteShelf: (Shelf) -> Unit,
     onRemoveFolder: (Shelf) -> Unit,
@@ -1003,9 +1237,38 @@ private fun LibraryContent(
     modifier: Modifier = Modifier
 ) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        val shelvesById = remember(state.shelves) { state.shelves.associateBy { it.id } }
+        val visibleBooks = remember(state.libraryBooks, selectedTab, platform) {
+            state.booksForNonReaderLibraryTab(selectedTab, platform)
+        }
+        val tagShelves = remember(state.shelves) {
+            state.shelves.filter { it.type == ShelfType.TAG && it.bookCount > 0 }
+        }
+        val browseShelves = remember(state.shelves) {
+            state.shelves.filter {
+                it.type != ShelfType.FOLDER &&
+                    it.type != ShelfType.TAG &&
+                    it.type != ShelfType.SMART
+            }
+        }
+        val smartShelves = remember(state.shelves) {
+            state.shelves.filter { it.type == ShelfType.SMART }
+        }
+        val rootFolderShelves = remember(state.shelves) {
+            state.shelves.filter { it.type == ShelfType.FOLDER && it.parentShelfId == null }
+        }
+        val addToShelfFromBookAction = if (NonReaderBookOverflowAction.ADD_TO_SHELF in bookOverflowActionsForPlatform(platform)) {
+            onAddBooksToShelf
+        } else {
+            null
+        }
+        val manageShelfBooksAction = if (platform == ReaderPlatform.DESKTOP) onManageShelfBooks else null
+        val showNewShelfPrimaryAction = NonReaderLibraryPrimaryAction.NEW_SHELF in
+            primaryLibraryActionsForTab(selectedTab, platform)
         if (showFilters) {
             LibraryFilterPanel(
                 state = state,
+                platform = platform,
                 onStateChange = onStateChange
             )
         } else if (state.libraryFilters.isActive || state.searchQuery.isNotBlank()) {
@@ -1017,7 +1280,7 @@ private fun LibraryContent(
             NonReaderLibraryTab.UNREAD,
             NonReaderLibraryTab.IN_PROGRESS,
             NonReaderLibraryTab.COMPLETED -> {
-                val books = state.booksForNonReaderLibraryTab(selectedTab, platform)
+                val books = visibleBooks
                 if (books.isEmpty()) {
                     if (state.rawLibraryBooks.isEmpty() && useImportEmptyStateWhenLibraryEmpty) {
                         LibraryImportEmptyState(
@@ -1052,13 +1315,13 @@ private fun LibraryContent(
                         onShowBookInfo = onShowBookInfo,
                         onEditBook = onEditBook,
                         onTogglePinned = onTogglePinned,
+                        onAddToShelf = addToShelfFromBookAction?.let { addToShelf -> { book -> addToShelf(setOf(book.id)) } },
                         modifier = Modifier.weight(1f)
                     )
                 }
             }
 
             NonReaderLibraryTab.SHELVES -> {
-                val tagShelves = state.shelves.filter { it.type == ShelfType.TAG && it.bookCount > 0 }
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     BrowseByTagRow(
                         tagShelves = tagShelves,
@@ -1077,7 +1340,7 @@ private fun LibraryContent(
                         }
                     )
                     ShelfCollection(
-                        shelves = state.shelves.filter { it.type != ShelfType.FOLDER && it.type != ShelfType.TAG && it.type != ShelfType.SMART },
+                        shelves = browseShelves,
                         selectedBookIds = state.selectedBookIds,
                         pinnedBookIds = state.pinnedLibraryBookIds,
                         onOpenBook = onOpenBook,
@@ -1085,18 +1348,22 @@ private fun LibraryContent(
                         onShowBookInfo = onShowBookInfo,
                         onEditBook = onEditBook,
                         onTogglePinned = onTogglePinned,
+                        onAddBooksToShelf = addToShelfFromBookAction,
+                        onManageShelfBooks = manageShelfBooksAction,
                         onRenameShelf = onRenameShelf,
                         onDeleteShelf = onDeleteShelf,
                         onRemoveFolder = onRemoveFolder,
+                        onCreateShelf = if (showNewShelfPrimaryAction) onCreateShelf else null,
                         emptyTitle = readerString("desktop_no_shelves_yet", "No shelves yet"),
                         emptyBody = readerString("desktop_no_shelves_desc", "Manual shelves and series collections will appear here."),
+                        emptyActionLabel = if (showNewShelfPrimaryAction) readerString("fab_new_shelf", "New shelf") else null,
                         modifier = Modifier.weight(1f)
                     )
                 }
             }
 
             NonReaderLibraryTab.SMART_SHELVES -> ShelfCollection(
-                shelves = state.shelves.filter { it.type == ShelfType.SMART },
+                shelves = smartShelves,
                 selectedBookIds = state.selectedBookIds,
                 pinnedBookIds = state.pinnedLibraryBookIds,
                 onOpenBook = onOpenBook,
@@ -1104,6 +1371,7 @@ private fun LibraryContent(
                 onShowBookInfo = onShowBookInfo,
                 onEditBook = onEditBook,
                 onTogglePinned = onTogglePinned,
+                onAddBooksToShelf = addToShelfFromBookAction,
                 onRenameShelf = onRenameShelf,
                 onDeleteShelf = onDeleteShelf,
                 emptyTitle = readerString("desktop_no_smart_shelves_yet", "No smart shelves yet"),
@@ -1112,7 +1380,7 @@ private fun LibraryContent(
             )
 
             NonReaderLibraryTab.TAGS -> ShelfCollection(
-                shelves = state.shelves.filter { it.type == ShelfType.TAG && it.bookCount > 0 },
+                shelves = tagShelves,
                 selectedBookIds = state.selectedBookIds,
                 pinnedBookIds = state.pinnedLibraryBookIds,
                 onOpenBook = onOpenBook,
@@ -1120,6 +1388,7 @@ private fun LibraryContent(
                 onShowBookInfo = onShowBookInfo,
                 onEditBook = onEditBook,
                 onTogglePinned = onTogglePinned,
+                onAddBooksToShelf = addToShelfFromBookAction,
                 emptyTitle = readerString("desktop_no_tags_yet", "No tags yet"),
                 emptyBody = readerString("desktop_no_tags_desc", "Tags added to books will appear here."),
                 modifier = Modifier.weight(1f)
@@ -1127,12 +1396,12 @@ private fun LibraryContent(
 
             NonReaderLibraryTab.FOLDERS -> {
                 val currentFolder = state.viewingShelfId
-                    ?.let { id -> state.shelves.firstOrNull { it.id == id && it.type == ShelfType.FOLDER } }
+                    ?.let { id -> shelvesById[id]?.takeIf { it.type == ShelfType.FOLDER } }
                 if (currentFolder != null) {
                     FolderShelfDetail(
                         shelf = currentFolder,
                         childShelves = currentFolder.childShelfIds.mapNotNull { childId ->
-                            state.shelves.firstOrNull { it.id == childId }
+                            shelvesById[childId]
                         },
                         selectedBookIds = state.selectedBookIds,
                         pinnedBookIds = state.pinnedLibraryBookIds,
@@ -1141,6 +1410,7 @@ private fun LibraryContent(
                         onShowBookInfo = onShowBookInfo,
                         onEditBook = onEditBook,
                         onTogglePinned = onTogglePinned,
+                        onAddBooksToShelf = addToShelfFromBookAction,
                         onOpenShelf = { shelf -> onStateChange(state.copy(viewingShelfId = shelf.id)) },
                         onBack = { onStateChange(state.copy(viewingShelfId = currentFolder.parentShelfId)) },
                         modifier = Modifier.weight(1f)
@@ -1154,7 +1424,7 @@ private fun LibraryContent(
                             )
                         }
                         ShelfCollection(
-                            shelves = state.shelves.filter { it.type == ShelfType.FOLDER && it.parentShelfId == null },
+                            shelves = rootFolderShelves,
                             selectedBookIds = state.selectedBookIds,
                             pinnedBookIds = state.pinnedLibraryBookIds,
                             onOpenBook = onOpenBook,
@@ -1162,6 +1432,7 @@ private fun LibraryContent(
                             onShowBookInfo = onShowBookInfo,
                             onEditBook = onEditBook,
                             onTogglePinned = onTogglePinned,
+                            onAddBooksToShelf = addToShelfFromBookAction,
                             onRemoveFolder = onRemoveFolder,
                             onOpenShelf = { shelf -> onStateChange(state.copy(viewingShelfId = shelf.id)) },
                             emptyTitle = readerString("desktop_no_folders_yet", "No folders yet"),
@@ -1257,9 +1528,9 @@ private fun LibraryFilterSummary(
 }
 
 @Composable
-@OptIn(ExperimentalLayoutApi::class)
 private fun LibraryFilterPanel(
     state: SharedReaderScreenState,
+    platform: ReaderPlatform,
     onStateChange: (SharedReaderScreenState) -> Unit
 ) {
     Surface(
@@ -1267,7 +1538,7 @@ private fun LibraryFilterPanel(
         color = MaterialTheme.colorScheme.surfaceContainerLow,
         border = sharedSubtleBorder()
     ) {
-        Column(Modifier.fillMaxWidth().padding(SharedUiTokens.panelPadding), verticalArrangement = Arrangement.spacedBy(SharedUiTokens.contentGap)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(readerString("filter_library", "Filters"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 if (state.libraryFilters.isActive || state.searchQuery.isNotBlank()) {
@@ -1278,30 +1549,20 @@ private fun LibraryFilterPanel(
             }
 
             LibraryFilterSection(title = readerString("filter_file_type", "File type")) {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    nonReaderLibraryFileTypeGroups().forEach { group ->
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text(
-                                readerString(group.titleKey, group.titleFallback),
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                group.fileTypes.forEach { type ->
-                                    FilterChip(
-                                        selected = type in state.libraryFilters.fileTypes,
-                                        onClick = {
-                                            val updated = state.libraryFilters.fileTypes.toggle(type)
-                                            onStateChange(state.reduce(LibraryAction.FiltersChanged(state.libraryFilters.copy(fileTypes = updated))))
-                                        },
-                                        label = { Text(SharedFileCapabilities.displayNameFor(type)) }
-                                    )
-                                }
-                            }
-                        }
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    nonReaderLibraryFileTypeGroups(platform).flatMap { it.fileTypes }.forEach { type ->
+                        FilterChip(
+                            selected = type in state.libraryFilters.fileTypes,
+                            onClick = {
+                                val updated = state.libraryFilters.fileTypes.toggle(type)
+                                onStateChange(state.reduce(LibraryAction.FiltersChanged(state.libraryFilters.copy(fileTypes = updated))))
+                            },
+                            label = { Text(SharedFileCapabilities.displayNameFor(type)) }
+                        )
                     }
                 }
             }
@@ -1328,7 +1589,14 @@ private fun LibraryFilterPanel(
                                 onStateChange(state.reduce(LibraryAction.FiltersChanged(state.libraryFilters.copy(sourceFolders = updated))))
                             },
                             leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp)) },
-                            label = { Text(folder.name) }
+                            label = {
+                                Text(
+                                    folder.name,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.widthIn(max = 180.dp)
+                                )
+                            }
                         )
                     }
                 }
@@ -1360,9 +1628,10 @@ private fun LibraryFilterPanel(
 
             if (state.allTags.isNotEmpty()) {
                 LibraryFilterSection(title = readerString("section_tags", "Tags")) {
-                    FlowRow(
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         state.allTags.forEach { tag ->
                             FilterChip(
@@ -1372,7 +1641,14 @@ private fun LibraryFilterPanel(
                                     onStateChange(state.reduce(LibraryAction.FiltersChanged(state.libraryFilters.copy(tagIds = updated))))
                                 },
                                 leadingIcon = { Icon(Icons.Default.Tag, contentDescription = null, modifier = Modifier.size(16.dp)) },
-                                label = { Text(tag.name) }
+                                label = {
+                                    Text(
+                                        tag.name,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 160.dp)
+                                    )
+                                }
                             )
                         }
                     }
@@ -1387,11 +1663,11 @@ private fun LibraryFilterSection(
     title: String,
     content: @Composable () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
         Text(
             title,
-            style = MaterialTheme.typography.titleSmall,
+            style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.SemiBold
         )
         content()
@@ -1414,6 +1690,7 @@ private fun BookGrid(
     onShowBookInfo: (BookItem) -> Unit,
     onEditBook: (BookItem) -> Unit,
     onTogglePinned: (BookItem) -> Unit,
+    onAddToShelf: ((BookItem) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     if (viewMode == BookViewMode.LIST) {
@@ -1432,7 +1709,8 @@ private fun BookGrid(
                     onToggleSelection = { onToggleSelection(book.id) },
                     onShowInfo = { onShowBookInfo(book) },
                     onEdit = { onEditBook(book) },
-                    onTogglePinned = { onTogglePinned(book) }
+                    onTogglePinned = { onTogglePinned(book) },
+                    onAddToShelf = onAddToShelf?.let { addToShelf -> { addToShelf(book) } }
                 )
             }
         }
@@ -1454,7 +1732,8 @@ private fun BookGrid(
                     onToggleSelection = { onToggleSelection(book.id) },
                     onShowInfo = { onShowBookInfo(book) },
                     onEdit = { onEditBook(book) },
-                    onTogglePinned = { onTogglePinned(book) }
+                    onTogglePinned = { onTogglePinned(book) },
+                    onAddToShelf = onAddToShelf?.let { addToShelf -> { addToShelf(book) } }
                 )
             }
         }
@@ -1473,6 +1752,7 @@ private fun BookTile(
     onShowInfo: () -> Unit,
     onEdit: () -> Unit,
     onTogglePinned: () -> Unit,
+    onAddToShelf: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -1522,7 +1802,8 @@ private fun BookTile(
                         onTogglePinned = onTogglePinned,
                         onShowInfo = onShowInfo,
                         onEdit = onEdit,
-                        onToggleSelection = onToggleSelection
+                        onToggleSelection = onToggleSelection,
+                        onAddToShelf = onAddToShelf
                     )
                 }
                 TypeBadge(book.type, modifier = Modifier.align(Alignment.BottomEnd).padding(6.dp))
@@ -1557,7 +1838,8 @@ private fun BookListItem(
     onToggleSelection: () -> Unit,
     onShowInfo: () -> Unit,
     onEdit: () -> Unit,
-    onTogglePinned: () -> Unit
+    onTogglePinned: () -> Unit,
+    onAddToShelf: (() -> Unit)? = null
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
     Surface(
@@ -1598,7 +1880,8 @@ private fun BookListItem(
                     onTogglePinned = onTogglePinned,
                     onShowInfo = onShowInfo,
                     onEdit = onEdit,
-                    onToggleSelection = onToggleSelection
+                    onToggleSelection = onToggleSelection,
+                    onAddToShelf = onAddToShelf
                 )
             }
         }
@@ -1614,7 +1897,8 @@ private fun BookActionMenu(
     onTogglePinned: () -> Unit,
     onShowInfo: () -> Unit,
     onEdit: () -> Unit,
-    onToggleSelection: () -> Unit
+    onToggleSelection: () -> Unit,
+    onAddToShelf: (() -> Unit)? = null
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         DropdownMenuItem(
@@ -1641,6 +1925,16 @@ private fun BookActionMenu(
                 onEdit()
             }
         )
+        if (onAddToShelf != null) {
+            DropdownMenuItem(
+                leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                text = { Text(readerString("desktop_add_to_shelf", "Add to shelf")) },
+                onClick = {
+                    onDismiss()
+                    onAddToShelf()
+                }
+            )
+        }
         DropdownMenuItem(
             leadingIcon = { Icon(if (selected) Icons.Default.Check else Icons.AutoMirrored.Filled.List, contentDescription = null) },
             text = { Text(if (selected) readerString("clear_selection", "Clear selection") else readerString("action_select", "Select")) },
@@ -1818,12 +2112,16 @@ private fun ShelfCollection(
     onShowBookInfo: (BookItem) -> Unit,
     onEditBook: (BookItem) -> Unit,
     onTogglePinned: (BookItem) -> Unit,
+    onAddBooksToShelf: ((Set<String>) -> Unit)? = null,
+    onManageShelfBooks: ((Shelf) -> Unit)? = null,
     onRenameShelf: (Shelf) -> Unit = {},
     onDeleteShelf: (Shelf) -> Unit = {},
     onRemoveFolder: (Shelf) -> Unit = {},
     onOpenShelf: ((Shelf) -> Unit)? = null,
+    onCreateShelf: (() -> Unit)? = null,
     emptyTitle: String,
     emptyBody: String,
+    emptyActionLabel: String? = null,
     modifier: Modifier = Modifier
 ) {
     if (shelves.isEmpty()) {
@@ -1831,6 +2129,8 @@ private fun ShelfCollection(
             icon = { Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(56.dp)) },
             title = emptyTitle,
             body = emptyBody,
+            actionLabel = emptyActionLabel,
+            onAction = onCreateShelf,
             modifier = modifier
         )
         return
@@ -1851,6 +2151,8 @@ private fun ShelfCollection(
                 onShowBookInfo = onShowBookInfo,
                 onEditBook = onEditBook,
                 onTogglePinned = onTogglePinned,
+                onAddBooksToShelf = onAddBooksToShelf,
+                onManageShelfBooks = onManageShelfBooks,
                 onRenameShelf = onRenameShelf,
                 onDeleteShelf = onDeleteShelf,
                 onRemoveFolder = onRemoveFolder,
@@ -1870,6 +2172,8 @@ private fun ShelfSection(
     onShowBookInfo: (BookItem) -> Unit,
     onEditBook: (BookItem) -> Unit,
     onTogglePinned: (BookItem) -> Unit,
+    onAddBooksToShelf: ((Set<String>) -> Unit)?,
+    onManageShelfBooks: ((Shelf) -> Unit)?,
     onRenameShelf: (Shelf) -> Unit,
     onDeleteShelf: (Shelf) -> Unit,
     onRemoveFolder: (Shelf) -> Unit,
@@ -1912,6 +2216,23 @@ private fun ShelfSection(
                     }
                 }
                 if (shelf.type == ShelfType.MANUAL && shelf.id != "unshelved") {
+                    if (onManageShelfBooks != null) {
+                        OutlinedButton(onClick = { onManageShelfBooks(shelf) }) {
+                            Icon(
+                                if (shelf.bookCount == 0) Icons.Default.Add else Icons.Default.FormatListNumbered,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                if (shelf.bookCount == 0) {
+                                    readerString("fab_add_books", "Add books")
+                                } else {
+                                    readerString("desktop_manage_books", "Manage books")
+                                }
+                            )
+                        }
+                    }
                     IconButton(onClick = { onRenameShelf(shelf) }, modifier = Modifier.size(34.dp)) {
                         Icon(Icons.Default.Edit, contentDescription = readerString("menu_rename_shelf", "Rename shelf"), modifier = Modifier.size(18.dp))
                     }
@@ -1937,6 +2258,7 @@ private fun ShelfSection(
                             onShowInfo = { onShowBookInfo(book) },
                             onEdit = { onEditBook(book) },
                             onTogglePinned = { onTogglePinned(book) },
+                            onAddToShelf = onAddBooksToShelf?.let { addToShelf -> { addToShelf(setOf(book.id)) } },
                             modifier = Modifier.width(148.dp)
                         )
                     }
@@ -1957,6 +2279,7 @@ private fun FolderShelfDetail(
     onShowBookInfo: (BookItem) -> Unit,
     onEditBook: (BookItem) -> Unit,
     onTogglePinned: (BookItem) -> Unit,
+    onAddBooksToShelf: ((Set<String>) -> Unit)? = null,
     onOpenShelf: (Shelf) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
@@ -2021,7 +2344,8 @@ private fun FolderShelfDetail(
                             onToggleSelection = { onToggleSelection(book.id) },
                             onShowInfo = { onShowBookInfo(book) },
                             onEdit = { onEditBook(book) },
-                            onTogglePinned = { onTogglePinned(book) }
+                            onTogglePinned = { onTogglePinned(book) },
+                            onAddToShelf = onAddBooksToShelf?.let { addToShelf -> { addToShelf(setOf(book.id)) } }
                         )
                     }
                 }
@@ -2431,7 +2755,7 @@ private fun fileTypeColor(type: FileType): Color {
         FileType.PDF -> Color(0xFF9C4146)
         FileType.EPUB, FileType.MOBI -> Color(0xFF006C4C)
         FileType.DOCX, FileType.ODT, FileType.FODT, FileType.PPTX -> Color(0xFF0F52BA)
-        FileType.CBZ, FileType.CBR, FileType.CB7 -> Color(0xFF705D49)
+        FileType.CBZ, FileType.CBR, FileType.CB7, FileType.CBT -> Color(0xFF705D49)
         else -> Color(0xFF5D6B82)
     }
 }

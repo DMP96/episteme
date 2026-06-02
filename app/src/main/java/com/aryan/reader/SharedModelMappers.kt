@@ -10,11 +10,13 @@ import com.aryan.reader.shared.BookShelfRef as SharedBookShelfRef
 import com.aryan.reader.shared.EpubAnnotationSerializer
 import com.aryan.reader.shared.FileType as SharedFileType
 import com.aryan.reader.shared.LibraryFilters as SharedLibraryFilters
+import com.aryan.reader.shared.ReaderLocator as SharedReaderLocator
 import com.aryan.reader.shared.SharedReaderScreenState
 import com.aryan.reader.shared.Shelf as SharedShelf
 import com.aryan.reader.shared.ShelfRecord
 import com.aryan.reader.shared.SyncedFolder as SharedSyncedFolder
 import com.aryan.reader.shared.Tag as SharedTag
+import com.aryan.reader.shared.toStablePositionCfi
 
 fun FileType.toSharedFileType(): SharedFileType = this
 
@@ -29,11 +31,21 @@ fun SyncedFolder.toSharedSyncedFolder(): SharedSyncedFolder = this
 fun SharedSyncedFolder.toAndroidSyncedFolder(): SyncedFolder = this
 
 fun RecentFileItem.toSharedBookItem(): SharedBookItem {
+    return toSharedBookItem(
+        displayName = customName ?: displayName,
+        includeReaderAnnotations = true
+    )
+}
+
+private fun RecentFileItem.toSharedBookItem(
+    displayName: String,
+    includeReaderAnnotations: Boolean
+): SharedBookItem {
     return SharedBookItem(
         id = bookId,
         path = uriString,
         type = type,
-        displayName = customName ?: displayName,
+        displayName = displayName,
         timestamp = timestamp,
         coverImagePath = coverImagePath,
         title = title,
@@ -53,13 +65,22 @@ fun RecentFileItem.toSharedBookItem(): SharedBookItem {
         seriesName = seriesName,
         seriesIndex = seriesIndex,
         lastPageIndex = lastPage,
+        readerPosition = toSharedReaderLocatorOrNull(),
         tags = tags.map { it.toSharedTag() },
-        readerHighlights = EpubAnnotationSerializer.parseHighlightsJson(highlightsJson)
+        readerHighlights = if (includeReaderAnnotations) {
+            EpubAnnotationSerializer.parseHighlightsJson(highlightsJson)
+        } else {
+            emptyList()
+        },
+        readingPositionModifiedTimestamp = readingPositionModifiedTimestamp
     )
 }
 
 fun RecentFileItem.toSharedProjectionBookItem(): SharedBookItem {
-    return toSharedBookItem().copy(displayName = displayName)
+    return toSharedBookItem(
+        displayName = displayName,
+        includeReaderAnnotations = false
+    )
 }
 
 fun SharedBookItem.toRecentFileItem(
@@ -67,36 +88,49 @@ fun SharedBookItem.toRecentFileItem(
     tagEntitiesById: Map<String, TagEntity> = emptyMap()
 ): RecentFileItem {
     val resolvedTags = tags.map { tag -> tagEntitiesById[tag.id] ?: tag.toTagEntity(createdAt = 0L) }
-    return androidBooksById[id]?.copy(tags = resolvedTags)
-        ?.copy(
+    val positionCfi = readerPosition?.toSharedPositionCfi()
+    androidBooksById[id]?.let { existing ->
+        val mappedLastChapterIndex = readerPosition?.chapterIndex ?: existing.lastChapterIndex
+        val mappedLastPositionCfi = positionCfi ?: existing.lastPositionCfi
+        val mappedLocatorBlockIndex = readerPosition?.blockIndex ?: existing.locatorBlockIndex
+        val mappedLocatorCharOffset = readerPosition?.charOffset ?: existing.locatorCharOffset
+
+        if (
+            existing.uriString == path &&
+            existing.type == type &&
+            existing.timestamp == timestamp &&
+            existing.coverImagePath == coverImagePath &&
+            existing.title == title &&
+            existing.author == author &&
+            existing.description == description &&
+            existing.originalTitle == originalTitle &&
+            existing.originalAuthor == originalAuthor &&
+            existing.originalSeriesName == originalSeriesName &&
+            existing.originalSeriesIndex == originalSeriesIndex &&
+            existing.originalDescription == originalDescription &&
+            existing.lastPage == lastPageIndex &&
+            existing.progressPercentage == progressPercentage &&
+            existing.isRecent == isRecent &&
+            existing.sourceFolderUri == sourceFolder &&
+            existing.fileSize == fileSize &&
+            existing.fileContentModifiedTimestamp == fileContentModifiedTimestamp &&
+            existing.seriesName == seriesName &&
+            existing.seriesIndex == seriesIndex &&
+            existing.folderTextMetadataParsed == folderTextMetadataParsed &&
+            existing.lastChapterIndex == mappedLastChapterIndex &&
+            existing.lastPositionCfi == mappedLastPositionCfi &&
+            existing.locatorBlockIndex == mappedLocatorBlockIndex &&
+            existing.locatorCharOffset == mappedLocatorCharOffset &&
+            existing.readingPositionModifiedTimestamp == readingPositionModifiedTimestamp &&
+            existing.tags == resolvedTags
+        ) {
+            return existing
+        }
+
+        return existing.copy(
             uriString = path,
             type = type,
-            displayName = androidBooksById[id]?.displayName ?: displayName,
-            timestamp = timestamp,
-            coverImagePath = coverImagePath,
-            title = title,
-            author = author,
-            description = description,
-            originalTitle = originalTitle,
-            originalAuthor = originalAuthor,
-            originalSeriesName = originalSeriesName,
-            originalSeriesIndex = originalSeriesIndex,
-            originalDescription = originalDescription,
-            lastPage = lastPageIndex,
-            progressPercentage = progressPercentage,
-            isRecent = isRecent,
-            sourceFolderUri = sourceFolder,
-            fileSize = fileSize,
-            fileContentModifiedTimestamp = fileContentModifiedTimestamp,
-            seriesName = seriesName,
-            seriesIndex = seriesIndex,
-            folderTextMetadataParsed = folderTextMetadataParsed
-        )
-        ?: RecentFileItem(
-            bookId = id,
-            uriString = path,
-            type = type,
-            displayName = displayName,
+            displayName = existing.displayName,
             timestamp = timestamp,
             coverImagePath = coverImagePath,
             title = title,
@@ -116,8 +150,70 @@ fun SharedBookItem.toRecentFileItem(
             seriesName = seriesName,
             seriesIndex = seriesIndex,
             folderTextMetadataParsed = folderTextMetadataParsed,
+            lastChapterIndex = mappedLastChapterIndex,
+            lastPositionCfi = mappedLastPositionCfi,
+            locatorBlockIndex = mappedLocatorBlockIndex,
+            locatorCharOffset = mappedLocatorCharOffset,
+            readingPositionModifiedTimestamp = readingPositionModifiedTimestamp,
             tags = resolvedTags
         )
+    }
+
+    return RecentFileItem(
+        bookId = id,
+        uriString = path,
+        type = type,
+        displayName = displayName,
+        timestamp = timestamp,
+        coverImagePath = coverImagePath,
+        title = title,
+        author = author,
+        description = description,
+        originalTitle = originalTitle,
+        originalAuthor = originalAuthor,
+        originalSeriesName = originalSeriesName,
+        originalSeriesIndex = originalSeriesIndex,
+        originalDescription = originalDescription,
+        lastPage = lastPageIndex,
+        progressPercentage = progressPercentage,
+        isRecent = isRecent,
+        sourceFolderUri = sourceFolder,
+        fileSize = fileSize,
+        fileContentModifiedTimestamp = fileContentModifiedTimestamp,
+        seriesName = seriesName,
+        seriesIndex = seriesIndex,
+        folderTextMetadataParsed = folderTextMetadataParsed,
+        lastChapterIndex = readerPosition?.chapterIndex,
+        lastPositionCfi = positionCfi,
+        locatorBlockIndex = readerPosition?.blockIndex,
+        locatorCharOffset = readerPosition?.charOffset,
+        readingPositionModifiedTimestamp = readingPositionModifiedTimestamp,
+        tags = resolvedTags
+    )
+}
+
+private fun RecentFileItem.toSharedReaderLocatorOrNull(): SharedReaderLocator? {
+    if (
+        lastChapterIndex == null &&
+        lastPage == null &&
+        lastPositionCfi.isNullOrBlank() &&
+        locatorBlockIndex == null &&
+        locatorCharOffset == null
+    ) {
+        return null
+    }
+    return SharedReaderLocator.fromLegacy(
+        chapterIndex = lastChapterIndex,
+        cfi = lastPositionCfi,
+        pageIndex = lastPage
+    ).withFallbacks(
+        blockIndex = locatorBlockIndex,
+        charOffset = locatorCharOffset
+    )
+}
+
+private fun SharedReaderLocator.toSharedPositionCfi(): String? {
+    return toStablePositionCfi()
 }
 
 fun TagEntity.toSharedTag(): SharedTag {
@@ -167,8 +263,16 @@ fun BookShelfCrossRef.toSharedBookShelfRef(): SharedBookShelfRef {
 
 fun ReaderScreenState.toSharedReaderScreenState(
     rawBooks: List<RecentFileItem> = rawLibraryFiles,
-    dbTags: List<TagEntity> = allTags
+    dbTags: List<TagEntity> = allTags,
+    includeReaderAnnotations: Boolean = true
 ): SharedReaderScreenState {
+    fun RecentFileItem.toStateSharedBookItem(): SharedBookItem {
+        return toSharedBookItem(
+            displayName = customName ?: displayName,
+            includeReaderAnnotations = includeReaderAnnotations
+        )
+    }
+
     return SharedReaderScreenState(
         selectedBookId = selectedBookId,
         selectedUriString = selectedPdfUri?.toString() ?: selectedEpubUri?.toString(),
@@ -202,16 +306,16 @@ fun ReaderScreenState.toSharedReaderScreenState(
         isSearchActive = isSearchActive,
         isRefreshing = isRefreshing,
         reflowProgress = reflowProgress,
-        recentBooks = recentFiles.map { it.toSharedBookItem() },
-        libraryBooks = allRecentFiles.map { it.toSharedBookItem() },
-        rawLibraryBooks = rawBooks.map { it.toSharedBookItem() },
+        recentBooks = recentFiles.map { it.toStateSharedBookItem() },
+        libraryBooks = allRecentFiles.map { it.toStateSharedBookItem() },
+        rawLibraryBooks = rawBooks.map { it.toStateSharedBookItem() },
         pinnedHomeBookIds = pinnedHomeBookIds,
         pinnedLibraryBookIds = pinnedLibraryBookIds,
         libraryFilters = libraryFilters,
         recentFilesLimit = recentFilesLimit,
         isTabsEnabled = isTabsEnabled,
         openTabIds = openTabIds,
-        openTabs = openTabs.map { it.toSharedBookItem() },
+        openTabs = openTabs.map { it.toStateSharedBookItem() },
         activeTabBookId = activeTabBookId,
         showExternalFileSavePromptFor = showExternalFileSavePromptFor,
         externalFileBehavior = externalFileBehavior,
@@ -237,7 +341,14 @@ fun List<RecentFileItem>.withResolvedTags(
     val bookTagsMap = tagRefs.groupBy { it.bookId }.mapValues { entry ->
         entry.value.mapNotNull { tagsById[it.tagId] }
     }
-    return map { item -> item.copy(tags = bookTagsMap[item.bookId].orEmpty()) }
+    return map { item ->
+        val resolvedTags = bookTagsMap[item.bookId].orEmpty()
+        if (item.tags == resolvedTags) {
+            item
+        } else {
+            item.copy(tags = resolvedTags)
+        }
+    }
 }
 
 fun SharedReaderScreenState.toAndroidReaderScreenState(
@@ -246,8 +357,11 @@ fun SharedReaderScreenState.toAndroidReaderScreenState(
     tagEntitiesById: Map<String, TagEntity> = emptyMap()
 ): ReaderScreenState {
     val fallbackBooksById = rawLibraryBooks.associateBy { it.id }
+    val mappedBooksById = LinkedHashMap<String, RecentFileItem>()
     fun SharedBookItem.toAndroidBook(): RecentFileItem {
-        return toRecentFileItem(androidBooksById, tagEntitiesById)
+        return mappedBooksById.getOrPut(id) {
+            toRecentFileItem(androidBooksById, tagEntitiesById)
+        }
     }
     fun bookById(bookId: String): RecentFileItem? {
         return androidBooksById[bookId] ?: fallbackBooksById[bookId]?.toAndroidBook()
@@ -260,7 +374,7 @@ fun SharedReaderScreenState.toAndroidReaderScreenState(
         isAddingBooksToShelf = isAddingBooksToShelf,
         contextualActionShelfIds = selectedShelfIds,
         contextualActionItems = selectedBookIds.mapNotNullTo(mutableSetOf()) { bookById(it) },
-        shelves = shelves.map { it.toAndroidShelf(androidBooksById, tagEntitiesById) },
+        shelves = shelves.map { shelf -> shelf.toAndroidShelf { book -> book.toAndroidBook() } },
         openTabs = openTabs.map { it.toAndroidBook() },
         openTabIds = openTabIds,
         activeTabBookId = activeTabBookId,
@@ -273,12 +387,18 @@ fun SharedShelf.toAndroidShelf(
     androidBooksById: Map<String, RecentFileItem> = emptyMap(),
     tagEntitiesById: Map<String, TagEntity> = emptyMap()
 ): Shelf {
+    return toAndroidShelf { it.toRecentFileItem(androidBooksById, tagEntitiesById) }
+}
+
+private fun SharedShelf.toAndroidShelf(
+    resolveBook: (SharedBookItem) -> RecentFileItem
+): Shelf {
     return Shelf(
         id = id,
         name = name,
         type = type,
-        books = books.map { it.toRecentFileItem(androidBooksById, tagEntitiesById) },
-        directBooks = directBooks.map { it.toRecentFileItem(androidBooksById, tagEntitiesById) },
+        books = books.map(resolveBook),
+        directBooks = directBooks.map(resolveBook),
         parentShelfId = parentShelfId,
         childShelfIds = childShelfIds,
         depth = depth,

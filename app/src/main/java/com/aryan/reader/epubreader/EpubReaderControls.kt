@@ -1,30 +1,6 @@
-/*
- * Episteme Reader - A native Android document reader.
- * Copyright (C) 2026 Episteme
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
- * mail: epistemereader@gmail.com
- */
-// EpubReaderControls.kt
 package com.aryan.reader.epubreader
 
-import android.annotation.SuppressLint
-import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.os.Build
-import android.webkit.WebView
 import androidx.annotation.RequiresApi
 import androidx.annotation.StringRes
 import androidx.compose.foundation.lazy.LazyListState
@@ -38,14 +14,12 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -56,6 +30,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.only
@@ -72,6 +47,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.NavigateBefore
+import androidx.compose.material.icons.automirrored.filled.NavigateNext
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ArrowUpward
@@ -82,6 +59,10 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
@@ -121,9 +102,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -136,7 +115,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.zIndex
-import androidx.core.graphics.createBitmap
 import androidx.media3.common.util.UnstableApi
 import com.aryan.reader.BuildConfig
 import com.aryan.reader.R
@@ -145,15 +123,13 @@ import com.aryan.reader.SearchState
 import com.aryan.reader.SearchTopBar
 import com.aryan.reader.TooltipIconButton
 import com.aryan.reader.areReaderAiFeaturesEnabled
-import com.aryan.reader.epub.EpubChapter
 import com.aryan.reader.loadNativeVoice
-import com.aryan.reader.paginatedreader.BookPaginator
-import com.aryan.reader.paginatedreader.IPaginator
+import com.aryan.reader.readerSliderStepPage
+import com.aryan.reader.shared.ui.ReaderMinimalSlider
 import com.aryan.reader.tts.GEMINI_TTS_SPEAKERS
+import com.aryan.reader.tts.ReaderTtsOverlaySize
 import com.aryan.reader.tts.TtsPlaybackManager.TtsState
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import timber.log.Timber
+import com.aryan.reader.tts.formatReaderTtsChunkLabel
 import kotlin.math.roundToInt
 
 enum class ReaderTool(@StringRes val titleRes: Int, val category: String) {
@@ -177,7 +153,8 @@ enum class ReaderTool(@StringRes val titleRes: Int, val category: String) {
     SCREEN_ORIENTATION(R.string.menu_screen_orientation, "Top Bar"),
     AUTO_SCROLL(R.string.menu_auto_scroll, "Overflow Menu"),
     TTS_SETTINGS(R.string.menu_tts_settings, "Overflow Menu"),
-    TTS_REPLACEMENTS(R.string.menu_tts_word_replacements, "Overflow Menu")
+    TTS_REPLACEMENTS(R.string.menu_tts_word_replacements, "Overflow Menu"),
+    BOOK_REPLACEMENTS(R.string.menu_book_word_replacements, "Overflow Menu")
 }
 
 enum class FlatItemType { SECTION_HEADER, TOOL, EMPTY_PLACEHOLDER, MORE_HEADER, MORE_TOOL }
@@ -286,6 +263,7 @@ internal enum class EpubOverflowMenuSection {
     KEEP_SCREEN_ON,
     VISUAL_OPTIONS,
     AUTO_SCROLL,
+    BOOK_REPLACEMENTS,
     TTS_SETTINGS,
     FILE_INFO
 }
@@ -309,6 +287,7 @@ internal fun epubOverflowMenuSections(
     if (!hiddenTools.contains(ReaderTool.KEEP_SCREEN_ON.name)) add(EpubOverflowMenuSection.KEEP_SCREEN_ON)
     if (!hiddenTools.contains(ReaderTool.VISUAL_OPTIONS.name)) add(EpubOverflowMenuSection.VISUAL_OPTIONS)
     if (!hiddenTools.contains(ReaderTool.AUTO_SCROLL.name)) add(EpubOverflowMenuSection.AUTO_SCROLL)
+    if (!hiddenTools.contains(ReaderTool.BOOK_REPLACEMENTS.name)) add(EpubOverflowMenuSection.BOOK_REPLACEMENTS)
     if (
         !hiddenTools.contains(ReaderTool.TTS_SETTINGS.name) ||
         !hiddenTools.contains(ReaderTool.TTS_REPLACEMENTS.name)
@@ -381,11 +360,13 @@ fun EpubReaderTopBar(
     volumeScrollEnabled: Boolean,
     isPageTurnAnimationEnabled: Boolean,
     isRightToLeftPagination: Boolean,
+    useNativeVerticalRenderer: Boolean,
     onNavigateBack: () -> Unit,
     isKeepScreenOn: Boolean,
     onToggleKeepScreenOn: (Boolean) -> Unit,
     onCloseSearch: () -> Unit,
     onChangeRenderMode: (RenderMode) -> Unit,
+    onUseNativeVerticalRendererChange: (Boolean) -> Unit,
     onToggleBookmark: () -> Unit,
     onToggleTapToNavigate: (Boolean) -> Unit,
     onToggleVolumeScroll: (Boolean) -> Unit,
@@ -394,6 +375,7 @@ fun EpubReaderTopBar(
     onStartAutoScroll: () -> Unit,
     onOpenTtsSettings: () -> Unit,
     onOpenTtsReplacements: () -> Unit,
+    onOpenBookReplacements: () -> Unit,
     onOpenDictionarySettings: () -> Unit,
     onOpenThemeSettings: () -> Unit,
     onOpenBrightness: () -> Unit,
@@ -701,14 +683,29 @@ fun EpubReaderTopBar(
                                         )
                                         if (showReadingModeExpanded) {
                                             DropdownMenuItem(
-                                                text = { Text(stringResource(R.string.menu_reading_mode_vertical)) },
+                                                text = { Text(stringResource(R.string.menu_reading_mode_vertical_webview)) },
                                                 enabled = !isTtsActive,
                                                 onClick = {
+                                                    onUseNativeVerticalRendererChange(false)
                                                     showMoreMenu = false
                                                     onChangeRenderMode(RenderMode.VERTICAL_SCROLL)
                                                 },
                                                 trailingIcon = {
-                                                    if (currentRenderMode == RenderMode.VERTICAL_SCROLL) Icon(
+                                                    if (currentRenderMode == RenderMode.VERTICAL_SCROLL && !useNativeVerticalRenderer) Icon(
+                                                        Icons.Default.Check,
+                                                        contentDescription = stringResource(R.string.content_desc_selected)
+                                                    )
+                                                })
+                                            DropdownMenuItem(
+                                                text = { Text(stringResource(R.string.menu_reading_mode_vertical_native)) },
+                                                enabled = !isTtsActive,
+                                                onClick = {
+                                                    onUseNativeVerticalRendererChange(true)
+                                                    showMoreMenu = false
+                                                    onChangeRenderMode(RenderMode.VERTICAL_SCROLL)
+                                                },
+                                                trailingIcon = {
+                                                    if (currentRenderMode == RenderMode.VERTICAL_SCROLL && useNativeVerticalRenderer) Icon(
                                                         Icons.Default.Check,
                                                         contentDescription = stringResource(R.string.content_desc_selected)
                                                     )
@@ -848,6 +845,22 @@ fun EpubReaderTopBar(
                                                 showMoreMenu = false
                                                 onStartAutoScroll()
                                             })
+                                    }
+                                    EpubOverflowMenuSection.BOOK_REPLACEMENTS -> {
+                                        DropdownMenuItem(
+                                            text = { Text(stringResource(R.string.menu_book_word_replacements)) },
+                                            onClick = {
+                                                showMoreMenu = false
+                                                onOpenBookReplacements()
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    painter = painterResource(id = R.drawable.text_fields),
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(20.dp)
+                                                )
+                                            }
+                                        )
                                     }
                                     EpubOverflowMenuSection.TTS_SETTINGS -> {
                                         DropdownMenuItem(
@@ -1158,26 +1171,18 @@ fun EpubReaderBottomBar(
 }
 
 @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
-@SuppressLint("UnusedBoxWithConstraintsScope")
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EpubReaderPageSlider(
     isVisible: Boolean,
-    currentRenderMode: RenderMode,
     totalPages: Int,
     sliderCurrentPage: Float,
     sliderStartPage: Int,
-    startPageThumbnail: Bitmap?,
-    paginator: IPaginator?,
-    chapters: List<EpubChapter>,
     onScrub: (Float) -> Unit,
     onJumpToPage: (Int) -> Unit,
     modifier: Modifier = Modifier,
     activeColor: Color = Color.Unspecified,
     inactiveColor: Color = Color.Unspecified,
-    contentColor: Color = Color.Unspecified,
-    thumbnailSurfaceColor: Color = Color.Unspecified,
-    thumbnailContentColor: Color = Color.Unspecified
+    contentColor: Color = Color.Unspecified
 ) {
     val effectiveActiveColor = if (activeColor == Color.Unspecified) {
         MaterialTheme.colorScheme.primary
@@ -1194,16 +1199,8 @@ fun EpubReaderPageSlider(
     } else {
         contentColor
     }
-    val effectiveThumbnailSurfaceColor = if (thumbnailSurfaceColor == Color.Unspecified) {
-        MaterialTheme.colorScheme.surfaceVariant
-    } else {
-        thumbnailSurfaceColor
-    }
-    val effectiveThumbnailContentColor = if (thumbnailContentColor == Color.Unspecified) {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    } else {
-        thumbnailContentColor
-    }
+    val maxPage = totalPages.coerceAtLeast(1)
+    val currentPage = sliderCurrentPage.roundToInt().coerceIn(1, maxPage)
 
     AnimatedVisibility(
         visible = isVisible,
@@ -1211,128 +1208,73 @@ fun EpubReaderPageSlider(
         exit = slideOutVertically(animationSpec = tween(200)) { fullHeight -> fullHeight } + fadeOut(animationSpec = tween(200)),
         modifier = modifier
     ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Spacer(Modifier.height(72.dp))
-            Box(
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(indication = null, interactionSource = remember { MutableInteractionSource() }) {},
+        ) {
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(indication = null, interactionSource = remember { MutableInteractionSource() }) {},
+                    .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Horizontal))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Horizontal))
-                        .padding(horizontal = 32.dp, vertical = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    BoxWithConstraints(
-                        modifier = Modifier.weight(1f),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Slider(
-                            value = sliderCurrentPage,
-                            onValueChange = onScrub,
-                            valueRange = 1f..(totalPages.toFloat().coerceAtLeast(1f)),
-                            steps = if (totalPages > 2) totalPages - 2 else 0,
-                            modifier = Modifier.fillMaxWidth(),
-                            thumb = {
-                                Surface(
-                                    modifier = Modifier.size(20.dp),
-                                    shape = CircleShape,
-                                    color = effectiveActiveColor,
-                                    tonalElevation = 0.dp,
-                                    shadowElevation = 0.dp
-                                ) {}
-                            },
-                            track = { sliderState ->
-                                val trackHeight = 2.dp
-                                val trackShape = RoundedCornerShape(trackHeight)
-                                val range = sliderState.valueRange.endInclusive - sliderState.valueRange.start
-                                val fraction = if (range == 0f) 0f else {
-                                    ((sliderState.value - sliderState.valueRange.start) / range).coerceIn(0f, 1f)
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(trackHeight)
-                                        .background(
-                                            color = effectiveInactiveColor,
-                                            shape = trackShape
-                                        )
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth(fraction)
-                                            .fillMaxHeight()
-                                            .background(
-                                                color = effectiveActiveColor,
-                                                shape = trackShape
-                                            )
-                                    )
-                                }
-                            }
-                        )
-
-                        // Thumbnail Indicator
-                        val startPageOffsetFraction = if (totalPages > 1) {
-                            (sliderStartPage - 1).toFloat() / (totalPages - 1)
-                        } else {
-                            0f
-                        }
-                        val thumbWidth = 20.dp
-                        val trackWidth = maxWidth - thumbWidth
-                        val startPagePixelPosition = (trackWidth * startPageOffsetFraction) + (thumbWidth / 2)
-                        val thumbnailModifier = Modifier
-                            .graphicsLayer { clip = false }
-                            .align(Alignment.TopStart)
-                            .offset(
-                                x = startPagePixelPosition - (45.dp / 2),
-                                y = (-72).dp
+                IconButton(
+                    onClick = {
+                        onJumpToPage(
+                            readerSliderStepPage(
+                                currentPage = currentPage,
+                                delta = -1,
+                                minPage = 1,
+                                maxPage = maxPage
                             )
+                        )
+                    },
+                    enabled = currentPage > 1,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.NavigateBefore,
+                        contentDescription = stringResource(R.string.desktop_previous_page),
+                        tint = effectiveContentColor.copy(alpha = if (currentPage > 1) 0.9f else 0.32f)
+                    )
+                }
 
-                        if (currentRenderMode == RenderMode.VERTICAL_SCROLL) {
-                            startPageThumbnail?.let { thumbnail ->
-                                ThumbnailWithIndicator(
-                                    modifier = thumbnailModifier,
-                                    borderColor = effectiveActiveColor,
-                                    onClick = { onJumpToPage(sliderStartPage) }
-                                ) {
-                                    Image(
-                                        bitmap = thumbnail.asImageBitmap(),
-                                        contentDescription = stringResource(R.string.content_desc_start_page_thumbnail),
-                                        contentScale = ContentScale.FillBounds,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                }
-                            }
-                        } else {
-                            val startPageChapterIndex = remember(sliderStartPage, paginator) {
-                                (paginator as? BookPaginator)?.findChapterIndexForPage(sliderStartPage - 1)
-                            }
-                            val startPageChapterTitle = remember(startPageChapterIndex) {
-                                startPageChapterIndex?.let { chapters.getOrNull(it)?.title }
-                            }
-                            ThumbnailWithIndicator(
-                                modifier = thumbnailModifier,
-                                borderColor = effectiveActiveColor,
-                                onClick = { onJumpToPage(sliderStartPage) }
-                            ) {
-                                PaginatedThumbnailContent(
-                                    pageNumber = sliderStartPage,
-                                    chapterTitle = startPageChapterTitle,
-                                    surfaceColor = effectiveThumbnailSurfaceColor,
-                                    contentColor = effectiveThumbnailContentColor
-                                )
-                            }
-                        }
-                    }
+                ReaderMinimalSlider(
+                    value = sliderCurrentPage.coerceIn(1f, maxPage.toFloat()),
+                    onValueChange = onScrub,
+                    valueRange = 1f..maxPage.toFloat(),
+                    enabled = maxPage > 1,
+                    activeColor = effectiveActiveColor,
+                    inactiveColor = effectiveInactiveColor,
+                    thumbColor = effectiveActiveColor,
+                    markerValue = sliderStartPage.toFloat(),
+                    markerColor = effectiveActiveColor,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(32.dp)
+                )
 
-                    Text(
-                        text = "${sliderCurrentPage.roundToInt()} / $totalPages",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = effectiveContentColor,
-                        fontSize = 18.sp
+                IconButton(
+                    onClick = {
+                        onJumpToPage(
+                            readerSliderStepPage(
+                                currentPage = currentPage,
+                                delta = 1,
+                                minPage = 1,
+                                maxPage = maxPage
+                            )
+                        )
+                    },
+                    enabled = currentPage < maxPage,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.NavigateNext,
+                        contentDescription = stringResource(R.string.desktop_next_page),
+                        tint = effectiveContentColor.copy(alpha = if (currentPage < maxPage) 0.9f else 0.32f)
                     )
                 }
             }
@@ -1371,109 +1313,6 @@ fun PageScrubbingAnimation(currentPage: Int, totalPages: Int) {
                 style = MaterialTheme.typography.headlineSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
-        }
-    }
-}
-
-@Composable
-internal fun ThumbnailWithIndicator(
-    modifier: Modifier = Modifier,
-    borderColor: Color = Color.Unspecified,
-    onClick: () -> Unit,
-    content: @Composable () -> Unit
-) {
-    val effectiveBorderColor = if (borderColor == Color.Unspecified) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        borderColor
-    }
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Surface(
-            modifier = Modifier
-                .width(45.dp)
-                .height(64.dp)
-                .clickable(onClick = onClick),
-            shape = RoundedCornerShape(4.dp),
-            border = BorderStroke(2.dp, effectiveBorderColor)
-        ) {
-            content()
-        }
-        Box(
-            modifier = Modifier
-                .offset(y = (-4).dp)
-                .size(8.dp)
-                .rotate(45f)
-                .background(effectiveBorderColor)
-        )
-    }
-}
-
-@Composable
-private fun PaginatedThumbnailContent(
-    pageNumber: Int,
-    chapterTitle: String?,
-    surfaceColor: Color = Color.Unspecified,
-    contentColor: Color = Color.Unspecified
-) {
-    val effectiveSurfaceColor = if (surfaceColor == Color.Unspecified) {
-        MaterialTheme.colorScheme.surfaceVariant
-    } else {
-        surfaceColor
-    }
-    val effectiveContentColor = if (contentColor == Color.Unspecified) {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    } else {
-        contentColor
-    }
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = effectiveSurfaceColor,
-        contentColor = effectiveContentColor
-    ) {
-        Column(
-            modifier = Modifier.padding(4.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            if (chapterTitle != null) {
-                Text(
-                    text = chapterTitle,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                    lineHeight = 10.sp
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-            }
-            Text(
-                text = "$pageNumber",
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-suspend fun captureWebViewVisibleArea(webView: WebView): Bitmap? {
-    return withContext(Dispatchers.Main) {
-        if (webView.width <= 0 || webView.height <= 0) return@withContext null
-        try {
-            val thumbnailWidth = 180
-            val thumbnailHeight = 256
-            val bitmap = createBitmap(thumbnailWidth, thumbnailHeight)
-            val canvas = Canvas(bitmap)
-            val scale = thumbnailWidth.toFloat() / webView.width.toFloat()
-            canvas.scale(scale, scale)
-            canvas.translate(-webView.scrollX.toFloat(), -webView.scrollY.toFloat())
-            webView.draw(canvas)
-            bitmap
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to capture webview content")
-            null
         }
     }
 }
@@ -2204,6 +2043,7 @@ private fun ToolPreviewIcon(tool: ReaderTool, isSliderActive: Boolean = false) {
         ReaderTool.SEARCH -> Icon(Icons.Default.Search, contentDescription = title, modifier = Modifier.size(20.dp))
         ReaderTool.AI_FEATURES -> Icon(painterResource(id = R.drawable.ai), contentDescription = title, modifier = Modifier.size(20.dp))
         ReaderTool.TTS_CONTROLS -> Icon(painterResource(id = R.drawable.text_to_speech), contentDescription = title, modifier = Modifier.size(20.dp))
+        ReaderTool.BOOK_REPLACEMENTS -> Icon(painterResource(id = R.drawable.text_fields), contentDescription = title, modifier = Modifier.size(20.dp))
         ReaderTool.FILE_INFO -> Icon(Icons.Default.Info, contentDescription = title, modifier = Modifier.size(20.dp))
         ReaderTool.SCREEN_ORIENTATION -> Icon(Icons.Default.ScreenRotation, contentDescription = title, modifier = Modifier.size(20.dp))
         else -> Icon(Icons.Default.MoreVert, contentDescription = title, modifier = Modifier.size(20.dp))
@@ -2260,8 +2100,8 @@ fun TtsOverlayControls(
     ttsController: com.aryan.reader.tts.TtsController,
     ttsState: TtsState,
     currentTtsMode: com.aryan.reader.tts.TtsPlaybackManager.TtsMode,
-    isCollapsed: Boolean,
-    onCollapseChange: (Boolean) -> Unit,
+    overlaySize: ReaderTtsOverlaySize,
+    onOverlaySizeChange: (ReaderTtsOverlaySize) -> Unit,
     onLocateCurrentChunk: () -> Unit,
     onOpenTtsSettings: () -> Unit,
     onClose: () -> Unit,
@@ -2301,11 +2141,17 @@ fun TtsOverlayControls(
         }
     }
     val chunkLabel = remember(ttsState.currentChunkIndex, ttsState.totalChunks) {
-        if (ttsState.currentChunkIndex >= 0 && ttsState.totalChunks > 0) {
-            "Chunk ${ttsState.currentChunkIndex + 1}/${ttsState.totalChunks}"
-        } else {
-            null
-        }
+        formatReaderTtsChunkLabel(ttsState.currentChunkIndex, ttsState.totalChunks)
+    }
+    val miniBarTitle = ttsState.bookTitle
+        ?.takeIf { it.isNotBlank() }
+        ?: stringResource(R.string.action_read_aloud)
+    val miniBarSubtitle = remember(chapterLabel, chunkLabel, progressPercent, miniBarTitle) {
+        listOfNotNull(
+            chunkLabel,
+            progressPercent?.let { "$it%" },
+            chapterLabel?.takeIf { it != miniBarTitle }
+        ).joinToString(" - ")
     }
     val canSkipPreviousChunk = !ttsState.isLoading &&
         ttsState.currentChunkIndex > 0 &&
@@ -2330,24 +2176,40 @@ fun TtsOverlayControls(
         tonalElevation = 0.dp,
         shadowElevation = 0.dp,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.8f)),
-        modifier = modifier.widthIn(max = 400.dp).animateContentSize()
+        modifier = modifier
+            .widthIn(max = if (overlaySize == ReaderTtsOverlaySize.MEDIUM) 560.dp else 400.dp)
+            .animateContentSize()
     ) {
         AnimatedContent(
-            targetState = isCollapsed,
+            targetState = overlaySize,
             transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
             label = "TtsOverlayUnified"
-        ) { collapsed ->
-            if (collapsed) {
+        ) { size ->
+            if (size == ReaderTtsOverlaySize.SMALL) {
                 Row(
                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     IconButton(
-                        onClick = { onCollapseChange(false) },
+                        onClick = { onOverlaySizeChange(ReaderTtsOverlaySize.LARGE) },
                         modifier = Modifier.size(36.dp)
                     ) {
-                        Icon(Icons.Default.ChevronLeft, "Expand", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Icon(
+                            Icons.Default.KeyboardArrowUp,
+                            stringResource(R.string.content_desc_expand),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(
+                        onClick = { onOverlaySizeChange(ReaderTtsOverlaySize.MEDIUM) },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.KeyboardArrowLeft,
+                            stringResource(R.string.content_desc_expand),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                     Box(modifier = Modifier.size(36.dp), contentAlignment = Alignment.Center) {
                         FilledIconButton(
@@ -2371,6 +2233,114 @@ fun TtsOverlayControls(
                         )
                     }
                 }
+            } else if (size == ReaderTtsOverlaySize.MEDIUM) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 64.dp)
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(16.dp))
+                            .clickable(onClick = onLocateCurrentChunk)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = miniBarTitle,
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (miniBarSubtitle.isNotBlank()) {
+                            Text(
+                                text = miniBarSubtitle,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.width(4.dp))
+
+                    IconButton(
+                        enabled = canSkipPreviousChunk,
+                        onClick = { ttsController.skipToPreviousChunk() },
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SkipPrevious,
+                            contentDescription = stringResource(R.string.content_desc_tts_previous_chunk),
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+
+                    Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                        FilledIconButton(
+                            onClick = { if (ttsState.isPlaying) ttsController.pause() else ttsController.resume() },
+                            modifier = Modifier.size(44.dp),
+                            colors = IconButtonDefaults.filledIconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                                contentColor = MaterialTheme.colorScheme.primary
+                            )
+                        ) {
+                            Icon(
+                                painterResource(if (ttsState.isPlaying) R.drawable.pause else R.drawable.play),
+                                stringResource(R.string.content_desc_play_pause),
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                        if (ttsState.isLoading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(48.dp),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                strokeWidth = 2.dp
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        enabled = canSkipNextChunk,
+                        onClick = { ttsController.skipToNextChunk() },
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SkipNext,
+                            contentDescription = stringResource(R.string.content_desc_tts_next_chunk),
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
+                        IconButton(
+                            onClick = { onOverlaySizeChange(ReaderTtsOverlaySize.LARGE) },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.KeyboardArrowUp,
+                                contentDescription = stringResource(R.string.content_desc_expand),
+                                modifier = Modifier.size(22.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(
+                            onClick = { onOverlaySizeChange(ReaderTtsOverlaySize.SMALL) },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.KeyboardArrowRight,
+                                contentDescription = stringResource(R.string.content_desc_collapse),
+                                modifier = Modifier.size(22.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             } else {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
@@ -2378,7 +2348,10 @@ fun TtsOverlayControls(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             Surface(
                                 color = MaterialTheme.colorScheme.primaryContainer,
                                 shape = RoundedCornerShape(8.dp)
@@ -2428,6 +2401,8 @@ fun TtsOverlayControls(
                             }
                         }
 
+                        Spacer(Modifier.width(8.dp))
+
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             IconButton(onClick = onLocateCurrentChunk, modifier = Modifier.size(32.dp)) {
                                 Icon(
@@ -2437,8 +2412,27 @@ fun TtsOverlayControls(
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                            IconButton(onClick = { onCollapseChange(true) }, modifier = Modifier.size(32.dp)) {
-                                Icon(Icons.Default.ChevronRight, stringResource(R.string.content_desc_collapse), modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            IconButton(
+                                onClick = { onOverlaySizeChange(ReaderTtsOverlaySize.MEDIUM) },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.KeyboardArrowDown,
+                                    stringResource(R.string.content_desc_collapse),
+                                    modifier = Modifier.size(18.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(
+                                onClick = { onOverlaySizeChange(ReaderTtsOverlaySize.SMALL) },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.KeyboardArrowRight,
+                                    stringResource(R.string.content_desc_collapse),
+                                    modifier = Modifier.size(18.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                             IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
                                 Icon(Icons.Default.Close, stringResource(R.string.content_desc_stop_tts), tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))

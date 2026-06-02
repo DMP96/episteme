@@ -1,11 +1,13 @@
 // PaginatorTest.kt
 package com.aryan.reader.paginatedreader
 
+import android.os.Build
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
-import com.google.common.truth.Truth.assertThat
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.filters.SdkSuppress
+import com.google.common.truth.Truth.assertThat
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -42,13 +44,51 @@ class FakeSplittableMeasurementProvider(
         }
         return null
     }
+
+    override suspend fun split(block: TableBlock, availableHeight: Int): Pair<TableBlock, TableBlock>? = null
+
+    override suspend fun split(block: FlexContainerBlock, availableHeight: Int): Pair<FlexContainerBlock, FlexContainerBlock>? = null
 }
 
 @RunWith(AndroidJUnit4::class)
+@SdkSuppress(minSdkVersion = Build.VERSION_CODES.VANILLA_ICE_CREAM)
 class PaginatorTest {
 
     private val testDensity = Density(density = 1f, fontScale = 1f)
     private val pageHeight = 1000
+
+    private fun List<ContentBlock>.withoutMeasuredHeights(): List<ContentBlock> {
+        return map { it.withoutMeasuredHeight() }
+    }
+
+    private fun ContentBlock.withoutMeasuredHeight(): ContentBlock {
+        return when (this) {
+            is ParagraphBlock -> copy(expectedHeight = 0)
+            is ImageBlock -> copy(expectedHeight = 0)
+            is HeaderBlock -> copy(expectedHeight = 0)
+            is SpacerBlock -> copy(expectedHeight = 0)
+            is QuoteBlock -> copy(expectedHeight = 0)
+            is ListItemBlock -> copy(expectedHeight = 0)
+            is TableBlock -> copy(
+                rows = rows.map { row ->
+                    row.map { cell ->
+                        cell.copy(content = cell.content.withoutMeasuredHeights())
+                    }
+                },
+                expectedHeight = 0
+            )
+            is MathBlock -> copy(expectedHeight = 0)
+            is WrappingContentBlock -> copy(
+                floatedImage = floatedImage.copy(expectedHeight = 0),
+                paragraphsToWrap = paragraphsToWrap.map { it.copy(expectedHeight = 0) },
+                expectedHeight = 0
+            )
+            is FlexContainerBlock -> copy(
+                children = children.withoutMeasuredHeights(),
+                expectedHeight = 0
+            )
+        }
+    }
 
     @Test
     fun paginate_givenEmptyBlocks_createsZeroPages() = runTest {
@@ -85,8 +125,53 @@ class PaginatorTest {
         val pages = paginate(blocks, pageHeight, measurementProvider, testDensity)
 
         assertThat(pages).hasSize(2)
-        assertThat(pages[0].content).containsExactly(block1)
-        assertThat(pages[1].content).containsExactly(block2)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(block1)
+        assertThat(pages[1].content.withoutMeasuredHeights()).containsExactly(block2)
+    }
+
+    @Test
+    fun paginate_honorsBreakBeforePage() = runTest {
+        val block1 = ParagraphBlock(content = AnnotatedString("Before"), blockIndex = 0)
+        val block2 = ParagraphBlock(
+            content = AnnotatedString("After"),
+            style = BlockStyle(breakBefore = "page"),
+            blockIndex = 1
+        )
+
+        val pages = paginate(
+            listOf(block1, block2),
+            pageHeight,
+            FakeSplittableMeasurementProvider(mapOf(block1 to 100, block2 to 100)),
+            testDensity
+        )
+
+        assertThat(pages).hasSize(2)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(block1)
+        assertThat(pages[1].content.withoutMeasuredHeights()).containsExactly(block2)
+    }
+
+    @Test
+    fun paginate_breakInsideAvoidPreventsParagraphSplit() = runTest {
+        val block1 = ParagraphBlock(
+            content = AnnotatedString("Keep together"),
+            style = BlockStyle(breakInside = "avoid"),
+            blockIndex = 0
+        )
+        val part1 = block1.copy(content = AnnotatedString("Keep"))
+        val part2 = block1.copy(content = AnnotatedString("together"))
+
+        val pages = paginate(
+            listOf(block1),
+            pageHeight = 400,
+            measurementProvider = FakeSplittableMeasurementProvider(
+                heights = mapOf(block1 to 800, part1 to 300, part2 to 500),
+                splittableParagraphs = mapOf(block1 to (part1 to part2))
+            ),
+            density = testDensity
+        )
+
+        assertThat(pages).hasSize(1)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(block1)
     }
 
     @Test
@@ -110,8 +195,8 @@ class PaginatorTest {
         val pages = paginate(blocks, pageHeight, measurementProvider, testDensity)
 
         assertThat(pages).hasSize(2)
-        assertThat(pages[0].content).containsExactly(block1, part1).inOrder()
-        assertThat(pages[1].content).containsExactly(part2)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(block1, part1).inOrder()
+        assertThat(pages[1].content.withoutMeasuredHeights()).containsExactly(part2)
     }
 
     @Test
@@ -136,8 +221,8 @@ class PaginatorTest {
         val pages = paginate(listOf(originalWrapper), pageHeight, measurementProvider, testDensity)
 
         assertThat(pages).hasSize(2)
-        assertThat(pages[0].content).containsExactly(splitWrapper)
-        assertThat(pages[1].content).containsExactly(para2)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(splitWrapper)
+        assertThat(pages[1].content.withoutMeasuredHeights()).containsExactly(para2)
     }
 
 
@@ -158,8 +243,8 @@ class PaginatorTest {
         val pages = paginate(blocks, pageHeight, measurementProvider, testDensity)
 
         assertThat(pages).hasSize(2)
-        assertThat(pages[0].content).containsExactly(block1)
-        assertThat(pages[1].content).containsExactly(unsplittableBlock)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(block1)
+        assertThat(pages[1].content.withoutMeasuredHeights()).containsExactly(unsplittableBlock)
     }
 
     @Test
@@ -172,7 +257,7 @@ class PaginatorTest {
         val pages = paginate(blocks, pageHeight, measurementProvider, testDensity)
 
         assertThat(pages).hasSize(1)
-        assertThat(pages[0].content).containsExactly(oversizedBlock)
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(oversizedBlock)
     }
 
     @Test
@@ -248,8 +333,8 @@ class PaginatorTest {
 
         val pages = paginate(blocks, pageHeight, measurementProvider, testDensity)
         assertThat(pages).hasSize(2)
-        assertThat(pages[0].content).containsExactly(block1)
-        assertThat(pages[1].content).containsExactly(splittableBlock) // Was not split
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(block1)
+        assertThat(pages[1].content.withoutMeasuredHeights()).containsExactly(splittableBlock) // Was not split
     }
 
     @Test
@@ -271,8 +356,7 @@ class PaginatorTest {
         // Set page height so that a split is attempted.
         val pages = paginate(blocks, 150, measurementProvider, testDensity)
         assertThat(pages).hasSize(1)
-        // The page should be empty because part1 was empty, and the original block was re-added
-        // to the remaining list. The next page then contains the full block.
-        assertThat(pages[0].content).containsExactly(part2)
+        // Empty split heads are skipped so pagination keeps only the remaining content.
+        assertThat(pages[0].content.withoutMeasuredHeights()).containsExactly(part2)
     }
 }

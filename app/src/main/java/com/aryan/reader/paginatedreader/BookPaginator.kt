@@ -37,8 +37,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import com.aryan.reader.SearchResult
+import com.aryan.reader.applyBookReplacementsToHtmlDocument
 import com.aryan.reader.epub.EpubChapter
 import com.aryan.reader.epub.contentFilePath
+import com.aryan.reader.epub.plainTextCharacterCount
 import com.aryan.reader.paginatedreader.data.BookCacheDao
 import com.aryan.reader.paginatedreader.data.BookProcessingInput
 import com.aryan.reader.paginatedreader.data.BookProcessingWorker
@@ -50,14 +52,20 @@ import com.aryan.reader.paginatedreader.data.PageIndexEntry
 import com.aryan.reader.paginatedreader.data.ProcessedBook
 import com.aryan.reader.paginatedreader.data.ProcessedChapter
 import com.aryan.reader.paginatedreader.data.SerializableEpubChapter
+import com.aryan.reader.shared.ReaderBookReplacementPreferences
+import com.aryan.reader.shared.ReaderBookReplacementPreferencesJson
 import com.aryan.reader.tts.PageCharacterRange
 import com.aryan.reader.tts.splitTextIntoChunks
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -74,6 +82,8 @@ import java.net.URI
 import java.net.URLDecoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 private const val PRIORITY_HIGHEST = 0
 private const val PRIORITY_HIGH = 1
@@ -134,7 +144,7 @@ private data class PageNavigationEntry(
 @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
 @Stable
 class BookPaginator(
-    private val coroutineScope: CoroutineScope,
+    coroutineScope: CoroutineScope,
     private val chapters: List<EpubChapter>,
     private val textMeasurer: TextMeasurer,
     private val constraints: Constraints,
@@ -157,7 +167,9 @@ class BookPaginator(
     private val userTextAlign: TextAlign?,
     private val paragraphGapMultiplier: Float,
     private val imageSizeMultiplier: Float,
-    private val verticalMarginMultiplier: Float
+    private val verticalMarginMultiplier: Float,
+    private val bookReplacementPreferences: ReaderBookReplacementPreferences = ReaderBookReplacementPreferences(),
+    private val bookReplacementFileId: String? = null
 ) : IPaginator {
     override var totalPageCount by mutableIntStateOf(0)
         private set
@@ -200,8 +212,27 @@ class BookPaginator(
     private val paginationQueue = PriorityBlockingQueue<PaginationRequest>()
     private val chaptersBeingProcessed = ConcurrentHashMap.newKeySet<Int>()
     private val chapterPaginationLocks = ConcurrentHashMap<Int, Mutex>()
+    private val chapterBlockLocks = ConcurrentHashMap<Int, Mutex>()
     private val navigationCallbacks = ConcurrentHashMap<Int, MutableList<(List<Page>) -> Unit>>()
     private var paginationWorker: Job? = null
+    private val paginatorJob = SupervisorJob(coroutineScope.coroutineContext[Job])
+    private val paginatorScope = CoroutineScope(coroutineScope.coroutineContext + paginatorJob)
+    @Volatile
+    private var disposed = false
+
+    override fun dispose() {
+        if (disposed) return
+        disposed = true
+        paginationQueue.clear()
+        navigationCallbacks.clear()
+        chaptersBeingProcessed.clear()
+        paginationWorker?.cancel()
+        paginatorJob.cancel(CancellationException("BookPaginator disposed"))
+        isLoading = false
+        Timber.i("BookPaginator disposed for book=$bookId configHash=$currentConfigHash")
+    }
+
+    private fun isDisposed(): Boolean = disposed || !paginatorJob.isActive
 
     internal fun getCharactersScrolledInChapter(chapterIndex: Int, pageInChapter: Int): Long {
         val cumulativeCharsList = chapterCumulativeChars[chapterIndex]
@@ -224,7 +255,7 @@ class BookPaginator(
             Timber.e("Paginator received UNBOUNDED HEIGHT. Pagination will fail.")
         } else {
             Timber.i("Paginator initializing with constraints: $constraints")
-            coroutineScope.launch {
+            paginatorScope.launch {
                 isLoading = true
                 Timber.d("Initialization started.")
 
@@ -236,22 +267,46 @@ class BookPaginator(
                     return@launch
                 }
 
-                // 1. Book processing check (Keep existing logic)
+                // 1. Generate config hash before touching semantic cache; processed chapters are style-sensitive.
+                coroutineContext.ensureActive()
+                currentConfigHash = generateConfigurationHash()
+                coroutineContext.ensureActive()
+
+                // 2. Book processing check (Keep existing logic)
                 val bookRecord = bookCacheDao.getProcessedBook(bookId)
+                var shouldEnqueueBookProcessing = false
                 if (bookRecord == null || bookRecord.processingVersion < LATEST_PROCESSING_VERSION) {
                     Timber.i("Book cache is new or stale. Creating initial record.")
                     bookCacheDao.deleteEntireBookCache(bookId)
                     val initialBook = ProcessedBook(bookId, LATEST_PROCESSING_VERSION, 0) // Temp 0
                     bookCacheDao.insertProcessedBook(initialBook)
-                    enqueueBookProcessingWork()
+                    shouldEnqueueBookProcessing = true
+                } else if (bookCacheDao.getProcessedChapter(
+                        bookId,
+                        initialChapterToPaginate.coerceIn(0, chapters.lastIndex),
+                        currentConfigHash
+                    ) == null
+                ) {
+                    Timber.i("Semantic chapter cache is missing for current style config. Enqueuing config-aware processing.")
+                    shouldEnqueueBookProcessing = true
                 }
 
-                // 2. GENERATE CONFIG HASH
-                currentConfigHash = generateConfigurationHash()
+                coroutineContext.ensureActive()
+                if (isDisposed()) return@launch
+
+                if (shouldEnqueueBookProcessing) {
+                    enqueueBookProcessingWork()
+                } else {
+                    BookProcessingWorker.cancelForBook(context, bookId)
+                }
 
                 // 3. TRY LOAD EXACT COUNTS FROM DB
+                coroutineContext.ensureActive()
+                if (isDisposed()) return@launch
                 val cachedConfig = bookCacheDao.getConfigurationCache(bookId, currentConfigHash)
 
+                coroutineContext.ensureActive()
+                if (isDisposed()) return@launch
                 if (cachedConfig != null) {
                     Timber.i("Configuration Cache HIT. Using saved page counts.")
                     applyAccuratePageCounts(cachedConfig.chapterPageCounts)
@@ -308,15 +363,7 @@ class BookPaginator(
     }
 
     private fun getAllTextBlocks(blocks: List<ContentBlock>): List<TextContentBlock> {
-        return blocks.flatMap { block ->
-            when (block) {
-                is WrappingContentBlock -> getAllTextBlocks(block.paragraphsToWrap)
-                is FlexContainerBlock -> getAllTextBlocks(block.children)
-                is TableBlock -> block.rows.flatten().flatMap { getAllTextBlocks(it.content) }
-                is TextContentBlock -> listOf(block)
-                else -> emptyList()
-            }
-        }
+        return flattenTextContentBlocksForNavigation(blocks)
     }
 
     private fun generateConfigurationHash(): Int {
@@ -326,10 +373,14 @@ class BookPaginator(
             append("-fs:${textStyle.fontSize.value}")
             append("-lh:${textStyle.lineHeight.value}")
             append("-ff:${textStyle.fontFamily}")
+            append("-style:${textStyle.hashCode()}")
+            append("-density:${density.density}")
+            append("-fontScale:${density.fontScale}")
             append("-ta:$userTextAlign")
             append("-pg:$paragraphGapMultiplier")
             append("-img:$imageSizeMultiplier")
             append("-vm:$verticalMarginMultiplier")
+            append("-book-replacements:${bookReplacementPreferences.signatureForFile(bookReplacementFileId)}")
             append("-proc:$LATEST_PROCESSING_VERSION")
             append("-pageCache:$LATEST_PAGE_CACHE_VERSION")
             append("-ua:${userAgentStylesheet.hashCode()}")
@@ -413,7 +464,7 @@ class BookPaginator(
             append('|')
             append(chapter.htmlContent.hashCode())
             append('|')
-            append(chapter.plainTextContent.length)
+            append(chapter.plainTextCharacterCount())
             append('|')
             append(chapter.plainTextContent.hashCode())
             append('|')
@@ -426,13 +477,24 @@ class BookPaginator(
     }
 
     private suspend fun loadCachedPagesForChapter(chapter: EpubChapter, chapterIndex: Int): List<Page>? {
-        val cachedPages = bookCacheDao.getPageCache(bookId, currentConfigHash, chapterIndex) ?: return null
+        val cachedPages = bookCacheDao.getPageCache(bookId, currentConfigHash, chapterIndex) ?: run {
+            Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                "page_cache_lookup result=miss chapter=$chapterIndex configHash=$currentConfigHash"
+            )
+            return null
+        }
         val expectedContentVersion = chapterContentVersion(chapter)
         val isCompatible = cachedPages.processingVersion == LATEST_PROCESSING_VERSION &&
             cachedPages.pageCacheVersion == LATEST_PAGE_CACHE_VERSION &&
             cachedPages.contentVersion == expectedContentVersion
 
         if (!isCompatible) {
+            Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                "page_cache_lookup result=stale chapter=$chapterIndex " +
+                    "cachedProcessing=${cachedPages.processingVersion} expectedProcessing=$LATEST_PROCESSING_VERSION " +
+                    "cachedPageCache=${cachedPages.pageCacheVersion} expectedPageCache=$LATEST_PAGE_CACHE_VERSION " +
+                    "cachedContent=${cachedPages.contentVersion} expectedContent=$expectedContentVersion"
+            )
             Timber.d("Page cache stale for chapter $chapterIndex. Ignoring cached pages.")
             return null
         }
@@ -446,6 +508,10 @@ class BookPaginator(
                 applyPageRuntimeIndexes(chapterIndex, pages)
                 updatePageCountsOnMain(chapterIndex, pages.size)
                 pageCache.put(chapterIndex, pages)
+                Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                    "page_cache_lookup result=hit chapter=$chapterIndex configHash=$currentConfigHash " +
+                        pages.readerPagesLinkDiagSummary()
+                )
                 Timber.i("Page cache HIT for chapter $chapterIndex. Loaded ${pages.size} measured pages.")
                 pages
             }
@@ -456,8 +522,14 @@ class BookPaginator(
     }
 
     private fun savePageCacheAsync(chapter: EpubChapter, chapterIndex: Int, pages: List<Page>) {
-        coroutineScope.launch(Dispatchers.IO) {
+        if (isDisposed()) return
+        paginatorScope.launch(Dispatchers.IO) {
+            if (isDisposed()) return@launch
             try {
+                Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                    "page_cache_save chapter=$chapterIndex configHash=$currentConfigHash " +
+                        pages.readerPagesLinkDiagSummary()
+                )
                 val pageIndexEntries = buildPersistentPageIndexEntries(chapterIndex, pages)
                 val cacheEntry = PageCacheEntry(
                     bookId = bookId,
@@ -578,16 +650,19 @@ class BookPaginator(
 
     private suspend fun updatePageCountsOnMain(chapterIndex: Int, actualPageCount: Int) {
         withContext(Dispatchers.Main) {
+            if (isDisposed()) return@withContext
             if (chapterPageCounts[chapterIndex] != actualPageCount) {
                 updatePageCounts(chapterIndex, actualPageCount)
             } else if (finalizedChapterCounts.add(chapterIndex)) {
-                coroutineScope.launch(Dispatchers.IO) { updateAndSaveConfigurationCache() }
+                paginatorScope.launch(Dispatchers.IO) { updateAndSaveConfigurationCache() }
             }
             generation++
         }
     }
 
     private suspend fun ensureChapterPaginated(chapterIndex: Int): List<Page>? {
+        coroutineContext.ensureActive()
+        if (isDisposed()) return null
         if (chapterIndex !in chapters.indices) {
             Timber.w("ensureChapterPaginated: Ignoring invalid chapter index $chapterIndex.")
             return null
@@ -608,6 +683,29 @@ class BookPaginator(
                 Timber.tag(TAG_STABLE_PAGE_NAV)
                     .d("ensure_chapter paginate chapter=$chapterIndex finalized=${chapterIndex in finalizedChapterCounts}")
                 paginateChapter(chapterIndex)
+            }
+        }
+    }
+
+    private suspend fun getCachedBlocksForChapter(chapter: EpubChapter, chapterIndex: Int): List<ContentBlock> {
+        blockCache[chapterIndex]?.let {
+            Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                "content_l2_cache_hit chapter=$chapterIndex " + it.readerContentLinkDiagSummary()
+            )
+            return it
+        }
+
+        val lock = chapterBlockLocks.computeIfAbsent(chapterIndex) { Mutex() }
+        return lock.withLock {
+            blockCache[chapterIndex]?.also {
+                Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                    "content_l2_cache_hit_after_wait chapter=$chapterIndex " + it.readerContentLinkDiagSummary()
+                )
+            } ?: run {
+                Timber.d("getCachedBlocksForChapter: L2 Cache MISS for chapter $chapterIndex. Loading from DB.")
+                getBlocksForChapter(chapter, chapterIndex).also { blocks ->
+                    blockCache.put(chapterIndex, blocks)
+                }
             }
         }
     }
@@ -672,7 +770,7 @@ class BookPaginator(
         ordinalInChapter: Int
     ): Pair<Int, Locator>? = withContext(Dispatchers.IO) {
         val chapter = chapters.getOrNull(chapterIndex) ?: return@withContext null
-        val imageBlocks = getAllBlocks(getBlocksForChapter(chapter, chapterIndex))
+        val imageBlocks = getAllBlocks(getCachedBlocksForChapter(chapter, chapterIndex))
             .filterIsInstance<ImageBlock>()
         if (imageBlocks.isEmpty()) return@withContext null
 
@@ -756,6 +854,7 @@ class BookPaginator(
     }
 
     private fun enqueueBookProcessingWork() {
+        if (isDisposed()) return
         val serializableChapters = chapters.map {
             SerializableEpubChapter(
                 htmlContent = it.htmlContent,
@@ -773,9 +872,15 @@ class BookPaginator(
             density = density.density,
             constraintsMaxWidth = constraints.maxWidth,
             constraintsMaxHeight = constraints.maxHeight,
-            fontFaces = this.allFontFaces
+            fontFaces = this.allFontFaces,
+            styleConfigHash = currentConfigHash,
+            bookReplacementPreferencesJson = ReaderBookReplacementPreferencesJson.encode(
+                bookReplacementPreferences.scopedToFile(bookReplacementFileId),
+            ),
+            bookReplacementFileId = bookReplacementFileId.orEmpty()
         )
 
+        if (isDisposed()) return
         BookProcessingWorker.enqueue(
             context = context,
             bookId = bookId,
@@ -802,10 +907,14 @@ class BookPaginator(
             adaptThemeColors = false
         )
 
-        bookCacheDao.getProcessedChapter(bookId, chapterIndex)?.let { cachedChapter ->
+        bookCacheDao.getProcessedChapter(bookId, chapterIndex, currentConfigHash)?.let { cachedChapter ->
             if (cachedChapter.contentBlocksProto.isNotEmpty()) {
                 try {
                     val semanticBlocks = proto.decodeFromByteArray<List<SemanticBlock>>(cachedChapter.contentBlocksProto)
+                    Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                        "semantic_cache_hit chapter=$chapterIndex configHash=$currentConfigHash " +
+                            semanticBlocks.readerSemanticLinkDiagSummary()
+                    )
 
                     val isCacheEmpty = semanticBlocks.isEmpty()
                     val isLazyChapter = chapter.htmlContent.isEmpty()
@@ -821,7 +930,12 @@ class BookPaginator(
 
                     if (!shouldIgnoreCache) {
                         Timber.d("getBlocksForChapter: Cache HIT for chapter $chapterIndex in DATABASE.")
-                        return styler.style(semanticBlocks)
+                        val styledBlocks = styler.style(semanticBlocks)
+                        Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                            "content_from_semantic_cache chapter=$chapterIndex configHash=$currentConfigHash " +
+                                styledBlocks.readerContentLinkDiagSummary()
+                        )
+                        return styledBlocks
                     }
                 } catch (e: Exception) {
                     Timber.e(e, "Failed to deserialize/style chapter $chapterIndex from DB. Reprocessing for this session.")
@@ -849,6 +963,10 @@ class BookPaginator(
         }
 
         val document = Jsoup.parse(htmlToParse, chapter.absPath)
+        Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+            "html_parse_input chapter=$chapterIndex htmlChars=${htmlToParse.length} " +
+                document.readerHtmlLinkDiagSummary()
+        )
         val mathElements = document.select("math")
         val svgResults = mutableMapOf<String, String>()
 
@@ -865,6 +983,11 @@ class BookPaginator(
                 element.replaceWith(placeholder)
             }
         }
+        applyBookReplacementsToHtmlDocument(
+            document = document,
+            preferences = bookReplacementPreferences,
+            fileId = bookReplacementFileId,
+        )
         val processedHtml = document.outerHtml()
 
         var parsingCssRules = OptimizedCssRules()
@@ -887,11 +1010,15 @@ class BookPaginator(
             mathSvgCache = svgResults,
             adaptThemeColors = false
         )
+        Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+            "semantic_parse_result chapter=$chapterIndex " +
+                semanticBlocks.readerSemanticLinkDiagSummary()
+        )
 
-        coroutineScope.launch(Dispatchers.IO) {
+        if (!isDisposed()) paginatorScope.launch(Dispatchers.IO) {
             try {
                 val protoBytes = proto.encodeToByteArray(semanticBlocks)
-                val newCacheEntry = ProcessedChapter(bookId, chapterIndex, protoBytes, chapterPageCounts[chapterIndex] ?: 0)
+                val newCacheEntry = ProcessedChapter(bookId, chapterIndex, protoBytes, chapterPageCounts[chapterIndex] ?: 0, currentConfigHash)
                 bookCacheDao.insertProcessedChapters(listOf(newCacheEntry))
                 Timber.i("Successfully cached SEMANTIC content for chapter $chapterIndex.")
             } catch (e: Exception) {
@@ -899,15 +1026,27 @@ class BookPaginator(
             }
         }
 
-        return styler.style(semanticBlocks)
+        val styledBlocks = styler.style(semanticBlocks)
+        Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+            "content_parse_result chapter=$chapterIndex " +
+                styledBlocks.readerContentLinkDiagSummary()
+        )
+        return styledBlocks
     }
 
-    private fun startPaginationWorker(): Job = coroutineScope.launch(Dispatchers.IO) {
+    internal suspend fun getFlowBlocksForChapter(chapterIndex: Int): List<ContentBlock>? = withContext(Dispatchers.IO) {
+        coroutineContext.ensureActive()
+        if (isDisposed()) return@withContext null
+        val chapter = chapters.getOrNull(chapterIndex) ?: return@withContext null
+        getCachedBlocksForChapter(chapter, chapterIndex)
+    }
+
+    private fun startPaginationWorker(): Job = paginatorScope.launch(Dispatchers.IO) {
         Timber.i("Pagination worker started.")
         while (isActive) {
             var request: PaginationRequest? = null
             try {
-                request = paginationQueue.take()
+                request = paginationQueue.poll(250, TimeUnit.MILLISECONDS) ?: continue
                 val chapterIndex = request.chapterIndex
                 Timber.d("Worker: Took chapter $chapterIndex from queue with priority ${request.priority}.")
 
@@ -933,6 +1072,9 @@ class BookPaginator(
                 } else {
                     Timber.e("Worker: Pagination for chapter $chapterIndex resulted in null.")
                 }
+            } catch (e: CancellationException) {
+                Timber.i("Pagination worker cancelled. Shutting down.")
+                throw e
             } catch (_: InterruptedException) {
                 Timber.i("Pagination worker interrupted. Shutting down.")
                 Thread.currentThread().interrupt()
@@ -968,7 +1110,7 @@ class BookPaginator(
                 "page_count_noop chapter=$chapterIndex count=$actualPageCount currentUserChapter=${currentUserChapterIndex.value}"
             )
             if (!pageCountsAreAccurate && finalizedChapterCounts.add(chapterIndex)) {
-                coroutineScope.launch(Dispatchers.IO) { updateAndSaveConfigurationCache() }
+                paginatorScope.launch(Dispatchers.IO) { updateAndSaveConfigurationCache() }
             }
             return
         }
@@ -1000,7 +1142,7 @@ class BookPaginator(
 
         if (!pageCountsAreAccurate) {
             if (finalizedChapterCounts.add(chapterIndex)) {
-                coroutineScope.launch(Dispatchers.IO) {
+                paginatorScope.launch(Dispatchers.IO) {
                     updateAndSaveConfigurationCache()
                 }
             }
@@ -1041,6 +1183,7 @@ class BookPaginator(
     }
 
     override fun getPageContent(pageIndex: Int): Page? {
+        if (isDisposed()) return null
         Timber.v("getPageContent requested for pageIndex $pageIndex")
         val chapterIndex = findChapterIndexForPage(pageIndex)
         if (chapterIndex == null) {
@@ -1127,8 +1270,13 @@ class BookPaginator(
     }
 
     private suspend fun paginateChapter(chapterIndex: Int): List<Page>? {
+        coroutineContext.ensureActive()
+        if (isDisposed()) return null
         pageCache[chapterIndex]?.let {
             Timber.d("paginateChapter: L1 Cache HIT for chapter $chapterIndex in MEMORY, returning cached pages.")
+            Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+                "page_memory_cache_hit chapter=$chapterIndex " + it.readerPagesLinkDiagSummary()
+            )
             return it
         }
 
@@ -1142,12 +1290,9 @@ class BookPaginator(
             return it
         }
 
-        val blocks = blockCache[chapterIndex] ?: run {
-            Timber.d("paginateChapter: L2 Cache MISS for chapter $chapterIndex. Loading from DB.")
-            val blocksFromDb = getBlocksForChapter(chapter, chapterIndex)
-            blockCache.put(chapterIndex, blocksFromDb) // Store in L2 cache
-            blocksFromDb
-        }
+        val blocks = getCachedBlocksForChapter(chapter, chapterIndex)
+        coroutineContext.ensureActive()
+        if (isDisposed()) return null
 
         Timber.d("paginateChapter: Chapter $chapterIndex retrieved/parsed into ${blocks.size} content blocks.")
 
@@ -1165,7 +1310,12 @@ class BookPaginator(
             measurementProvider = measurementProvider,
             density = density
         )
+        coroutineContext.ensureActive()
+        if (isDisposed()) return null
         Timber.d("paginateChapter: PaginatorLogic returned ${pages.size} pages for chapter $chapterIndex.")
+        Timber.tag(TAG_PAGINATED_LINK_DIAG).d(
+            "pagination_result chapter=$chapterIndex " + pages.readerPagesLinkDiagSummary()
+        )
 
         applyPageRuntimeIndexes(chapterIndex, pages)
         savePageCacheAsync(chapter, chapterIndex, pages)
@@ -1177,6 +1327,7 @@ class BookPaginator(
     }
 
     private fun triggerPagination(chapterIndex: Int, priority: Int) {
+        if (isDisposed()) return
         if (chapterIndex !in chapters.indices) {
             Timber.w("Trigger: Ignoring invalid chapter index $chapterIndex. Chapter count: ${chapters.size}.")
             return
@@ -1209,6 +1360,7 @@ class BookPaginator(
     }
 
     private fun prefetchChapters(currentChapterIndex: Int) {
+        if (isDisposed()) return
         Timber.v("Prefetching chapters around index $currentChapterIndex.")
         for (offset in 1..2) {
             val nextChapterIndex = currentChapterIndex + offset
@@ -1307,12 +1459,32 @@ class BookPaginator(
         finalPage
     }
 
+    suspend fun findStableLocatorForAnchor(chapterIndex: Int, anchor: String?): Locator? = withContext(Dispatchers.IO) {
+        if (anchor.isNullOrBlank()) return@withContext Locator(chapterIndex, 0, 0)
+
+        val requestedChapter = chapters.getOrNull(chapterIndex) ?: return@withContext null
+        val requestedBlocks = getCachedBlocksForChapter(requestedChapter, chapterIndex)
+        findLocatorForAnchorInBlocks(chapterIndex, anchor, requestedBlocks)?.let { locator ->
+            return@withContext locator
+        }
+
+        val indexEntry = bookCacheDao.getAnchorIndex(bookId, anchor)
+        val targetChapter = indexEntry?.chapterIndex ?: chapterIndex
+        val chapter = chapters.getOrNull(targetChapter) ?: return@withContext null
+        val blocks = getCachedBlocksForChapter(chapter, targetChapter)
+
+        findLocatorForAnchorInBlocks(targetChapter, anchor, blocks)
+            ?: indexEntry?.let { Locator(it.chapterIndex, it.blockIndex, 0) }
+    }
+
     override fun findPageForAnchor(
         chapterIndex: Int,
         anchor: String?,
         onResult: (pageIndex: Int) -> Unit
     ) {
-        coroutineScope.launch(Dispatchers.IO) {
+        if (isDisposed()) return
+        paginatorScope.launch(Dispatchers.IO) {
+            if (isDisposed()) return@launch
             val page = findStablePageForAnchor(chapterIndex, anchor) ?: return@launch
             withContext(Dispatchers.Main) { onResult(page) }
         }
@@ -1365,7 +1537,9 @@ class BookPaginator(
         href: String,
         onNavigationComplete: (pageIndex: Int) -> Unit
     ) {
-        coroutineScope.launch(Dispatchers.IO) {
+        if (isDisposed()) return
+        paginatorScope.launch(Dispatchers.IO) {
+            if (isDisposed()) return@launch
             val targetPage = findStablePageForHref(currentChapterAbsPath, href) ?: return@launch
             withContext(Dispatchers.Main) { onNavigationComplete(targetPage) }
         }
@@ -1389,9 +1563,32 @@ class BookPaginator(
         findStablePageForAnchor(targetChapterIndex, anchor)
     }
 
+    suspend fun findStableLocatorForHref(currentChapterAbsPath: String, href: String): Locator? = withContext(Dispatchers.IO) {
+        val (targetChapterPath, anchor) = resolveHref(currentChapterAbsPath, href)
+        if (targetChapterPath == null) {
+            Timber.w("Could not resolve href '$href' to a valid chapter path.")
+            return@withContext null
+        }
+
+        val targetChapterIndex = chapters.indexOfFirst { it.absPath == targetChapterPath }
+        if (targetChapterIndex == -1) {
+            Timber.w("Could not find chapter for path: $targetChapterPath")
+            return@withContext null
+        }
+
+        findStableLocatorForAnchor(targetChapterIndex, anchor)
+    }
+
     suspend fun findStablePageForSearchResult(result: SearchResult): Int? = withContext(Dispatchers.IO) {
         val targetChapterIndex = result.locationInSource
         Timber.i("Finding page for search result: '${result.query}' in chapter $targetChapterIndex")
+
+        findStableLocatorForSearchResult(result)?.let { locator ->
+            findStablePageForLocator(locator)?.let { page ->
+                Timber.i("Found exact search result locator $locator on absolute page $page")
+                return@withContext page
+            }
+        }
 
         val chapterPages = ensureChapterPaginated(targetChapterIndex)
         val chapterStartPage = ensureStableStartPageForChapter(targetChapterIndex)
@@ -1435,8 +1632,16 @@ class BookPaginator(
         finalPageIndex
     }
 
+    suspend fun findStableLocatorForSearchResult(result: SearchResult): Locator? = withContext(Dispatchers.IO) {
+        val chapter = chapters.getOrNull(result.locationInSource) ?: return@withContext null
+        val blocks = getCachedBlocksForChapter(chapter, result.locationInSource)
+        findLocatorForSearchResultInBlocks(result, blocks)
+    }
+
     override fun findPageForSearchResult(result: SearchResult, onResult: (pageIndex: Int) -> Unit) {
-        coroutineScope.launch(Dispatchers.IO) {
+        if (isDisposed()) return
+        paginatorScope.launch(Dispatchers.IO) {
+            if (isDisposed()) return@launch
             val page = findStablePageForSearchResult(result) ?: return@launch
             withContext(Dispatchers.Main) { onResult(page) }
         }
@@ -1617,7 +1822,9 @@ class BookPaginator(
     }
 
     override fun findPageForCfi(chapterIndex: Int, cfi: String, onResult: (pageIndex: Int) -> Unit) {
-        coroutineScope.launch(Dispatchers.IO) {
+        if (isDisposed()) return
+        paginatorScope.launch(Dispatchers.IO) {
+            if (isDisposed()) return@launch
             Timber.i("findPageForCfi: Starting search for CFI: '$cfi' in chapter: '$chapterIndex'")
 
             val chapterPages = ensureChapterPaginated(chapterIndex)

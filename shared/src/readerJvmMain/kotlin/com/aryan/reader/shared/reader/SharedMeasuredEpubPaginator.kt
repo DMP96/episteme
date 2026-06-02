@@ -38,6 +38,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import kotlin.math.roundToInt
 
 class SharedMeasuredEpubPaginator(
@@ -50,29 +51,33 @@ class SharedMeasuredEpubPaginator(
     suspend fun paginate(
         book: SharedEpubBook,
         settings: ReaderSettings,
-        viewport: ReaderViewportSpec
+        viewport: ReaderViewportSpec,
+        readCache: Boolean = true
     ): List<ReaderPage> {
         currentCoroutineContext().ensureActive()
-        pageCache?.load(
-            book = book,
-            settings = settings,
-            viewport = viewport,
-            density = density.density,
-            fontScale = density.fontScale
-        )?.let { cached ->
-            logEpubPagination {
-                "cache_hit book=\"${book.title.logPreview()}\" pages=${cached.size} " +
-                    "viewport=${viewport.widthPx}x${viewport.heightPx} spread=${settings.pageSpreadMode}"
+        if (readCache) {
+            pageCache?.load(
+                book = book,
+                settings = settings,
+                viewport = viewport,
+                density = density.density,
+                fontScale = density.fontScale
+            )?.let { cached ->
+                logEpubPagination {
+                    "cache_hit book=\"${book.title.logPreview()}\" pages=${cached.size} " +
+                        "viewport=${viewport.widthPx}x${viewport.heightPx} spread=${settings.pageSpreadMode}"
+                }
+                logEpubPageFit {
+                    "page_fit layer=cache_hit book=\"${book.title.logPreview()}\" pages=${cached.size} " +
+                        "note=clear_book_cache_to_capture_layer_measured"
+                }
+                return cached
             }
-            logEpubPageFit {
-                "page_fit layer=cache_hit book=\"${book.title.logPreview()}\" pages=${cached.size} " +
-                    "note=clear_book_cache_to_capture_layer_measured"
-            }
-            return cached
         }
 
         currentCoroutineContext().ensureActive()
-        val geometry = measuredPageGeometryFor(settings, viewport, density.density)
+        val geometryTerms = measuredPageGeometryTerms(settings, viewport, density.density)
+        val geometry = geometryTerms.geometry
         logEpubPagination {
             "paginate_start book=\"${book.title.logPreview()}\" chapters=${book.chapters.size} " +
                 "viewport=${viewport.widthPx}x${viewport.heightPx} page=${geometry.pageWidthPx}x${geometry.pageHeightPx} " +
@@ -89,6 +94,7 @@ class SharedMeasuredEpubPaginator(
         val pages = mutableListOf<ReaderPage>()
         book.chapters.forEachIndexed { chapterIndex, chapter ->
             currentCoroutineContext().ensureActive()
+            yield()
             pages += paginateChapter(
                 chapter = chapter,
                 chapterIndex = chapterIndex,
@@ -122,6 +128,43 @@ class SharedMeasuredEpubPaginator(
                 "viewport=${viewport.widthPx}x${viewport.heightPx} page=${geometry.pageWidthPx}x${geometry.pageHeightPx}"
         }
         return measuredPages
+    }
+
+    suspend fun paginateChapterWindow(
+        book: SharedEpubBook,
+        settings: ReaderSettings,
+        viewport: ReaderViewportSpec,
+        chapterIndex: Int,
+        firstPageIndex: Int
+    ): List<ReaderPage> {
+        currentCoroutineContext().ensureActive()
+        val chapter = book.chapters.getOrNull(chapterIndex) ?: return emptyList()
+        val geometryTerms = measuredPageGeometryTerms(settings, viewport, density.density)
+        val geometry = geometryTerms.geometry
+        val baseStyle = TextStyle(
+            fontSize = settings.fontSize.sp,
+            lineHeight = (settings.fontSize * settings.lineSpacing).sp,
+            fontFamily = fontFamily,
+            textAlign = settings.textAlign.toComposeTextAlign()
+        ).withAndroidPaginationTextMetrics()
+        logEpubPagination {
+            "chapter_window_start book=\"${book.title.logPreview()}\" chapter=$chapterIndex " +
+                "firstPage=${firstPageIndex + 1} viewport=${viewport.widthPx}x${viewport.heightPx} " +
+                "page=${geometry.pageWidthPx}x${geometry.pageHeightPx}"
+        }
+        val pages = paginateChapter(
+            chapter = chapter,
+            chapterIndex = chapterIndex,
+            firstPageIndex = firstPageIndex,
+            settings = settings,
+            geometry = geometry,
+            baseStyle = baseStyle
+        ).mapIndexed { index, page -> page.copy(pageIndex = firstPageIndex + index) }
+        logEpubPagination {
+            "chapter_window_complete book=\"${book.title.logPreview()}\" chapter=$chapterIndex " +
+                "pages=${pages.size} firstPage=${firstPageIndex + 1}"
+        }
+        return pages
     }
 
     private suspend fun paginateChapter(
@@ -190,6 +233,13 @@ class SharedMeasuredEpubPaginator(
                         "blocks=${pageBlocks.size} range=${page.startOffset}..${page.endOffset} " +
                         "textChars=${page.text.length} tail=\"${pageBlockFits.measuredPageFitTail()}\""
                 }
+                logEpubCutoff {
+                    "cutoff_probe layer=measured_overflow reason=$reason page=${page.pageIndex + 1} chapter=$chapterIndex " +
+                        "usedPx=$usedHeight pageHeightPx=${geometry.pageHeightPx} remainingPx=$remainingPx " +
+                        "overflowPx=${(-remainingPx).coerceAtLeast(0)} blocks=${pageBlocks.size} " +
+                        "range=${page.startOffset}..${page.endOffset} textChars=${page.text.length} " +
+                        "tail=\"${pageBlockFits.measuredPageFitTail()}\""
+                }
             }
             logReaderGapPagination {
                 val firstTopMargin = pageBlocks.firstOrNull()?.effectiveTopMarginPx() ?: 0
@@ -206,8 +256,11 @@ class SharedMeasuredEpubPaginator(
             usedHeight = 0
         }
 
+        var processedBlocks = 0
         while (queue.isNotEmpty()) {
             currentCoroutineContext().ensureActive()
+            processedBlocks += 1
+            if (processedBlocks % 8 == 0) yield()
             val block = queue.removeFirst()
             val blockHeight = measureBlock(block, geometry, baseStyle, settings)
             val spaceBeforeBlock = block.collapsedMarginBefore(pageBlocks.lastOrNull(), settings)
@@ -411,6 +464,7 @@ class SharedMeasuredEpubPaginator(
         style: TextStyle,
         widthPx: Int
     ): TextLayoutResult {
+        currentCoroutineContext().ensureActive()
         return withContext(Dispatchers.Main) {
             textMeasurer.measure(
                 text = text,
@@ -736,24 +790,58 @@ internal data class MeasuredPageGeometry(
             viewport: ReaderViewportSpec,
             densityScale: Float = 1f
         ): MeasuredPageGeometry {
-            val safeWidth = viewport.widthPx.takeIf { it > 0 } ?: 980
-            val safeHeight = viewport.heightPx.takeIf { it > 0 } ?: 720
-            val scale = densityScale.takeIf { it.isFinite() && it > 0f } ?: 1f
-            val gutter = if (settings.isTwoPageSpreadEnabled()) MeasuredSpreadGutterPx.scaleCssPx(scale) else 0
-            val horizontalMargin = settings.resolvedHorizontalMargin.scaleCssPx(scale) * 2
-            val verticalMargin = settings.resolvedVerticalMargin.scaleCssPx(scale) * 2
-            val contentWidth = (safeWidth - horizontalMargin).coerceAtLeast(1)
-            val configuredPageWidth = settings.pageWidth.scaleCssPx(scale).coerceAtLeast(1)
-            val pageWidth = if (settings.isTwoPageSpreadEnabled()) {
-                val spreadWidth = contentWidth.coerceAtMost((configuredPageWidth * 2) + gutter)
-                ((spreadWidth - gutter).coerceAtLeast(1) / 2).coerceAtLeast(1)
-            } else {
-                contentWidth.coerceAtMost(configuredPageWidth).coerceAtLeast(1)
-            }
-            val pageHeight = (safeHeight - verticalMargin).coerceAtLeast(1)
-            return MeasuredPageGeometry(pageWidthPx = pageWidth, pageHeightPx = pageHeight)
+            return measuredPageGeometryTerms(settings, viewport, densityScale).geometry
         }
     }
+}
+
+private data class MeasuredPageGeometryTerms(
+    val safeWidthPx: Int,
+    val safeHeightPx: Int,
+    val pageHorizontalMarginPx: Int,
+    val pageVerticalMarginPx: Int,
+    val configuredPageWidthPx: Int,
+    val spreadGutterPx: Int,
+    val singlePageContentWidthPx: Int,
+    val twoPageAvailableOuterWidthPx: Int,
+    val twoPageAvailableContentWidthPx: Int,
+    val geometry: MeasuredPageGeometry
+)
+
+private fun measuredPageGeometryTerms(
+    settings: ReaderSettings,
+    viewport: ReaderViewportSpec,
+    densityScale: Float = 1f
+): MeasuredPageGeometryTerms {
+    val safeWidth = viewport.widthPx.takeIf { it > 0 } ?: 980
+    val safeHeight = viewport.heightPx.takeIf { it > 0 } ?: 720
+    val scale = densityScale.takeIf { it.isFinite() && it > 0f } ?: 1f
+    val pageHorizontalMargin = settings.resolvedHorizontalMargin.scaleCssPx(scale)
+    val pageVerticalMargin = settings.resolvedVerticalMargin.scaleCssPx(scale)
+    val configuredPageWidth = settings.pageWidth.scaleCssPx(scale).coerceAtLeast(1)
+    val usesSpreadPageSlot = settings.usesMeasuredPaginatedSpreadPageSlot()
+    val gutter = if (usesSpreadPageSlot) MeasuredSpreadGutterPx.scaleCssPx(scale) else 0
+    val singlePageContentWidth = (safeWidth - (pageHorizontalMargin * 2)).coerceAtLeast(1)
+    val twoPageAvailableOuterWidth = ((safeWidth - gutter).coerceAtLeast(1) / 2).coerceAtLeast(1)
+    val twoPageAvailableContentWidth = (twoPageAvailableOuterWidth - (pageHorizontalMargin * 2)).coerceAtLeast(1)
+    val pageWidth = if (usesSpreadPageSlot) {
+        twoPageAvailableContentWidth.coerceAtMost(configuredPageWidth).coerceAtLeast(1)
+    } else {
+        singlePageContentWidth.coerceAtMost(configuredPageWidth).coerceAtLeast(1)
+    }
+    val pageHeight = (safeHeight - (pageVerticalMargin * 2)).coerceAtLeast(1)
+    return MeasuredPageGeometryTerms(
+        safeWidthPx = safeWidth,
+        safeHeightPx = safeHeight,
+        pageHorizontalMarginPx = pageHorizontalMargin,
+        pageVerticalMarginPx = pageVerticalMargin,
+        configuredPageWidthPx = configuredPageWidth,
+        spreadGutterPx = gutter,
+        singlePageContentWidthPx = singlePageContentWidth,
+        twoPageAvailableOuterWidthPx = twoPageAvailableOuterWidth,
+        twoPageAvailableContentWidthPx = twoPageAvailableContentWidth,
+        geometry = MeasuredPageGeometry(pageWidthPx = pageWidth, pageHeightPx = pageHeight)
+    )
 }
 
 internal fun measuredPageGeometryFor(
@@ -765,6 +853,10 @@ internal fun measuredPageGeometryFor(
 }
 
 private const val MeasuredSpreadGutterPx = 28
+
+private fun ReaderSettings.usesMeasuredPaginatedSpreadPageSlot(): Boolean {
+    return readingMode == ReaderReadingMode.PAGINATED
+}
 
 private fun Int.scaleCssPx(scale: Float): Int {
     return (this * scale).roundToInt()
@@ -1146,6 +1238,12 @@ private fun logOversizedMeasuredPageFit(
             "usedPx=$usedPx pageHeightPx=$pageHeightPx remainingPx=$remainingPx blocks=1 " +
             "range=${page.startOffset}..${page.endOffset} textChars=${page.text.length} tail=\"${fit.format()}\""
     }
+    logEpubCutoff {
+        "cutoff_probe layer=measured_overflow reason=$reason page=${page.pageIndex + 1} chapter=$chapterIndex " +
+            "usedPx=$usedPx pageHeightPx=$pageHeightPx remainingPx=$remainingPx " +
+            "overflowPx=${(-remainingPx).coerceAtLeast(0)} blocks=1 " +
+            "range=${page.startOffset}..${page.endOffset} textChars=${page.text.length} tail=\"${fit.format()}\""
+    }
 }
 
 private fun String.toCssPxOrNull(containerPx: Int): Int? {
@@ -1189,6 +1287,10 @@ private inline fun logEpubPagination(message: () -> String) {
 
 private inline fun logEpubPageFit(message: () -> String) {
     logSharedReaderDiagnostic("EpistemeEpubPageFit", message)
+}
+
+private inline fun logEpubCutoff(message: () -> String) {
+    logSharedReaderDiagnostic(SharedEpubCutoffDiagnosticsTag, message)
 }
 
 private inline fun logReaderGapPagination(message: () -> String) {

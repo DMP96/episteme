@@ -1086,4 +1086,15 @@
     <string name="language_dutch">Nederlands (holandês)</string>
     <string name="language_ukrainian">Українська (ucraniano)</string>
     <string name="language_indonesian">Bahasa Indonesia (indonésio)</string>
+    <string name="pdf_tabs_show_top_app_bar_tabs">Exibir abas na barra superior do aplicativo</string>
+    <string name="content_desc_tts_previous_chunk">TTS Anterior</string>
+    <string name="content_desc_tts_next_chunk">Proximo TTS</string>
+    <string name="tab_images">Imagens</string>
+    <string name="no_images_found">Nenhuma imagem encontrada.</string>
+    <string name="content_desc_download_image">Baixar imagem</string>
+    <string name="saved_image_message">Salvo %1$s</string>
+    <string name="error_save_image">Não foi possivel salvar a imagem.</string>
+    <string name="visual_options_pdf_spread_single">Página única</string>
+    <string name="visual_options_pdf_spread_two">Duas páginas</string>
+    <string name="visual_options_pdf_first_page_alone">Apenas a primeira página</string>
 </resources>

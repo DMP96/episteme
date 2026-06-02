@@ -24,14 +24,6 @@ internal data class DesktopPlatform(
     val isLinux: Boolean get() = os == DesktopOperatingSystem.LINUX
     val isWindows: Boolean get() = os == DesktopOperatingSystem.WINDOWS
 
-    val kcefBundleDirectoryName: String
-        get() = when (os) {
-            DesktopOperatingSystem.WINDOWS -> "kcef-bundle"
-            DesktopOperatingSystem.LINUX -> "kcef-bundle-linux-${architecture.resourceName}"
-            DesktopOperatingSystem.MACOS -> "kcef-bundle-macos-${architecture.resourceName}"
-            DesktopOperatingSystem.OTHER -> "kcef-bundle-${architecture.resourceName}"
-        }
-
     val pdfiumDirectoryName: String
         get() = when (os) {
             DesktopOperatingSystem.WINDOWS -> "win-${architecture.resourceName}-v8"
@@ -140,7 +132,7 @@ private fun xdgBase(
 ): File {
     return env(envName)
         ?.takeIf { it.isNotBlank() }
+        ?.takeIf { it.startsWith("/") }
         ?.let(::File)
-        ?.takeIf { it.isAbsolute }
         ?: File(userHome, fallbackRelativePath)
 }

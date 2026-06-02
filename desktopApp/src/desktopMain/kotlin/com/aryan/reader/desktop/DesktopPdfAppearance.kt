@@ -1,7 +1,6 @@
 package com.aryan.reader.desktop
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,12 +19,17 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.ImageShader
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.isSpecified
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.aryan.reader.shared.BuiltInPdfReaderThemes
 import com.aryan.reader.shared.PdfDisplayMode
@@ -33,9 +37,11 @@ import com.aryan.reader.shared.ReaderTheme
 import com.aryan.reader.shared.reader.ReaderSettings
 
 internal enum class DesktopPdfInspectorTab(val title: String) {
-    VIEW("View"),
+    APPEARANCE("Appearance"),
+    APP_THEME("App theme"),
+    VISUAL("Visual"),
     MARKUP("Markup"),
-    ASSIST("Assist")
+    TTS("TTS")
 }
 
 internal data class DesktopPdfThemeStyle(
@@ -56,15 +62,25 @@ internal fun DesktopPdfThemedPageImage(
     modifier: Modifier = Modifier
 ) {
     Box(modifier = modifier.background(themeStyle.pageBackgroundColor)) {
-        Image(
-            bitmap = bitmap,
-            contentDescription = contentDescription,
-            colorFilter = themeStyle.colorFilter,
-            modifier = Modifier.fillMaxSize()
-        )
         val textureBitmap = themeStyle.textureBitmap
-        if (textureBitmap != null && themeStyle.textureAlpha > 0f) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .semantics { this.contentDescription = contentDescription }
+        ) {
+            drawImage(
+                image = bitmap,
+                srcOffset = IntOffset.Zero,
+                srcSize = IntSize(bitmap.width, bitmap.height),
+                dstOffset = IntOffset.Zero,
+                dstSize = IntSize(
+                    size.width.toInt().coerceAtLeast(1),
+                    size.height.toInt().coerceAtLeast(1)
+                ),
+                colorFilter = themeStyle.colorFilter,
+                filterQuality = FilterQuality.High
+            )
+            if (textureBitmap != null && themeStyle.textureAlpha > 0f) {
                 drawRect(
                     brush = ShaderBrush(ImageShader(textureBitmap, TileMode.Repeated, TileMode.Repeated)),
                     size = size,
@@ -77,7 +93,7 @@ internal fun DesktopPdfThemedPageImage(
 }
 
 internal fun ReaderSettings?.toDesktopPdfReaderSettings(): ReaderSettings {
-    val defaults = ReaderSettings(themeId = "no_theme")
+    val defaults = DesktopDefaultPdfReaderSettings
     val settings = this ?: defaults
     val themeId = settings.themeId
     val hasPdfTheme = BuiltInPdfReaderThemes.any { it.id == themeId }

@@ -740,4 +740,17 @@
     <string name="language_dutch">Nederlands (Néerlandais)</string>
     <string name="language_ukrainian">Українська (Ukrainien)</string>
     <string name="language_indonesian">Bahasa Indonesia (Indonésien)</string>
+    <string name="pdf_tabs_show_top_app_bar_tabs">Voir les onglets dans la barre d\'application du haut</string>
+    <string name="support_project_heading">Garder Episteme en mouvement</string>
+    <string name="support_patreon_desc">Pour remercier le soutien de l\'application, les contributeurs Patreon recevront du contenu supplémentaire et des bénéfices : Un aperçu du travail actuel, des captures d\'écran et mises à jour en avant-première, des votes qui aideront à déterminer à quoi ressembleront et comment fonctionneront les nouveaux ajouts, et une mention spéciale dans le LISEZMOI du projet.</string>
+    <string name="error_unsupported_file_type">Ce type de fichier n\'est pas pris en charge.</string>
+    <string name="ai_thinking">En pleine réflexion…</string>
+    <string name="theme_textured_presets">Préselections texturés</string>
+    <string name="theme_my_textured_themes">Mes thèmes texturés</string>
+    <string name="theme_no_textured_custom">Pas encore de thème texturé personnalisé.</string>
+    <string name="theme_new_textured">Nouveau thème texturé</string>
+    <string name="theme_texture">Texture</string>
+    <string name="theme_texture_transparency">Transparence de la texture</string>
+    <string name="ai_story_recap_beta">Récapitulation de l\'histoire (Bêta)</string>
+    <string name="ai_unlock_summarization">Débloquer la récapitulation des chapitres</string>
 </resources>

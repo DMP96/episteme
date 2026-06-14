@@ -7,6 +7,7 @@ import org.junit.Test
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
 
 class TtsChunkNavigationTest {
     @Test
@@ -51,6 +52,25 @@ class TtsChunkNavigationTest {
         assertEquals(true, shouldAdvanceToTtsPlaylistChunk(currentChunkIndex = 8, playlistChunkIndex = 9))
         assertEquals(false, shouldAdvanceToTtsPlaylistChunk(currentChunkIndex = 8, playlistChunkIndex = 10))
         assertEquals(false, shouldAdvanceToTtsPlaylistChunk(currentChunkIndex = 8, playlistChunkIndex = null))
+    }
+
+    @Test
+    fun `automatic playlist advance can step over chunks marked skipped after generation failures`() {
+        assertEquals(
+            true,
+            shouldAdvanceToTtsPlaylistChunk(
+                currentChunkIndex = 8,
+                playlistChunkIndex = 10,
+                skippedChunkIndices = setOf(9)
+            )
+        )
+        assertEquals(10, resolveNextPlayableTtsChunkIndex(8, 12, setOf(9)))
+    }
+
+    @Test
+    fun `chunk generation gives up after bounded failures`() {
+        assertEquals(false, shouldGiveUpTtsChunkGeneration(failureCount = 1, maxFailures = 2))
+        assertEquals(true, shouldGiveUpTtsChunkGeneration(failureCount = 2, maxFailures = 2))
     }
 
     @Test
@@ -148,6 +168,16 @@ class TtsChunkNavigationTest {
         assertEquals(1_500L, estimateTtsNotificationDurationMs(text = "one two"))
         assertEquals(5_000L, estimateTtsNotificationDurationMs(text = "one", currentPositionMs = 3_000L))
         assertNull(estimateTtsNotificationDurationMs(text = "   "))
+    }
+
+    @Test
+    fun `stable sorted snapshot copies concurrent cache keys`() {
+        val cache = ConcurrentHashMap<Int, String>()
+        cache[3] = "three"
+        cache[1] = "one"
+        cache[2] = "two"
+
+        assertEquals(listOf(1, 2, 3), stableSortedIntSnapshot(cache.keys))
     }
 
     @Test

@@ -5,14 +5,13 @@ package com.aryan.reader.paginatedreader
 
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
 import android.widget.Toast
 import com.aryan.reader.BuildConfig
+import com.aryan.reader.copyPlainTextToClipboard
 import androidx.compose.ui.unit.isSpecified
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -175,6 +174,7 @@ import com.aryan.reader.epubreader.UserHighlight
 import com.aryan.reader.paginatedreader.data.BookCacheDatabase
 import com.aryan.reader.shared.ReaderBookReplacementPreferences
 import com.aryan.reader.shared.ReaderLocator as SharedReaderLocator
+import com.aryan.reader.shared.ui.sharedAcceleratedLazyWheelScroll
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.delay
@@ -192,6 +192,8 @@ import timber.log.Timber
 import java.io.File
 import java.net.URI
 import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -243,7 +245,8 @@ data class NativeVerticalLocation(
     val firstVisibleItemSize: Int,
     val isAtStart: Boolean,
     val isAtEnd: Boolean,
-    val visibleTextRanges: List<NativeVerticalVisibleTextRange> = emptyList()
+    val visibleTextRanges: List<NativeVerticalVisibleTextRange> = emptyList(),
+    val chapterPageInfo: NativeVerticalChapterPageInfo? = null
 )
 
 data class NativeVerticalVisibleTextRange(
@@ -251,6 +254,34 @@ data class NativeVerticalVisibleTextRange(
     val blockIndex: Int,
     val startCharOffset: Int,
     val endCharOffset: Int
+)
+
+fun NativeVerticalLocation.locatorForPersistence(): Locator? {
+    val visibleRange = visibleTextRanges.firstOrNull()
+    return if (visibleRange != null) {
+        Locator(
+            chapterIndex = visibleRange.chapterIndex,
+            blockIndex = visibleRange.blockIndex,
+            charOffset = visibleRange.startCharOffset
+        )
+    } else {
+        locator
+    }
+}
+
+internal fun shouldFallbackNativeVerticalInitialScrollToCompatPage(
+    hasInitialLocator: Boolean,
+    didLocatorScroll: Boolean
+): Boolean = !hasInitialLocator && !didLocatorScroll
+
+internal fun nativeVerticalCenteredScrollDelta(
+    targetOffsetInViewport: Float,
+    viewportHeight: Float
+): Float = targetOffsetInViewport - (viewportHeight * 0.5f)
+
+data class NativeVerticalChapterPageInfo(
+    val currentPage: Int,
+    val totalPages: Int
 )
 
 private data class SelectionBlockKey(
@@ -318,7 +349,7 @@ internal fun nativeVerticalInitialChapterPrefetchOrder(
     chapterCount: Int,
     initialChapter: Int,
     forwardCount: Int = 2,
-    backwardCount: Int = 1
+    backwardCount: Int = 0
 ): List<Int> {
     if (chapterCount <= 0) return emptyList()
     val start = initialChapter.coerceIn(0, chapterCount - 1)
@@ -1026,6 +1057,68 @@ internal fun nativeVerticalProgressForCompatPage(pageIndex: Int, totalPageCount:
         .coerceIn(0f, 100f)
 }
 
+internal fun nativeVerticalChapterPageInfo(
+    chapterCharOffset: Int?,
+    chapterLengthChars: Int,
+    chapterPageCount: Int?,
+    compatPageIndex: Int,
+    chapterStartPageIndex: Int?
+): NativeVerticalChapterPageInfo? {
+    val total = chapterPageCount?.takeIf { it > 0 } ?: return null
+    val pageIndexInChapter = if (chapterCharOffset != null && chapterLengthChars > 0) {
+        ((chapterCharOffset.coerceIn(0, chapterLengthChars).toFloat() / chapterLengthChars.toFloat()) * (total - 1))
+            .roundToInt()
+    } else if (chapterStartPageIndex != null) {
+        compatPageIndex - chapterStartPageIndex
+    } else {
+        0
+    }.coerceIn(0, total - 1)
+    return NativeVerticalChapterPageInfo(
+        currentPage = pageIndexInChapter + 1,
+        totalPages = total
+    )
+}
+
+internal fun nativeVerticalChapterPageInfoForScroll(
+    itemChapterIndices: List<Int>,
+    itemWeights: List<Int>,
+    firstVisibleItemIndex: Int,
+    firstVisibleItemScrollOffset: Int,
+    firstVisibleItemSize: Int,
+    chapterPageCount: Int?
+): NativeVerticalChapterPageInfo? {
+    val total = chapterPageCount?.takeIf { it > 0 } ?: return null
+    if (itemChapterIndices.isEmpty() || itemWeights.isEmpty()) {
+        return NativeVerticalChapterPageInfo(currentPage = 1, totalPages = total)
+    }
+    val safeIndex = firstVisibleItemIndex.coerceIn(0, minOf(itemChapterIndices.lastIndex, itemWeights.lastIndex))
+    val chapterIndex = itemChapterIndices[safeIndex]
+    val chapterItems = itemChapterIndices.indices.filter { index ->
+        index < itemWeights.size && itemChapterIndices[index] == chapterIndex
+    }
+    val totalChapterWeight = chapterItems.sumOf { itemWeights[it].coerceAtLeast(0) }
+    if (totalChapterWeight <= 0) {
+        return NativeVerticalChapterPageInfo(currentPage = 1, totalPages = total)
+    }
+    val completedWeight = chapterItems
+        .filter { it < safeIndex }
+        .sumOf { itemWeights[it].coerceAtLeast(0) }
+    val currentWeight = itemWeights[safeIndex].coerceAtLeast(0)
+    val currentFraction = if (firstVisibleItemSize > 0) {
+        (firstVisibleItemScrollOffset.toFloat() / firstVisibleItemSize.toFloat())
+            .coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val chapterProgress = ((completedWeight + currentWeight * currentFraction) / totalChapterWeight.toFloat())
+        .coerceIn(0f, 1f)
+    val pageIndexInChapter = (chapterProgress * (total - 1)).roundToInt().coerceIn(0, total - 1)
+    return NativeVerticalChapterPageInfo(
+        currentPage = pageIndexInChapter + 1,
+        totalPages = total
+    )
+}
+
 internal fun nativeVerticalProgressToItemIndex(
     itemWeights: List<Int>,
     progressPercent: Float
@@ -1119,29 +1212,43 @@ private fun findNativeVerticalFlowItemIndexForProgress(
     )
 }
 
-private fun estimateNativeVerticalScrollProgressPercent(
-    items: List<NativeVerticalFlowItem>,
+internal fun estimateNativeVerticalWeightedScrollProgressPercent(
+    itemWeights: List<Int>,
     firstVisibleItemIndex: Int,
     firstVisibleItemScrollOffset: Int,
     firstVisibleItemSize: Int
 ): Float? {
-    if (items.isEmpty()) return null
-    val totalWeight = items.sumOf { it.locationWeight }.takeIf { it > 0 } ?: return null
-    val safeIndex = firstVisibleItemIndex.coerceIn(0, items.lastIndex)
-    val completedWeight = items
+    if (itemWeights.isEmpty()) return null
+    val totalWeight = itemWeights.sumOf { it }.takeIf { it > 0 } ?: return null
+    val safeIndex = firstVisibleItemIndex.coerceIn(0, itemWeights.lastIndex)
+    val completedWeight = itemWeights
         .take(safeIndex)
-        .sumOf { it.locationWeight }
-    val currentItem = items[safeIndex]
+        .sum()
+    val currentItemWeight = itemWeights[safeIndex]
     val currentFraction = if (firstVisibleItemSize > 0) {
         (firstVisibleItemScrollOffset.toFloat() / firstVisibleItemSize.toFloat())
             .coerceIn(0f, 1f)
     } else {
         0f
     }
-    val weightedPosition = completedWeight + (currentItem.locationWeight * currentFraction)
+    val weightedPosition = completedWeight + (currentItemWeight * currentFraction)
     return ((weightedPosition.toDouble() / totalWeight.toDouble()) * 100.0)
         .toFloat()
         .coerceIn(0f, 100f)
+}
+
+private fun estimateNativeVerticalScrollProgressPercent(
+    items: List<NativeVerticalFlowItem>,
+    firstVisibleItemIndex: Int,
+    firstVisibleItemScrollOffset: Int,
+    firstVisibleItemSize: Int
+): Float? {
+    return estimateNativeVerticalWeightedScrollProgressPercent(
+        itemWeights = items.map { it.locationWeight },
+        firstVisibleItemIndex = firstVisibleItemIndex,
+        firstVisibleItemScrollOffset = firstVisibleItemScrollOffset,
+        firstVisibleItemSize = firstVisibleItemSize
+    )
 }
 
 private fun findNativeVerticalFlowItemIndexForLocator(
@@ -1333,7 +1440,7 @@ private fun resolveNativeVerticalVisibleTextRanges(
 
                 val start = blockStart + (firstVisibleOffset ?: 0)
                 val end = blockStart + (lastVisibleOffset ?: block.content.text.length)
-                NativeVerticalVisibleTextRange(
+                bounds.top to NativeVerticalVisibleTextRange(
                     chapterIndex = chapterIndex,
                     blockIndex = block.blockIndex,
                     startCharOffset = start,
@@ -1341,6 +1448,8 @@ private fun resolveNativeVerticalVisibleTextRanges(
                 )
             }
         }
+        .sortedBy { it.first }
+        .map { it.second }
         .toList()
 }
 
@@ -1903,6 +2012,37 @@ private fun imageContentScale(style: BlockStyle): ContentScale {
     }
 }
 
+internal fun nativeVerticalSvgContentFromDataUri(source: String): String? {
+    if (!source.startsWith("data:image/svg+xml", ignoreCase = true)) return null
+    val commaIndex = source.indexOf(',')
+    if (commaIndex < 0) return null
+    val metadata = source.substring(0, commaIndex)
+    val payload = source.substring(commaIndex + 1)
+    return runCatching {
+        if (metadata.contains(";base64", ignoreCase = true)) {
+            String(Base64.getDecoder().decode(payload), StandardCharsets.UTF_8)
+        } else {
+            URLDecoder.decode(payload.replace("+", "%2B"), "UTF-8")
+        }
+    }.getOrNull()
+}
+
+internal fun nativeVerticalImageModelData(source: String): Any {
+    val trimmed = source.trim()
+    return when {
+        trimmed.startsWith("<svg", ignoreCase = true) -> SvgData(trimmed)
+        trimmed.startsWith("data:image/svg+xml", ignoreCase = true) ->
+            nativeVerticalSvgContentFromDataUri(trimmed)?.let { SvgData(it) } ?: trimmed
+        trimmed.startsWith("file:", ignoreCase = true) ||
+            trimmed.startsWith("content:", ignoreCase = true) ||
+            trimmed.startsWith("android.resource:", ignoreCase = true) ||
+            trimmed.startsWith("http://", ignoreCase = true) ||
+            trimmed.startsWith("https://", ignoreCase = true) -> trimmed.toUri()
+        trimmed.startsWith("data:", ignoreCase = true) -> trimmed
+        else -> File(trimmed)
+    }
+}
+
 private fun tableCellImageModifier(
     block: ImageBlock,
     density: Density,
@@ -2023,7 +2163,9 @@ private fun WrappingContentLayout(
 
     Layout(content = {
         AsyncImage(
-            model = Builder(LocalContext.current).data(File(block.floatedImage.path)).build(),
+            model = Builder(LocalContext.current)
+                .data(nativeVerticalImageModelData(block.floatedImage.path))
+                .build(),
             contentDescription = block.floatedImage.altText,
             contentScale = imageContentScale(block.floatedImage.style)
         )
@@ -2971,7 +3113,7 @@ fun PaginatedReaderScreen(
 }
 
 @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
-@OptIn(ExperimentalSerializationApi::class, FlowPreview::class)
+@OptIn(ExperimentalSerializationApi::class)
 @Composable
 fun NativeVerticalReaderScreen(
     modifier: Modifier = Modifier,
@@ -3342,19 +3484,19 @@ fun NativeVerticalReaderScreen(
             )
             if (exactDelta != null) {
                 val scrollDelta = if (keepVisible) {
-                    val viewportHeight = rootWindowBounds.height
-                    val comfortableTop = viewportHeight * 0.24f
-                    val comfortableBottom = viewportHeight * 0.76f
-                    if (exactDelta in comfortableTop..comfortableBottom) {
-                        0f
-                    } else {
-                        exactDelta - (viewportHeight * 0.38f)
-                    }
+                    nativeVerticalCenteredScrollDelta(
+                        targetOffsetInViewport = exactDelta,
+                        viewportHeight = rootWindowBounds.height
+                    )
                 } else {
                     exactDelta
                 }
                 if (abs(scrollDelta) > 1f) {
-                    listState.scrollBy(scrollDelta)
+                    if (animate) {
+                        listState.animateScrollBy(scrollDelta)
+                    } else {
+                        listState.scrollBy(scrollDelta)
+                    }
                 }
                 if (keepVisible || abs(exactDelta) > 1f) return true
             }
@@ -3364,7 +3506,11 @@ fun NativeVerticalReaderScreen(
                 chapters = chapters,
                 locator = locator
             ) ?: return false
-            listState.scrollToItem(targetIndex)
+            if (animate) {
+                listState.animateScrollToItem(targetIndex)
+            } else {
+                listState.scrollToItem(targetIndex)
+            }
             repeat(4) {
                 withFrameNanos { }
                 val refinedDelta = resolveNativeVerticalScrollDeltaForLocator(
@@ -3379,13 +3525,19 @@ fun NativeVerticalReaderScreen(
                 )
                 if (refinedDelta != null) {
                     val scrollDelta = if (keepVisible) {
-                        val viewportHeight = rootWindowBounds.height
-                        refinedDelta - (viewportHeight * 0.38f)
+                        nativeVerticalCenteredScrollDelta(
+                            targetOffsetInViewport = refinedDelta,
+                            viewportHeight = rootWindowBounds.height
+                        )
                     } else {
                         refinedDelta
                     }
                     if (abs(scrollDelta) > 1f) {
-                        listState.scrollBy(scrollDelta)
+                        if (animate) {
+                            listState.animateScrollBy(scrollDelta)
+                        } else {
+                            listState.scrollBy(scrollDelta)
+                        }
                     }
                     return true
                 }
@@ -3441,8 +3593,11 @@ fun NativeVerticalReaderScreen(
 
             prefetchOrder.forEach { chapterIndex ->
                 if (!isActive) return@LaunchedEffect
+                while (isActive && listState.isScrollInProgress) {
+                    delay(80L)
+                }
                 loadFlowChapter(chapterIndex)
-                delay(16L)
+                delay(80L)
             }
         }
 
@@ -3453,9 +3608,18 @@ fun NativeVerticalReaderScreen(
                 didInitialScroll = true
                 return@LaunchedEffect
             }
-            val didScroll = scrollToFlowLocator(targetLocator, animate = false) ||
-                scrollToCompatPage(initialNativePageIndex, animate = false)
-            if (didScroll) {
+            val didLocatorScroll = scrollToFlowLocator(targetLocator, animate = false)
+            val didScroll = didLocatorScroll ||
+                if (shouldFallbackNativeVerticalInitialScrollToCompatPage(
+                        hasInitialLocator = initialNativeLocator != null,
+                        didLocatorScroll = didLocatorScroll
+                    )
+                ) {
+                    scrollToCompatPage(initialNativePageIndex, animate = false)
+                } else {
+                    false
+                }
+            if (didScroll || initialNativeLocator != null) {
                 didInitialScroll = true
             }
         }
@@ -3471,7 +3635,12 @@ fun NativeVerticalReaderScreen(
         LaunchedEffect(scrollRequestLocatorId, scrollRequestLocator, scrollRequestLocatorKeepVisible, flowChapters, rootWindowBounds) {
             val requestedLocator = scrollRequestLocator ?: return@LaunchedEffect
             if (flowChapters == null || rootWindowBounds == Rect.Zero) return@LaunchedEffect
-            if (scrollToFlowLocator(requestedLocator, animate = false, keepVisible = scrollRequestLocatorKeepVisible)) {
+            if (scrollToFlowLocator(
+                    locator = requestedLocator,
+                    animate = scrollRequestLocatorKeepVisible,
+                    keepVisible = scrollRequestLocatorKeepVisible
+                )
+            ) {
                 paginator.onUserScrolledTo(
                     nativeVerticalCompatPageForProgress(
                         estimateNativeVerticalProgressPercent(book, requestedLocator) ?: 0f,
@@ -3506,6 +3675,7 @@ fun NativeVerticalReaderScreen(
         var lastReportedTotalPageCount by remember { mutableIntStateOf(0) }
         var lastReportedProgressPercent by remember { mutableFloatStateOf(-1f) }
         var lastReportedLocator by remember { mutableStateOf<Locator?>(null) }
+        var lastReportedChapterPageInfo by remember { mutableStateOf<NativeVerticalChapterPageInfo?>(null) }
         var lastReportedVisibleTextRanges by remember { mutableStateOf<List<NativeVerticalVisibleTextRange>>(emptyList()) }
 
         LaunchedEffect(paginator, totalPageCount, rootWindowBounds, blockLayoutMap, flowChapters, flowItems) {
@@ -3531,7 +3701,6 @@ fun NativeVerticalReaderScreen(
                     initialScrollComplete = didInitialScroll
                 )
             }
-                .debounce(80)
                 .collectLatest { sample ->
                     if (!sample.initialScrollComplete) return@collectLatest
                     val total = sample.totalPageCount
@@ -3561,18 +3730,32 @@ fun NativeVerticalReaderScreen(
                     }
                     val compatPage = nativeVerticalCompatPageForProgress(progressPercent, total)
                     paginator.onUserScrolledTo(compatPage)
+                    val visibleChapterIndex = locator?.chapterIndex
+                        ?: flowItems.getOrNull(sample.firstVisiblePageIndex)?.chapterIndex
+                    val chapterPageInfo = visibleChapterIndex?.let { chapterIndex ->
+                        nativeVerticalChapterPageInfoForScroll(
+                            itemChapterIndices = flowItems.map { it.chapterIndex },
+                            itemWeights = flowItems.map { it.locationWeight },
+                            firstVisibleItemIndex = sample.firstVisiblePageIndex,
+                            firstVisibleItemScrollOffset = sample.firstVisiblePageScrollOffset,
+                            firstVisibleItemSize = sample.firstVisibleItemSize,
+                            chapterPageCount = paginator.chapterPageCounts[chapterIndex]
+                        )
+                    }
 
                     if (
                         compatPage != lastReportedVisiblePage ||
                         total != lastReportedTotalPageCount ||
                         abs(progressPercent - lastReportedProgressPercent) >= 0.05f ||
                         locator != lastReportedLocator ||
+                        chapterPageInfo != lastReportedChapterPageInfo ||
                         visibleTextRanges != lastReportedVisibleTextRanges
                     ) {
                         lastReportedVisiblePage = compatPage
                         lastReportedTotalPageCount = total
                         lastReportedProgressPercent = progressPercent
                         lastReportedLocator = locator
+                        lastReportedChapterPageInfo = chapterPageInfo
                         lastReportedVisibleTextRanges = visibleTextRanges
                         onLocationChanged(
                             NativeVerticalLocation(
@@ -3586,7 +3769,8 @@ fun NativeVerticalReaderScreen(
                                 firstVisibleItemSize = sample.firstVisibleItemSize,
                                 isAtStart = sample.isAtStart,
                                 isAtEnd = sample.isAtEnd,
-                                visibleTextRanges = visibleTextRanges
+                                visibleTextRanges = visibleTextRanges,
+                                chapterPageInfo = chapterPageInfo
                             )
                         )
                         onProgressChanged(compatPage, total, progressPercent)
@@ -3644,11 +3828,14 @@ fun NativeVerticalReaderScreen(
                 },
                 dismissButton = {
                     TextButton(onClick = {
-                        val clipboardManager =
-                            context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboardManager.setPrimaryClip(
-                            ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), urlToShow)
+                        val copied = copyPlainTextToClipboard(
+                            context = context,
+                            label = context.getString(R.string.clip_label_copied_text),
+                            text = urlToShow
                         )
+                        if (!copied) {
+                            Toast.makeText(context, context.getString(R.string.error_copy_to_clipboard), Toast.LENGTH_SHORT).show()
+                        }
                         showExternalLinkDialog = null
                     }) { Text(stringResource(R.string.action_copy)) }
                 }
@@ -3673,7 +3860,8 @@ fun NativeVerticalReaderScreen(
                 LazyColumn(
                     state = listState,
                     modifier = Modifier
-                        .fillMaxSize(),
+                        .fillMaxSize()
+                        .sharedAcceleratedLazyWheelScroll(listState),
                     contentPadding = PaddingValues(top = verticalPadding, bottom = verticalPadding)
                 ) {
                     itemsIndexed(
@@ -3820,11 +4008,14 @@ fun NativeVerticalReaderScreen(
                     ) {
                         PaginatedTextSelectionMenu(
                             onCopy = {
-                                val clipboardManager =
-                                    context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboardManager.setPrimaryClip(
-                                    ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), sel.text)
+                                val copied = copyPlainTextToClipboard(
+                                    context = context,
+                                    label = context.getString(R.string.clip_label_copied_text),
+                                    text = sel.text
                                 )
+                                if (!copied) {
+                                    Toast.makeText(context, context.getString(R.string.error_copy_to_clipboard), Toast.LENGTH_SHORT).show()
+                                }
                                 activeSelection = null
                             },
                             onSelectAll = null,
@@ -5806,10 +5997,14 @@ internal fun PaginatedReaderContent(
                 Row(horizontalArrangement = Arrangement.End) {
                     TextButton(
                         onClick = {
-                            val clipboard =
-                                context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_link), urlToShow)
-                            clipboard.setPrimaryClip(clip)
+                            val copied = copyPlainTextToClipboard(
+                                context = context,
+                                label = context.getString(R.string.clip_label_copied_link),
+                                text = urlToShow
+                            )
+                            if (!copied) {
+                                Toast.makeText(context, context.getString(R.string.error_copy_to_clipboard), Toast.LENGTH_SHORT).show()
+                            }
                             showExternalLinkDialog = null
                         }) { Text(stringResource(R.string.action_copy)) }
                     TextButton(
@@ -7535,10 +7730,14 @@ internal fun PaginatedReaderContent(
                         ) {
                             PaginatedTextSelectionMenu(
                                 onCopy = {
-                                    val clipboardManager =
-                                        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), sel.text)
-                                    clipboardManager.setPrimaryClip(clip)
+                                    val copied = copyPlainTextToClipboard(
+                                        context = context,
+                                        label = context.getString(R.string.clip_label_copied_text),
+                                        text = sel.text
+                                    )
+                                    if (!copied) {
+                                        Toast.makeText(context, context.getString(R.string.error_copy_to_clipboard), Toast.LENGTH_SHORT).show()
+                                    }
                                     activeSelection = null
                                 },
                                 onSelectAll = null,
@@ -8107,15 +8306,15 @@ private fun RenderFlexChildBlock(
             searchHighlighted
         }
 
-        // Apply block specific styles (like header font weight)
-        val finalStyle = if (block is HeaderBlock) {
-            createHeaderTextStyle(
+        val finalStyle = when (block) {
+            is HeaderBlock -> createHeaderTextStyle(
                 baseStyle = textStyle,
                 level = block.level,
                 textAlign = block.textAlign
             )
-        } else {
-            textStyle
+            is ParagraphBlock -> textStyle.copy(textAlign = block.textAlign ?: textStyle.textAlign)
+            is QuoteBlock -> textStyle.copy(textAlign = block.textAlign ?: textStyle.textAlign)
+            is ListItemBlock -> textStyle
         }
 
         TextWithEmphasis(
@@ -8157,7 +8356,7 @@ private fun RenderFlexChildBlock(
 
                 if (itemMarkerImage != null) {
                     val imageRequest =
-                        Builder(LocalContext.current).data(File(itemMarkerImage))
+                        Builder(LocalContext.current).data(nativeVerticalImageModelData(itemMarkerImage))
                             .crossfade(true).build()
                     val imageSize = with(density) { (textStyle.fontSize.value * 0.8f).sp.toDp() }
 
@@ -8227,7 +8426,7 @@ private fun RenderFlexChildBlock(
                         } else if (style.width != Dp.Unspecified && style.width > 0.dp) {
                             Modifier.width(style.width)
                         } else {
-                            Modifier
+                            Modifier.fillMaxWidth()
                         }
                     )
                     .then(
@@ -8250,7 +8449,7 @@ private fun RenderFlexChildBlock(
                     )
 
                 AsyncImage(
-                    model = Builder(LocalContext.current).data(File(childBlock.path)).crossfade(true)
+                    model = Builder(LocalContext.current).data(nativeVerticalImageModelData(childBlock.path)).crossfade(true)
                         .build(),
                     contentDescription = childBlock.altText,
                     modifier = imageModifier,
@@ -8338,9 +8537,7 @@ private fun RenderFlexChildBlock(
                                     } else if (blockInCell is ImageBlock) {
                                         AsyncImage(
                                             model = Builder(LocalContext.current).data(
-                                                File(
-                                                    blockInCell.path
-                                                )
+                                                nativeVerticalImageModelData(blockInCell.path)
                                             ).build(),
                                             contentDescription = blockInCell.altText,
                                             contentScale = imageContentScale(blockInCell.style),

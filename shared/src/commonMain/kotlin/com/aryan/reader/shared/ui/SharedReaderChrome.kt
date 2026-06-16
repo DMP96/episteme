@@ -1513,6 +1513,7 @@ private fun SharedReaderControlPanel(
 
                     ReaderControlSection.FORMAT -> SharedReaderFormatControls(
                         settings = session.reader.settings,
+                        toolbarPreferences = toolbarPreferences,
                         onPickCustomFont = onPickCustomFont,
                         customFonts = customFonts,
                         onReaderAction = onReaderAction
@@ -1639,6 +1640,7 @@ private fun ReaderToolbarPreferences.availableReaderControlSections(
 @Composable
 fun SharedReaderFormatControls(
     settings: ReaderSettings,
+    toolbarPreferences: ReaderToolbarPreferences,
     onPickCustomFont: (() -> String?)?,
     customFonts: List<CustomFontItem>,
     onReaderAction: (ReaderAction) -> Unit

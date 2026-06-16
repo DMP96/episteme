@@ -111,22 +111,6 @@ object PdfSpreadLayout {
         return if (settings.rightToLeftPagination) indices.asReversed() else indices
     }
 
-    fun spreadStartPageIndices(
-        pageCount: Int,
-        settings: ReaderSettings,
-        pageSizeProvider: PdfPageSizeProvider? = null
-    ): List<Int> {
-        if (pageCount <= 0) return emptyList()
-        if (!isTwoPageSpreadEnabled(settings)) return (0 until pageCount).toList()
-        val starts = mutableListOf<Int>()
-        var current = 0
-        while (current in 0 until pageCount && current !in starts) {
-            starts += current
-            val next = nextPageIndex(current, pageCount, settings, pageSizeProvider)
-            if (next <= current) break
-            current = next
-        }
-    }
 
     fun canGoPrevious(
         pageIndex: Int,

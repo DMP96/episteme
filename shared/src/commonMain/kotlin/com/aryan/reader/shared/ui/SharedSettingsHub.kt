@@ -517,6 +517,7 @@ private fun SharedSettingsDetailPage(
                 SharedSettingsDestination.EPUB_FORMAT -> {
                     SharedReaderFormatControls(
                         settings = settings,
+                        toolbarPreferences = toolbarPreferences ?: ReaderToolbarPreferences(),
                         onPickCustomFont = onPickCustomFont,
                         customFonts = customFonts,
                         onReaderAction = { action ->

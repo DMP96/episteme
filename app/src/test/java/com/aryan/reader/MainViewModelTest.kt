@@ -1,6 +1,7 @@
 package com.aryan.reader
 
 import android.app.Application
+import android.content.ContentResolver
 import android.content.SharedPreferences
 import android.content.res.Resources
 import android.net.Uri
@@ -22,6 +23,7 @@ import com.aryan.reader.tts.TtsPlaybackManager
 import io.mockk.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
@@ -45,6 +47,7 @@ class MainViewModelTest {
     private lateinit var mockApplication: Application
     private lateinit var mockPrefs: SharedPreferences
     private lateinit var mockEditor: SharedPreferences.Editor
+    private val prefsStringSets = mutableMapOf<String, Set<String>>()
 
     private val billingStateFlow = MutableStateFlow(ProUpgradeState())
     private val customFontsFlow = MutableStateFlow<List<CustomFontEntity>>(emptyList())
@@ -64,6 +67,12 @@ class MainViewModelTest {
     }
 
     private class TestMainViewModel(application: Application) : MainViewModel(application) {
+        val locallyCleanedBookIds = mutableListOf<String>()
+
+        override suspend fun cleanupBookDataLocally(bookId: String) {
+            locallyCleanedBookIds += bookId
+        }
+
         fun clearForTest() {
             ViewModel::class.java
                 .getDeclaredMethod("clear\$lifecycle_viewmodel_release")
@@ -83,6 +92,7 @@ class MainViewModelTest {
         billingStateFlow.value = ProUpgradeState()
         customFontsFlow.value = emptyList()
         ttsStateFlow.value = TtsPlaybackManager.TtsState()
+        prefsStringSets.clear()
 
         mockkStatic(Log::class)
         every { Log.isLoggable(any(), any()) } returns false
@@ -109,9 +119,14 @@ class MainViewModelTest {
         every { mockApplication.filesDir } returns filesDir
         every { mockApplication.cacheDir } returns cacheDir
         every { mockApplication.getExternalFilesDir(any()) } returns externalFilesDir
+        every { mockApplication.getString(any()) } answers { "res-${firstArg<Int>()}" }
+        every { mockApplication.getString(any(), *anyVararg()) } answers { "res-${firstArg<Int>()}" }
         every { mockPrefs.edit() } returns mockEditor
 
         every { mockPrefs.getString(any(), any()) } answers { secondArg() as String? }
+        every { mockPrefs.getStringSet(any(), any()) } answers {
+            prefsStringSets[firstArg<String>()]?.toMutableSet() ?: secondArg<Set<String>?>()?.toMutableSet()
+        }
         every { mockPrefs.getBoolean(any(), any()) } answers { secondArg() as Boolean }
         every { mockPrefs.getInt(any(), any()) } answers { secondArg() as Int }
         every { mockPrefs.getFloat(any(), any()) } answers { secondArg() as Float }
@@ -174,6 +189,7 @@ class MainViewModelTest {
         coEvery { anyConstructed<RecentFilesRepository>().addBooksToShelf(any(), any()) } just Runs
         coEvery { anyConstructed<RecentFilesRepository>().deleteShelf(any()) } just Runs
         coEvery { anyConstructed<RecentFilesRepository>().deleteFilePermanently(any()) } just Runs
+        coEvery { anyConstructed<RecentFilesRepository>().addRecentFile(any()) } just Runs
         coEvery { anyConstructed<BookImporter>().deleteBookByUriString(any()) } returns true
 
         every { anyConstructed<FontsRepository>().getAllFonts() } returns customFontsFlow
@@ -417,44 +433,99 @@ class MainViewModelTest {
         viewModel.setStrictFileFilter(true)
         viewModel.setUsePdfFileNameAsDisplayName(true)
         viewModel.setExternalFileBehavior("KEEP")
+        viewModel.setExternalFileBehavior("TEMPORARY")
 
         val state = viewModel.uiState.first {
-            it.useStrictFileFilter && it.usePdfFileNameAsDisplayName && it.externalFileBehavior == "KEEP"
+            it.useStrictFileFilter && it.usePdfFileNameAsDisplayName && it.externalFileBehavior == "TEMPORARY"
         }
         assertTrue(state.useStrictFileFilter)
         assertTrue(state.usePdfFileNameAsDisplayName)
-        assertEquals("KEEP", state.externalFileBehavior)
+        assertEquals("TEMPORARY", state.externalFileBehavior)
         verify { mockEditor.putBoolean("use_strict_file_filter", true) }
         verify { mockEditor.putBoolean("use_pdf_file_name_as_display_name", true) }
         verify { mockEditor.putString("external_file_behavior", "KEEP") }
+        verify { mockEditor.putString("external_file_behavior", "TEMPORARY") }
     }
 
     @Test
     fun `startup removes pending external always-remove file before restoring session`() = runTest(testDispatcher) {
         val pendingUri = "file:///data/user/0/com.aryan.reader/files/books/external.epub"
         val pendingEntry = """{"bookId":"external-book","uriString":"$pendingUri"}"""
-        every {
-            mockPrefs.getStringSet("pending_external_file_removals", any())
-        } returns mutableSetOf(pendingEntry)
+        prefsStringSets["pending_external_file_removals"] = setOf(pendingEntry)
         every { mockPrefs.getString("last_open_book_id", null) } returns "external-book"
         every { mockPrefs.getString("last_open_file_type", null) } returns FileType.EPUB.name
 
         val restored = TestMainViewModel(mockApplication)
         try {
             advanceUntilIdle()
-
-            coVerify {
+            coVerify(timeout = 1_000) {
                 anyConstructed<RecentFilesRepository>().deleteFilePermanently(listOf("external-book"))
             }
+
             coVerify {
                 anyConstructed<BookImporter>().deleteBookByUriString(pendingUri)
             }
+            assertEquals(listOf("external-book"), restored.locallyCleanedBookIds)
             verify(atLeast = 1) { mockEditor.remove("last_open_book_id") }
             verify(atLeast = 1) { mockEditor.remove("last_open_file_type") }
             verify { mockEditor.remove("pending_external_file_removals") }
         } finally {
             restored.clearForTest()
         }
+    }
+
+    @Test
+    fun `temporary external pdf opens directly without importing or adding to library`() = runTest(testDispatcher) {
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            viewModel.uiState.collect {}
+        }
+        val externalUri = mockUri("content://external/temp.pdf", path = "/temp.pdf", lastPathSegment = "temp.pdf")
+        val resolver = mockk<ContentResolver>()
+        every { mockApplication.contentResolver } returns resolver
+        every { resolver.getType(externalUri) } returns "application/pdf"
+        every { resolver.query(externalUri, null, null, null, null) } returns null
+        coEvery { anyConstructed<RecentFilesRepository>().getFileByBookId(match { it.startsWith("temporary-") }) } returns null
+
+        viewModel.onFileSelected(
+            externalUri,
+            isFromRecent = false,
+            isExternalIntent = true,
+            isTemporaryExternalIntent = true
+        )
+        advanceUntilIdle()
+
+        val selected = viewModel.uiState.first { it.selectedBookId?.startsWith("temporary-") == true && it.selectedPdfUri != null }
+        assertEquals(externalUri, selected.selectedPdfUri)
+        assertEquals(null, selected.showExternalFileSavePromptFor)
+        coVerify(exactly = 0) { anyConstructed<BookImporter>().importBook(any()) }
+        coVerify(exactly = 0) { anyConstructed<RecentFilesRepository>().addRecentFile(any()) }
+        verify(exactly = 0) { mockEditor.putStringSet("pending_external_file_removals", any()) }
+    }
+
+    @Test
+    fun `closing temporary external direct book signals activity finish without library cleanup`() = runTest(testDispatcher) {
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            viewModel.uiState.collect {}
+        }
+        val item = recentFile("external-book", type = FileType.PDF)
+        coEvery { anyConstructed<RecentFilesRepository>().getFileByBookId(item.bookId) } returns item
+        viewModel.trackExternalOpenForClose(
+            bookId = item.bookId,
+            importedCopyUriString = null,
+            isTemporaryExternalIntent = true
+        )
+        viewModel.onRecentFileClicked(item)
+        advanceUntilIdle()
+        viewModel.uiState.first { it.selectedBookId == item.bookId }
+        val finishEvent = backgroundScope.async { viewModel.temporaryExternalOpenFinished.first() }
+
+        viewModel.clearSelectedFile()
+        advanceUntilIdle()
+
+        assertEquals(null, viewModel.uiState.value.showExternalFileSavePromptFor)
+        coVerify(exactly = 0) { anyConstructed<RecentFilesRepository>().deleteFilePermanently(listOf(item.bookId)) }
+        coVerify(exactly = 0) { anyConstructed<BookImporter>().deleteBookByUriString(item.uriString!!) }
+        assertTrue(finishEvent.isCompleted)
     }
 
     @Test

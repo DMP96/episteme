@@ -22,8 +22,6 @@ package com.aryan.reader.epubreader
 
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -38,8 +36,6 @@ import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,8 +48,10 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -76,6 +74,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -86,7 +85,13 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.core.net.toUri
 import com.aryan.reader.R
+import com.aryan.reader.ReaderFontDiagnosticsTag
+import com.aryan.reader.copyPlainTextToClipboard
 import com.aryan.reader.getReaderTextureDataUri
+import com.aryan.reader.readerFontDiagnosticSummary
+import com.aryan.reader.shared.detectFontVariant
+import com.aryan.reader.shared.familyFilenameSignature
+import com.aryan.reader.shared.fontWeightCssDescriptor
 import com.aryan.reader.shared.ui.SharedSelectionMenuRect
 import com.aryan.reader.shared.ui.SharedSelectionMenuSize
 import com.aryan.reader.shared.ui.SharedSelectionMenuViewport
@@ -96,6 +101,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 
 private const val TAG_LINK_NAV = "LINK_NAV"
@@ -200,6 +206,49 @@ private fun getFontCssInjection(): String {
         @font-face { font-family: 'Roboto Mono'; src: url('file:///android_asset/fonts/roboto_mono.ttf'); }
         @font-face { font-family: 'Lexend'; src: url('file:///android_asset/fonts/lexend.ttf'); }
     """.trimIndent()
+}
+
+private fun buildCustomFontCssForWebView(customFontPath: String?, phase: String): String {
+    if (customFontPath == null) return ""
+
+    val fontFile = File(customFontPath)
+    val signature = fontFile.nameWithoutExtension.familyFilenameSignature()
+    val siblings = fontFile.parentFile?.listFiles()?.filter {
+        it.isFile && it.extension.lowercase() in setOf("ttf", "otf", "woff", "woff2") &&
+            it.nameWithoutExtension.familyFilenameSignature() == signature
+    } ?: listOf(fontFile)
+
+    Timber.tag(ReaderFontDiagnosticsTag).i(
+        "webview.$phase.customCss.start basePath='${fontFile.absolutePath}' " +
+            "exists=${fontFile.exists()} bytes=${fontFile.length()} " +
+            readerFontDiagnosticSummary(fontFile.nameWithoutExtension) +
+            " siblings=${siblings.joinToString { it.name }}"
+    )
+
+    val css = siblings.mapNotNull { sibling ->
+        val variant = sibling.nameWithoutExtension.detectFontVariant()
+        if (variant == null) {
+            Timber.tag(ReaderFontDiagnosticsTag).w(
+                "webview.$phase.customCss.skipNoVariant file='${sibling.name}' " +
+                    readerFontDiagnosticSummary(sibling.nameWithoutExtension)
+            )
+            return@mapNotNull null
+        }
+
+        val weight = sibling.nameWithoutExtension.fontWeightCssDescriptor(variant.weight)
+        val style = if (variant.style == FontStyle.Italic) "italic" else "normal"
+        Timber.tag(ReaderFontDiagnosticsTag).i(
+            "webview.$phase.customCss.face file='${sibling.name}' fontWeight='$weight' fontStyle='$style' " +
+                readerFontDiagnosticSummary(sibling.nameWithoutExtension)
+        )
+        "@font-face { font-family: 'CustomFont'; src: url('file://${sibling.absolutePath}'); font-weight: $weight; font-style: $style; }"
+    }.joinToString(" ")
+
+    val faceCount = Regex("@font-face").findAll(css).count()
+    Timber.tag(ReaderFontDiagnosticsTag).i(
+        "webview.$phase.customCss.done faceCount=$faceCount cssLength=${css.length}"
+    )
+    return css
 }
 
 private fun getJsToInject(context: Context): String {
@@ -514,6 +563,7 @@ fun ChapterWebView(
     onFootnoteRequested: (String) -> Unit,
     currentFontFamily: ReaderFont,
     customFontPath: String? = null,
+    epubFontFaceCss: String = "",
     currentTextAlign: ReaderTextAlign,
     onHighlightClicked: () -> Unit,
     onAutoScrollChapterEnd: () -> Unit = {},
@@ -578,10 +628,14 @@ fun ChapterWebView(
                         showExternalLinkDialog = null
                     }) { Text(stringResource(R.string.action_open)) }
                     TextButton(onClick = {
-                        val clipboard =
-                            context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_link), urlToShow)
-                        clipboard.setPrimaryClip(clip)
+                        val copied = copyPlainTextToClipboard(
+                            context = context,
+                            label = context.getString(R.string.clip_label_copied_link),
+                            text = urlToShow
+                        )
+                        if (!copied) {
+                            Toast.makeText(context, context.getString(R.string.error_copy_to_clipboard), Toast.LENGTH_SHORT).show()
+                        }
                         showExternalLinkDialog = null
                     }) { Text(stringResource(R.string.action_copy)) }
                 }
@@ -927,13 +981,14 @@ fun ChapterWebView(
                             )
 
                             val fontCss = getFontCssInjection().replace("\n", " ")
-                            val customFontCss = if (customFontPath != null) {
-                                "@font-face { font-family: 'CustomFont'; src: url('file://$customFontPath'); }"
-                            } else ""
-                            val combinedCss = "$fontCss $customFontCss"
+                            val customFontCss = buildCustomFontCssForWebView(customFontPath, "initial")
+                            val combinedCss = listOf(fontCss, customFontCss, epubFontFaceCss)
+                                .filter { it.isNotBlank() }
+                                .joinToString(separator = " ")
+                            val escapedCombinedCss = escapeJsString(combinedCss)
 
                             val injectFontJs =
-                                "var style = document.createElement('style'); style.id='injectedFonts'; style.innerHTML = \"$combinedCss\"; document.head.appendChild(style);"
+                                "var style = document.createElement('style'); style.id='injectedFonts'; style.innerHTML = \"$escapedCombinedCss\"; document.head.appendChild(style);"
                             view?.evaluateJavascript("javascript:$injectFontJs") {
                                 Timber.d("CSS Injection result: $it")
                             }
@@ -1125,10 +1180,10 @@ fun ChapterWebView(
                     runtimeApplierState.logPending(chapterTitle)
                 } else {
                     val fontCss = getFontCssInjection().replace("\n", " ")
-                    val customFontCss = if (customFontPath != null) {
-                        "@font-face { font-family: 'CustomFont'; src: url('file://$customFontPath'); }"
-                    } else ""
-                    val combinedCss = "$fontCss $customFontCss"
+                    val customFontCss = buildCustomFontCssForWebView(customFontPath, "runtime")
+                    val combinedCss = listOf(fontCss, customFontCss, epubFontFaceCss)
+                        .filter { it.isNotBlank() }
+                        .joinToString(separator = " ")
                     val fontNameForJs = if (customFontPath != null) {
                         "CustomFont"
                     } else if (currentFontFamily == ReaderFont.ORIGINAL) {
@@ -1166,8 +1221,9 @@ fun ChapterWebView(
 
                     if (fontCssChanged) {
                         runtimeApplierState.fontCss = combinedCss
+                        val escapedCombinedCss = escapeJsString(combinedCss)
                         val injectFontJs =
-                            "var style = document.getElementById('injectedFonts'); if(!style) { style = document.createElement('style'); style.id='injectedFonts'; document.head.appendChild(style); } style.innerHTML = \"$combinedCss\";"
+                            "var style = document.getElementById('injectedFonts'); if(!style) { style = document.createElement('style'); style.id='injectedFonts'; document.head.appendChild(style); } style.innerHTML = \"$escapedCombinedCss\";"
                         webView.evaluateJavascript("javascript:$injectFontJs", null)
                     }
 
@@ -1304,10 +1360,14 @@ fun ChapterWebView(
                         ) {
                             PaginatedTextSelectionMenu(
                                 onCopy = {
-                                val clipboard =
-                                    context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), state.selectedText)
-                                clipboard.setPrimaryClip(clip)
+                                val copied = copyPlainTextToClipboard(
+                                    context = context,
+                                    label = context.getString(R.string.clip_label_copied_text),
+                                    text = state.selectedText
+                                )
+                                if (!copied) {
+                                    Toast.makeText(context, context.getString(R.string.error_copy_to_clipboard), Toast.LENGTH_SHORT).show()
+                                }
                                 state.finishActionModeCallback()
                                 localWebViewRef?.clearFocus()
                                 localWebViewRef?.evaluateJavascript(

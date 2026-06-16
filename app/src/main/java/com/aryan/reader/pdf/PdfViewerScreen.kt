@@ -379,7 +379,6 @@ fun PdfViewerScreen(
     var screenOrientationMode by remember { mutableStateOf(loadReaderScreenOrientationMode(context)) }
     var rightToLeftPagination by remember { mutableStateOf(loadPdfRightToLeftPagination(context)) }
     var showScreenOrientationSheet by remember { mutableStateOf(false) }
-    var documentPassword by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingRestorePage by rememberSaveable { mutableStateOf(initialPage) }
     var isScrollLocked by remember { mutableStateOf(false) }
     var lockedState by remember { mutableStateOf<Triple<Float, Float, Float>?>(null) }
@@ -455,6 +454,8 @@ fun PdfViewerScreen(
     val uiState by viewModel.uiState.collectAsState()
     val effectivePdfUri = uiState.selectedPdfUri ?: pdfUri
     val effectiveFileType = uiState.selectedFileType ?: FileType.PDF
+    var documentPassword by rememberSaveable(effectivePdfUri.toString()) { mutableStateOf<String?>(null) }
+    var isPrintBlockedForPasswordProtectedPdf by rememberSaveable(effectivePdfUri.toString()) { mutableStateOf(false) }
     val isComicFile = effectiveFileType in COMIC_ARCHIVE_FILE_TYPES
 
     var showNewTabSheet by remember { mutableStateOf(false) }
@@ -599,7 +600,11 @@ fun PdfViewerScreen(
         isAutoScrollLocal = loadPdfAutoScrollLocalMode(context, bookId)
     }
 
-    val onPrintDocument: () -> Unit = {
+    val onPrintDocument: () -> Unit = onPrintDocument@{
+        if (isPrintBlockedForPasswordProtectedPdf) {
+            showBanner(context.getString(R.string.error_print_password_protected), isError = true)
+            return@onPrintDocument
+        }
         val printManager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
         val jobName = "${context.getString(R.string.app_name)} - $originalFileName"
 
@@ -2443,8 +2448,9 @@ fun PdfViewerScreen(
         }
     }
 
-    LaunchedEffect(currentPageScale) {
-        if (currentPageScale != 1f) {
+    val zoomIndicatorPercentage = pdfZoomIndicatorPercent(currentPageScale)
+    LaunchedEffect(zoomIndicatorPercentage) {
+        if (shouldShowPdfZoomIndicator(zoomIndicatorPercentage)) {
             showZoomIndicator = true
             delay(1500)
             showZoomIndicator = false
@@ -3538,6 +3544,7 @@ fun PdfViewerScreen(
         isDocumentReady = false
         errorMessage = null
         documentMetadataTitle = null
+        isPrintBlockedForPasswordProtectedPdf = false
         currentBookId = null
         areAnnotationsLoaded = false
         loadedSidecarBookId = null
@@ -3611,6 +3618,7 @@ fun PdfViewerScreen(
             totalPages = cachedItem.totalPages
             pageAspectRatios = cachedItem.pageAspectRatios
             flatTableOfContents = cachedItem.flatTableOfContents
+            isPrintBlockedForPasswordProtectedPdf = cachedItem.isPasswordProtectedPdf
 
             val mapPage = tabStateMap[currentBookId!!]
             val uiPage = uiState.initialPageInBook
@@ -3654,6 +3662,8 @@ fun PdfViewerScreen(
 
                 val selectedDocumentType = uiState.selectedFileType ?: FileType.PDF
                 val doc = DocumentFactory.loadDocument(context, effectivePdfUri, selectedDocumentType, documentPassword, pdfiumCore)
+                val loadedPasswordProtectedPdf = selectedDocumentType == FileType.PDF &&
+                    (documentPassword != null || isPdfLikelyEncryptedForPrint(context, effectivePdfUri))
 
                 if (!isActive) {
                     doc.close()
@@ -3661,6 +3671,7 @@ fun PdfViewerScreen(
                 }
 
                 pdfDocument = doc
+                isPrintBlockedForPasswordProtectedPdf = loadedPasswordProtectedPdf
                 documentMetadataTitle = (doc as? PdfDocumentWrapper)?.let { wrapper ->
                     PdfiumEngineProvider.withPdfium {
                         wrapper.pdfDocument.getDocumentMeta().title?.takeIf { it.isNotBlank() }
@@ -3757,7 +3768,8 @@ fun PdfViewerScreen(
                             pfd = null,
                             totalPages = pagesCount,
                             pageAspectRatios = ratios,
-                            flatTableOfContents = flatTableOfContents
+                            flatTableOfContents = flatTableOfContents,
+                            isPasswordProtectedPdf = loadedPasswordProtectedPdf
                         )
                     )
 
@@ -4580,6 +4592,8 @@ fun PdfViewerScreen(
                                             val latestSpreadScale = rememberUpdatedState(currentActiveScale)
                                             val latestSpreadOffset = rememberUpdatedState(currentActiveOffset)
                                             val spreadPageGap = if (showVerticalPageGap) 8.dp else 0.dp
+                                            val spreadPageGapPx = with(density) { spreadPageGap.toPx() }
+                                            val spreadPageCount = spreadPageIndices.size
                                             var spreadPanFlingJob by remember { mutableStateOf<Job?>(null) }
                                             Row(
                                                 modifier = Modifier
@@ -4952,6 +4966,20 @@ fun PdfViewerScreen(
                                             ) {
                                                 spreadPageIndices.forEach { pageIndex ->
                                                     key(pageIndex) {
+                                                        val spreadPageWidth = if (spreadPageCount > 1) {
+                                                            val pageAspectRatio = displayPageRatios.getOrElse(pageIndex) { 1f }
+                                                            with(density) {
+                                                                pdfSpreadPageSlotWidth(
+                                                                    containerWidth = boxMaxWidthFloat,
+                                                                    containerHeight = boxMaxHeightFloat,
+                                                                    pageGap = spreadPageGapPx,
+                                                                    spreadPageCount = spreadPageCount,
+                                                                    pageAspectRatio = pageAspectRatio
+                                                                ).toDp()
+                                                            }
+                                                        } else {
+                                                            with(density) { boxMaxWidthFloat.toDp() }
+                                                        }
                                             val isPageBookmarked by remember(bookmarks, pageIndex) {
                                                 derivedStateOf {
                                                     bookmarks.any { it.pageIndex == pageIndex }
@@ -5152,7 +5180,7 @@ fun PdfViewerScreen(
                                                 ocrHoverHighlights = stableOcrRects,
                                                 modifier = if (spreadPageIndices.size > 1) {
                                                     Modifier
-                                                        .weight(1f)
+                                                        .width(spreadPageWidth)
                                                         .fillMaxHeight()
                                                 } else {
                                                     Modifier.fillMaxSize()
@@ -6303,6 +6331,7 @@ fun PdfViewerScreen(
                     isReflowingThisBook = isReflowingThisBook,
                     hasReflowFile = hasReflowFile,
                     isPdfDocumentLoaded = pdfDocument != null,
+                    canPrintDocument = !isPrintBlockedForPasswordProtectedPdf,
                     isTabsEnabled = isPdfTabStripVisible,
                     openTabs = openTabs,
                     activeTabBookId = activeTabBookId,
@@ -7125,9 +7154,8 @@ fun PdfViewerScreen(
                     enter = fadeIn(),
                     exit = fadeOut()
                 ) {
-                    val percentage = (currentPageScale * 100).roundToInt()
                     ZoomPercentageIndicator(
-                        percentage = percentage,
+                        percentage = zoomIndicatorPercentage,
                         onResetZoomClick = {
                             resetZoomTrigger = System.currentTimeMillis()
                         }
